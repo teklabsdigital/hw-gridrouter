@@ -1,6 +1,7 @@
 gridrouter/libgridrouter.dylib
 gridrouter/libgridrouter.so
 gridrouter/gridrouter.dll
+gridrouter/*gridrouter_trace_*
 gridrouter/*.tmp
 gridrouter/*.obj
 gridrouter/*.exp

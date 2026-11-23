@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ["test_api.py", "test_search.py", "test_ripup.py", "test_kicad_emit.py"]
+FILES = ["test_api.py", "test_search.py", "test_ripup.py", "test_kicad_emit.py", "test_trace.py"]
 
 failed = []
 for f in FILES:
