@@ -51,11 +51,12 @@ def board_chunk(label, nx, ny, cell, pads, blocks, names, routes=None, title="be
     Y = lambda v: nm(v, oy)                         # noqa: E731
     bw = tf.BoardWriter(label, 1.6, (llround(ox * 1e6), llround(oy * 1e6)))
     cu = (bw.layer("F.Cu", 0, 0), bw.layer("B.Cu", 2, 0))
-    silk = bw.layer("F.SilkS", 5)
+    # layer names and ids as KiCad 10's BOARD.GetStandardLayerName gives them (spec 7.18)
+    silk = bw.layer("F.Silkscreen", 5)
     bw.layer("F.Mask", 1)
     edge = bw.layer("Edge.Cuts", 25)
-    for name, th, er in (("F.SilkS", 0.01, None), ("F.Mask", 0.01, 3.3), ("F.Cu", 0.035, None),
-                         ("dielectric 1", 1.51, 4.5), ("B.Cu", 0.035, None),
+    for name, th, er in (("F.Silkscreen", 0.01, None), ("F.Mask", 0.01, 3.3),
+                         ("F.Cu", 0.035, None), ("dielectric 1", 1.51, 4.5), ("B.Cu", 0.035, None),
                          ("B.Mask", 0.01, 3.3)):
         bw.stackup_item(name, th, er)
     code = {}

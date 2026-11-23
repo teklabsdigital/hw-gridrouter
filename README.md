@@ -34,15 +34,24 @@ router/
   gridrouter/gridrouter.c   C core: grids, claims, ownership / rip-up, A* search
   gridrouter/gridrouter.h   C API
   gridrouter/kicad.py       optional: write routes() into a pcbnew BOARD (pcbnew passed in)
+  gridrouter/recorder.py    optional tracing: TracedRouter, Recorder, load_traced() (see Tracing)
+  gridrouter/tracefile.py   trace file writer and reader, BoardWriter, check / replay, command line
+  gridrouter/kicad_trace.py optional: dump a pcbnew BOARD into a trace (pcbnew passed in)
+  docs/TRACE_FORMAT.md      the trace file format, version 1.0
+  examples/record_bench.py  record a trace of the benchmark board (or a small one) without KiCad
   tests/ref_router.py       the oracle: the original pure-Python Router, copied unchanged (constants configurable)
   tests/common.py           random-scene helpers shared by the tests
   tests/test_search.py      C search vs oracle on random boards, every mode, both direction tables
   tests/test_ripup.py       incremental rip-up: A/B vs fresh router; full route-with-rip-up vs oracle
   tests/test_api.py         API details and error handling
   tests/test_kicad_emit.py  gridrouter.kicad.emit on an in-memory board (KiCad's Python only)
+  tests/test_trace.py       trace hook vs oracle, Router vs TracedRouter, file format, reader checks
+  tests/test_kicad_trace.py kicad_trace.dump_board on in-memory boards (KiCad's Python only)
   tests/run_all.py          runs all of the above
+  tests/run_traced.py       runs the suite again with TracedRouter and a recorder in place of Router
   tests/bench.py            timing on a 501 x 361 grid, C vs oracle
   Makefile                  convenience targets (build, test, bench)
+  viewer/                   Visual Gridrouter, a native app that replays trace files (viewer/README.md)
 ```
 
 ## Build and test
@@ -56,7 +65,8 @@ cd router
 python3 -c "import gridrouter"          # compiles the library if needed (macOS: gridrouter/libgridrouter.dylib)
 make                                    # same, via make
 python3 tests/run_all.py                # all tests (~1-2 min); GRIDROUTER_TEST_SCALE=0.2 for a quick run
-make test-kicad                         # the same tests in KiCad's Python (includes the pcbnew emit test)
+make test-kicad                         # the same tests in KiCad's Python (includes the pcbnew emit and board dump tests)
+python3 tests/run_traced.py             # the suite again with TracedRouter and a recorder (slower; see Tracing)
 python3 tests/bench.py                  # benchmark; add --full-oracle to also route the whole board in Python
 python3 tests/bench.py --strict         # the same with the 4-direction (GEN_PCB_STRICT=1) tables
 ```
@@ -212,6 +222,150 @@ C functions that are not part of the Python API but worth knowing:
   oracle tests call `add_pad` and `block_rect` and compare the `novia` grids
   with the reference.
 
+## Tracing
+
+A trace is a file (`.grtrace`) that records one routing run: the router's
+settings, every search with its A* wavefront (the cells it expanded, in
+order, with their costs), every commit, via and rip-up, and, if you add it,
+the KiCad board. Use it to see afterwards why a net failed, where a search
+spent its time, or what a rip-up removed. The viewer in `viewer/` replays a
+trace (see [viewer/README.md](viewer/README.md)). The file format is
+[docs/TRACE_FORMAT.md](docs/TRACE_FORMAT.md).
+
+Tracing is off unless you ask for it. `gridrouter.Router` and the default
+library are unchanged: the trace hook in the C core is compiled only with
+`-DRT_TRACE`, into a second library that only `TracedRouter` loads.
+
+### Recording a run
+
+```python
+from gridrouter.recorder import Recorder, TracedRouter
+
+r = TracedRouter(60, 40, 0.1)               # the same arguments as gridrouter.Router
+nx = r.NX
+with Recorder("run.grtrace") as rec:
+    rec.attach(r, nets={1: "A"})            # settings, grids, net names
+    rec.phase("pads")
+    r.add_pad(1, (0,), 1.0, 1.0, 0.9, 0.9, 1.1, 1.1, 0)
+    r.add_pad(1, (0,), 4.0, 3.0, 3.9, 2.9, 4.1, 3.1, 0)
+    r.snapshot()
+    rec.phase("routing")
+    pads = [(1.0, 1.0, (0,), [(0, 10 * nx + 10)], "A.0"),
+            (4.0, 3.0, (0,), [(0, 30 * nx + 40)], "A.1")]
+    r.route_net(1, "A", pads, False, 0)
+    rec.routes()                            # the result of routes(), for comparison
+# leaving the block writes the END chunk and detaches the router
+```
+
+- `TracedRouter` is a `Router` subclass. It takes the same arguments and gives
+  the same results, with or without a recorder (`tests/test_trace.py` and
+  `tests/run_traced.py` check this). Without a recorder attached it does not
+  trace. `check=True` asserts the trace invariants after every search; the
+  tests use it.
+- `Recorder(path)` writes one file. `attach(router, origin=(x, y), nets=...)`
+  starts a session: `origin` is the board position of router cell (0, 0) in
+  mm, `nets` maps router net numbers to names. Then `phase(text)`,
+  `mark(text)`, `grids(label)`, `routes()`, `board(...)` and `close()`. Every
+  chunk is flushed when it is written, so a viewer can follow a file that is
+  still growing.
+- Calls are recorded at the outermost level only: `add_pad` writes one `PAD `
+  chunk, not also the `claim_rect` it makes. The format specification,
+  section 5, lists what each method writes.
+
+### The traced library
+
+`gridrouter.recorder.load_traced()` builds and loads the traced library;
+`TracedRouter` calls it. It reuses `gridrouter.build()` with `-DRT_TRACE`
+added to `GRIDROUTER_CFLAGS`, so the compiler and flags are the default
+library's. The file goes beside the default library:
+`gridrouter/libgridrouter_trace_<hash>.dylib` on macOS (`.so` on Linux,
+`gridrouter_trace_<hash>.dll` on Windows), or beside `GRIDROUTER_LIB` if that
+is set. `<hash>` covers the platform, `CC`, `GRIDROUTER_ARCHS` and
+`GRIDROUTER_CFLAGS`, so a change of flags builds a new file. Like the default
+library, it is rebuilt when the C source is newer.
+
+The default library is not rebuilt when only `GRIDROUTER_CFLAGS` changes
+(`build()` compares file times). To test other flags, give each flag set its
+own `GRIDROUTER_LIB` path in a directory that already exists.
+
+### KiCad boards
+
+```python
+from gridrouter.kicad_trace import dump_board
+
+stats = dump_board(rec, board, pcbnew, "placed", origin=(OX, OY), stackup=STACKUP)
+```
+
+`dump_board` writes a `pcbnew` board as one `BRD ` chunk: layers, stackup,
+nets, footprints, pad shapes per layer, holes, graphics, text as glyph
+outlines, zone outlines and fills, tracks and vias. It only reads the board,
+and `pcbnew` is passed in, as for `gridrouter.kicad.emit`. `stackup` is a list
+of `(name, thickness_mm[, er])` from top to bottom, because `pcbnew` does not
+give the stackup to Python. The returned dict counts what was written, what
+was approximated (arcs, circles) and what was skipped. Write a "placed" board
+before routing and a "final" one after the last zone fill and DRC.
+`tests/test_kicad_trace.py` tests it in KiCad's Python (`make test-kicad`).
+
+The dongle's `gen_pcb.py` records a trace when `GEN_PCB_TRACE_FILE` is set
+to an output path (on the dongle's `visual-router` branch). Unset, none of
+its trace code runs.
+
+### Without KiCad
+
+```sh
+python3 examples/record_bench.py OUT.grtrace                 # the tests/bench.py board, 21.8 MB
+python3 examples/record_bench.py OUT.grtrace --size small    # an 80 x 50 board, about 200 KB
+python3 examples/record_bench.py OUT.grtrace --timing        # also times Router and TracedRouter
+```
+
+These write a synthetic `BRD ` board (outline, pads, keep-outs, and the
+routed tracks in the "final" board), so the viewer has a board to draw. The
+small board has a rip-up, a failed plane drop and a repeated search. It is
+the viewer's test sample, `viewer/core/tests/data/small.grtrace`.
+
+### Reading a trace
+
+```sh
+python3 -m gridrouter.tracefile summary run.grtrace   # counts: chunks, searches, nets, failures
+python3 -m gridrouter.tracefile dump run.grtrace      # one line per chunk
+python3 -m gridrouter.tracefile check run.grtrace     # structure, ids and copper bookkeeping
+```
+
+`check` prints errors, then warnings, then one summary line. It exits 1 if
+there is an error (a corrupt chunk, an id out of sequence, a bad cell, a
+rip-up of copper that does not exist), and 0 for a clean file or one with
+warnings only. In Python, `gridrouter.tracefile.read_trace`, `replay` (the
+copper alive at any chunk) and `check` do the same.
+
+### Size and speed
+
+Measured on 2026-11-23 on an Apple Silicon Mac:
+
+| Run | Without recording | With recording | Trace file |
+|---|---|---|---|
+| `tests/bench.py` board, `examples/record_bench.py --timing` | 1.30 s | 1.35 s (about 3 to 4 % more) | 21.8 MB |
+| the dongle's board, `gen_pcb.py` | 16 s | 17 s (about 1 s more) | 145.8 MB |
+
+Most of a trace is wavefronts, and most of those come from searches that
+fail: a failed search expands every cell it can reach. A search that repeats
+an earlier one exactly stores a reference instead of its wavefront. A `BRD `
+chunk of the dongle's board is about 0.7 MB and took 0.13 s to write.
+
+### What a trace does not capture
+
+Direct writes to `T`, `W` and `novia`, anything done before `attach`,
+attribute changes after it, edits of the bookkeeping lists by user code, and
+calls that raise (other than `search`, `route_net` and `drop_to_plane`) are
+not recorded. The format specification lists these in section 14, "What the
+format does not capture". The dongle writes its direct grid writes as `mark`
+notes.
+
+### What is untested
+
+Tracing has been run only on macOS (Apple Silicon), in Python 3.13 and in
+KiCad 10's Python 3.9. The traced library has not been built on Linux or
+Windows.
+
 ## How it works, and how it differs from the reference
 
 ### Same results
@@ -286,6 +440,27 @@ fresh router and against the oracle's `rebuild()`.
    - Cells passed in must lie inside the grid. The reference would silently
      wrap a negative index; this raises `RouterError`.
    - Costs must be non-negative, which the reference assumed too.
+10. **Trace hook.** The C core has a hook that records each search's
+    wavefront (`rt_trace`, `rt_trace_count`). It is compiled only with
+    `-DRT_TRACE`, into the separate library that `gridrouter.recorder` builds
+    (see [Tracing](#tracing)). Without that flag the machine code is the same
+    as before the hook was added (checked on 2026-11-23: `otool -tv` of
+    `gridrouter.c` from `main` and from this branch, compiled with
+    `cc -O2 -std=c99 -c` on arm64, is identical). The hook only reads the
+    search's state, so tracing never changes a result: `tests/test_trace.py`
+    and `tests/run_traced.py` compare `Router` with `TracedRouter`.
+11. **Duplicate source cells.** If `search` is given the same source cell
+    more than once (a list or an `array`, not a set), the C core pushes it
+    once and skips the copies. The reference pushes every copy into its heap
+    and expands each one, so its expanded-state count is higher by one for
+    each extra copy. Paths, costs and `new_via` are identical. Observed on
+    2026-11-23 on a 40 x 30 grid, with one source cell and one target cell:
+    with the source listed twice, the reference counted 3562 expanded states
+    and C 3561 (892 and 891 with a goal); listed three times, 3563 and 3561.
+    The path and the cost (282) were the same in every case. This predates
+    tracing; it was found while testing the trace. `route_net` and
+    `drop_to_plane` pass no duplicates, and the oracle tests pass sets, so
+    neither is affected.
 
 ### Behaviour of the reference that is kept but worth knowing
 

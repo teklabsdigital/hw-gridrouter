@@ -12,13 +12,14 @@ nothing else.  It holds:
     objects (``types.SimpleNamespace`` with the field names of the spec),
     skip unknown tags, ignore trailing payload bytes, report corrupt chunks
     and stop quietly at a chunk that is not completely written yet;
-  * ``replay`` (copper state, spec section 8) and ``check`` (id sequences and
-    order guarantees, section 6);
+  * ``replay`` (copper state, spec section 8) and ``check`` (id sequences,
+    order guarantees and bounds, sections 3.4, 4.1, 6 and 10; errors and
+    warnings at the levels of section 10);
   * a command line:
 
         python3 -m gridrouter.tracefile summary FILE
         python3 -m gridrouter.tracefile dump FILE
-        python3 -m gridrouter.tracefile check FILE
+        python3 -m gridrouter.tracefile check FILE     # exit 1 on errors; warnings only: 0
 
 Standard library only, Python 3.9 compatible.
 """
@@ -945,8 +946,9 @@ class TraceReader:
             except CorruptChunk as e:
                 ch.error = str(e)
                 self.errors.append("offset %d: %s chunk corrupt: %s" % (ch.offset, tag, e))
-            if tag == "RUN " and ch.data is not None:
-                self._nc = ch.data.nx * ch.data.ny
+            if tag == "RUN ":
+                # a corrupt RUN starts a session with no known grid (spec 6 rule 2)
+                self._nc = None if ch.data is None else ch.data.nx * ch.data.ny
             self.chunks.append(ch)
             added += 1
             pos = nxt
@@ -968,20 +970,24 @@ def read_trace(source):
 def replay(trace, upto=None):
     """Copper state (spec section 8) just after chunk index `upto` (default: the last).
 
-    Returns a namespace: run (the latest RUN's fields or None), alive {copper_id:
-    chunk}, edges {net: {layer: set of ((i,j),(i,j))}}, ewidth {(net, layer, edge):
-    width}, vias {net: set of (i, j)}, stubs {net: [(layer, x0, y0, x1, y1, w)]}.
-    edges / ewidth / stubs / vias are the union of the live copper items, applied
-    in file order (a later CMIT's width wins on a shared edge)."""
+    Returns a namespace: run (the latest RUN's fields, or None if there is no RUN or
+    the latest one is corrupt), alive {copper_id: chunk}, edges {net: {layer: set of
+    ((i,j),(i,j))}}, ewidth {(net, layer, edge): width}, vias {net: set of (i, j)},
+    stubs {net: [(layer, x0, y0, x1, y1, w)]}.  edges / ewidth / stubs / vias are
+    the union of the live copper items, applied in file order (a later CMIT's width
+    wins on a shared edge).  Every RUN, also a corrupt one, starts a new session
+    with no copper; router chunks before the first RUN or after a corrupt RUN
+    belong to no usable session and are ignored (spec 6 rules 2 and 3)."""
     chunks = trace.chunks if upto is None else trace.chunks[:upto + 1]
     run, alive = None, {}
     for ch in chunks:
-        d = ch.data
-        if d is None:
-            continue
         if ch.tag == "RUN ":
-            run, alive = d, {}
-        elif ch.tag == "CMIT":
+            run, alive = ch.data, {}
+            continue
+        d = ch.data
+        if d is None or run is None:
+            continue
+        if ch.tag == "CMIT":
             alive[d.copper_id] = ch
         elif ch.tag == "VIA " and d.added:
             alive[d.copper_id] = ch
@@ -1014,106 +1020,198 @@ def replay(trace, upto=None):
     return out
 
 
-def check(trace):
-    """Structural checks a reader SHOULD make (spec 4.1, 6, 10).  Returns a list of
-    problems (empty if none).  Checks: id sequences, cells < 2 nc, GRDS nc,
-    non-decreasing t, END last and its totals, chunks that need a RUN after
-    one, SNAP followed by GRDS which = 1, RNB / RNE pairing and contents, RBLD
-    followed by its RIPs, DROP preceded by its SRCH / CMIT, repeat_of targets,
-    RIP removed lists exactly the net's live copper since the last SNAP."""
-    probs = []
-    need_run = {"PAD ", "RECT", "DISC", "VIA ", "SNAP", "GRDS", "RNB ", "RNE ", "SRCH", "CMIT",
-                "RBLD", "RIP ", "DROP", "ROUT"}
-    sid = rid = cid = 0
-    run = None
-    nc = 0
+_ROUTER_TAGS = frozenset(("PAD ", "RECT", "DISC", "VIA ", "SNAP", "GRDS", "RNB ", "RNE ", "SRCH",
+                          "CMIT", "RBLD", "RIP ", "DROP", "ROUT"))
+
+
+def check(trace, levels=False):
+    """Checks a reader SHOULD make (spec 4.1, 6, 10), at the levels of spec 10.
+
+    Errors: corrupt chunks, id mismatches, router chunks before the first RUN or
+    in a session whose RUN is corrupt, cells out of range (3.4), a CMIT stub
+    layer > 1, a GRDS whose nc is not the session's, a route_id that names no
+    earlier RNB, a VIA with added = 0 and a copper id, and a RIP that lists a
+    copper id that does not exist, belongs to an earlier session or was already
+    removed.
+
+    Warnings (inconsistencies that make no chunk corrupt): t decreasing or NaN,
+    END not last, END counts and totals, SNAP not followed by GRDS which = 1,
+    RNB / RNE pairing, route_id and ctx not matching the open route_net, other
+    chunks inside a route_net, RBLD not followed by its RIPs, DROP not preceded
+    by its SRCH / CMIT, repeat_of and other trace-field inconsistencies, a via
+    cell outside the grid (VIA, CMIT vias; the via still takes its copper id),
+    and a RIP removed list that is not strictly ascending or not exactly the
+    copper of spec 7.14 (a listed copper id of another net of the session is
+    still removed, as replay() does).
+
+    Ids (4.1): a corrupt SRCH, RNB or CMIT takes the next id; after a mismatch
+    the next expected id is the stored id plus one, so one gap is reported once.
+
+    Returns a list of strings in file order, each warning prefixed with
+    "warning: " (empty for a clean file).  With levels=True: a pair (errors,
+    warnings) of lists of strings without the prefix."""
+    out = []                                # (is_warning, text), file order
+
+    def err(where, text):
+        out.append((False, "%s: %s" % (where, text)))
+
+    def warn(where, text):
+        out.append((True, "%s: %s" % (where, text)))
+
+    def route_ref(where, route_id):
+        # a route_id names the open route_net, or NONE32 outside one (4.2, 6 rule 6)
+        if route_id != NONE32 and route_id >= rid:
+            err(where, "route_id %d names no earlier RNB" % route_id)
+        elif route_id != (NONE32 if open_route is None else open_route):
+            warn(where, "route_id %s, but the open route_net is %s" % (
+                "-" if route_id == NONE32 else route_id, "-" if open_route is None else open_route))
+
+    sid = rid = cid = 0                     # next expected ids (4.1)
+    session = -1                            # index of the current session (each RUN starts one)
+    run = None                              # its RUN; None before the first RUN or if corrupt
+    nx = ny = nc = 0
     last_t = -math.inf
     open_route = None
+    rnb_net = {}                            # route_id -> net of its RNB
+    rne_seen = set()
     srch = {}                               # search_id -> data (this session)
-    since_snap = {}                         # net -> set of live copper ids since SNAP
+    copper = {}                             # copper_id -> [session, net or None, removed]
+    since_snap = {}                         # net -> its unremoved copper ids since SNAP / RUN
     snapped = False
     n_srch = n_rnb = 0
     exp_total = tr_total = 0
     chunks = trace.chunks
     for k, ch in enumerate(chunks):
-        where = "chunk %d (%s at %d)" % (k, ch.tag, ch.offset)
-        if ch.t < last_t:
-            probs.append("%s: t decreases" % where)
-        last_t = ch.t
+        tag, d = ch.tag, ch.data
+        where = "chunk %d (%s at %d)" % (k, tag, ch.offset)
+        if math.isnan(ch.t):
+            warn(where, "t is NaN")
+        else:
+            if ch.t < last_t:
+                warn(where, "t decreases")
+            last_t = ch.t
         if ch.error:
-            probs.append("%s: %s" % (where, ch.error))
-        d = ch.data
+            err(where, ch.error)
+
+        # -- ids: file-wide, never reset; a corrupt SRCH / RNB / CMIT takes its id too
+        if tag == "SRCH":
+            n_srch += 1
+            if d is None:
+                sid += 1
+            else:
+                if d.search_id != sid:
+                    err(where, "search_id %d, expected %d" % (d.search_id, sid))
+                sid = d.search_id + 1
+        elif tag == "RNB ":
+            n_rnb += 1
+            if d is None:
+                rid += 1
+            else:
+                if d.route_id != rid:
+                    err(where, "route_id %d, expected %d" % (d.route_id, rid))
+                rid = d.route_id + 1
+        elif tag == "CMIT" or (tag == "VIA " and d is not None and d.added):
+            this = cid if d is None else d.copper_id
+            if this != cid:
+                err(where, "copper_id %d, expected %d" % (this, cid))
+            cid = this + 1
+            copper[this] = [session, None if d is None else d.net, False]
+        elif tag == "VIA " and d is not None and d.copper_id != NONE32:
+            err(where, "VIA added = 0 with a copper id")
+
+        # -- sessions (6 rules 2 and 3): every RUN starts one, also a corrupt RUN
+        if tag == "RUN ":
+            session += 1
+            run = d
+            nx, ny = (d.nx, d.ny) if d is not None else (0, 0)
+            nc = nx * ny
+            srch, since_snap, snapped = {}, {}, False
+            if open_route is not None:
+                warn(where, "RUN while route_net %d has no RNE" % open_route)
+                open_route = None
+            continue
         if d is None:
             continue
-        tag = ch.tag
-        if tag in need_run and run is None:
-            probs.append("%s: before any RUN" % where)
-            continue
+        if tag in _ROUTER_TAGS:
+            if session < 0:
+                err(where, "before any RUN")
+                continue
+            if run is None:
+                err(where, "in a router session whose RUN is corrupt")
+                continue
         if open_route is not None and tag not in ("SRCH", "RBLD", "RIP ", "CMIT", "RNE "):
-            probs.append("%s: inside route_net %d" % (where, open_route))
-        if tag == "RUN ":
-            run, nc = d, d.nx * d.ny
-            srch, since_snap, snapped = {}, {}, False
-        elif tag == "SRCH":
-            n_srch += 1
-            if d.search_id != sid:
-                probs.append("%s: search_id %d, expected %d" % (where, d.search_id, sid))
-            sid = d.search_id + 1
+            warn(where, "inside route_net %d" % open_route)
+
+        if tag == "SRCH":
             if d.expanded >= 0:
                 exp_total += d.expanded
             tr_total += d.ntrace
-            for name in ("path", "trace_cell"):     # src / tgt may hold bad cells (error)
+            # src / tgt may hold any value when the search raised (error, 3.4)
+            names = ("path", "trace_cell") if d.flags & S_ERROR else \
+                ("src", "tgt", "path", "trace_cell")
+            for name in names:
                 a = getattr(d, name)
                 if a and max(a) >= 2 * nc:
-                    probs.append("%s: %s cell out of range" % (where, name))
+                    err(where, "%s cell out of range" % name)
             if d.trace_cell and len(set(d.trace_cell)) != len(d.trace_cell):
-                probs.append("%s: a trace cell appears twice" % where)
-            if open_route is not None and (d.ctx != 1 or d.route_id != open_route):
-                probs.append("%s: ctx / route_id do not match the open route_net" % where)
+                warn(where, "a trace cell appears twice")
+            route_ref(where, d.route_id)
+            if (d.ctx == 1) != (open_route is not None):
+                warn(where, "ctx %d %s a route_net" % (d.ctx, "inside" if open_route is not None
+                                                       else "outside"))
             if d.repeat_of != NONE32:
                 t = srch.get(d.repeat_of)
                 if t is None or t.repeat_of != NONE32:
-                    probs.append("%s: repeat_of %d is not an earlier non-repeat search of the "
-                                 "session" % (where, d.repeat_of))
+                    warn(where, "repeat_of %d is not an earlier non-repeat search of the session"
+                         % d.repeat_of)
                 elif d.ntrace != 0 or d.ntrace_total != t.ntrace_total or \
                         (d.flags ^ t.flags) & (S_HAS_TRACE | S_HAS_COSTS):
-                    probs.append("%s: repeat fields differ from search %d" % (where, d.repeat_of))
+                    warn(where, "repeat fields differ from search %d" % d.repeat_of)
             if d.ntrace > d.ntrace_total:
-                probs.append("%s: ntrace > ntrace_total" % where)
+                warn(where, "ntrace > ntrace_total")
             srch[d.search_id] = d
         elif tag in ("CMIT", "VIA "):
-            if tag == "VIA " and not d.added:
-                if d.copper_id != NONE32:
-                    probs.append("%s: VIA added = 0 with a copper id" % where)
-            else:
-                if d.copper_id != cid:
-                    probs.append("%s: copper_id %d, expected %d" % (where, d.copper_id, cid))
-                cid = d.copper_id + 1
+            if tag == "CMIT":
+                if d.path and max(d.path) >= 2 * nc:
+                    err(where, "path cell out of range")
+                if any(s[0] > 1 for s in d.stubs):
+                    err(where, "stub layer > 1")
+                out_of_grid = [v for v in d.vias if not (0 <= v[0] < nx and 0 <= v[1] < ny)]
+                if out_of_grid:
+                    warn(where, "via cell %r outside the grid" % (tuple(out_of_grid[0]),))
+                if (d.ctx == 1) != (open_route is not None):
+                    warn(where, "ctx %d %s a route_net" % (d.ctx, "inside" if open_route is not None
+                                                           else "outside"))
+            elif not (0 <= d.i < nx and 0 <= d.j < ny):
+                warn(where, "via cell (%d, %d) outside the grid" % (d.i, d.j))
+            if tag == "CMIT" or d.added:
                 since_snap.setdefault(d.net, set()).add(d.copper_id)
-            if tag == "CMIT" and d.path and max(d.path) >= 2 * nc:
-                probs.append("%s: path cell out of range" % where)
-            if open_route is not None and (d.ctx != 1 or d.route_id != open_route):
-                probs.append("%s: ctx / route_id do not match the open route_net" % where)
+            route_ref(where, d.route_id)
         elif tag == "RNB ":
-            n_rnb += 1
-            if d.route_id != rid:
-                probs.append("%s: route_id %d, expected %d" % (where, d.route_id, rid))
-            rid = d.route_id + 1
             if open_route is not None:
-                probs.append("%s: route_net inside route_net" % where)
+                warn(where, "route_net inside route_net %d" % open_route)
             open_route = d.route_id
+            rnb_net[d.route_id] = d.net
         elif tag == "RNE ":
-            if open_route != d.route_id:
-                probs.append("%s: RNE without its RNB" % where)
+            if d.route_id >= rid:
+                err(where, "route_id %d names no earlier RNB" % d.route_id)
+            else:
+                if open_route != d.route_id:
+                    warn(where, "RNE without its RNB")
+                if d.route_id in rne_seen:
+                    warn(where, "second RNE for route_id %d" % d.route_id)
+                if rnb_net.get(d.route_id, d.net) != d.net:
+                    warn(where, "RNE net %d differs from its RNB's" % d.net)
+                rne_seen.add(d.route_id)
             open_route = None
         elif tag == "SNAP":
             nxt = chunks[k + 1] if k + 1 < len(chunks) else None
             if nxt is not None and (nxt.tag != "GRDS" or nxt.data is None or nxt.data.which != 1):
-                probs.append("%s: not followed by GRDS which = 1" % where)
+                warn(where, "not followed by GRDS which = 1")
             since_snap, snapped = {}, True
         elif tag == "GRDS":
             if d.nc != nc:
-                probs.append("%s: nc %d != %d" % (where, d.nc, nc))
+                err(where, "nc %d != %d" % (d.nc, nc))
         elif tag == "RBLD":
             want = [n for n in d.nets if n != -1]
             got = []
@@ -1123,20 +1221,36 @@ def check(trace):
                     break
                 got.append(c.data.net)
             if got != want:
-                probs.append("%s: followed by RIPs of %r, expected %r" % (where, got, want))
-            if open_route is not None and d.route_id != open_route:
-                probs.append("%s: route_id does not match the open route_net" % where)
+                warn(where, "followed by RIPs of %r, expected %r" % (got, want))
+            route_ref(where, d.route_id)
         elif tag == "RIP ":
-            # After a SNAP of this session: exactly the net's live copper since then.
-            # Before one: nothing, unless the router was snapshotted before it was
-            # attached (then, too, exactly the net's live copper of this session).
-            live = since_snap.get(d.net, set())
-            if d.removed or snapped:
-                if sorted(live) != list(d.removed):
-                    probs.append("%s: removed %r, expected %r" % (where, d.removed, sorted(live)))
+            removed = list(d.removed)
+            if any(b <= a for a, b in zip(removed, removed[1:])):
+                warn(where, "removed not strictly ascending")
+            route_ref(where, d.route_id)
+            # 7.14: exactly the net's unremoved copper of the session since its last
+            # SNAP (since RUN if none); before the session's first SNAP an empty
+            # list is also right (the router was never snapshotted).
+            live = sorted(since_snap.get(d.net, ()))
+            for x in removed:
+                c = copper.get(x)
+                if c is None:
+                    err(where, "removes copper id %d, which does not exist" % x)
+                elif c[0] != session:
+                    err(where, "removes copper id %d of an earlier router session" % x)
+                elif c[2]:
+                    err(where, "removes copper id %d, already removed" % x)
+                else:
+                    if c[1] is not None and c[1] != d.net:
+                        warn(where, "RIP of net %d removes copper id %d of net %d"
+                             % (d.net, x, c[1]))
+                    c[2] = True
+                    if c[1] is not None and c[1] in since_snap:
+                        since_snap[c[1]].discard(x)
+            if removed or snapped:
+                if live != removed:
+                    warn(where, "removed %r, expected %r" % (removed, live))
                 since_snap.pop(d.net, None)
-            if list(d.removed) != sorted(d.removed):
-                probs.append("%s: removed not ascending" % where)
         elif tag == "DROP":
             j = k - 1
             seen = []
@@ -1148,16 +1262,18 @@ def check(trace):
             ok = seen in (["SRCH", "CMIT"], ["SRCH", "SRCH", "CMIT"]) if d.ok == 1 else \
                 (len(seen) in (0, 1, 2) and "CMIT" not in seen)
             if not ok:
-                probs.append("%s: preceded by %r" % (where, seen))
+                warn(where, "preceded by %r" % seen)
         elif tag == "END ":
             if k != len(chunks) - 1:
-                probs.append("%s: END is not the last chunk" % where)
+                warn(where, "END is not the last chunk")
             if d.searches != n_srch or d.routes != n_rnb:
-                probs.append("%s: END counts %d / %d, file has %d / %d"
-                             % (where, d.searches, d.routes, n_srch, n_rnb))
+                warn(where, "END counts %d / %d, file has %d / %d"
+                     % (d.searches, d.routes, n_srch, n_rnb))
             if d.expanded_total != exp_total or d.trace_entries != tr_total:
-                probs.append("%s: END totals differ from the SRCH chunks" % where)
-    return probs
+                warn(where, "END totals differ from the SRCH chunks")
+    if levels:
+        return [t for w, t in out if not w], [t for w, t in out if w]
+    return ["warning: " + t if w else t for w, t in out]
 
 
 # -- summary / dump -----------------------------------------------------------------
@@ -1288,12 +1404,15 @@ def _main(argv):
             print("ERROR:", e)
         return 1 if tr.errors else 0
     if a.command == "check":
-        probs = list(tr.errors) + check(tr)
+        errs, warns = check(tr, levels=True)
+        probs = list(tr.errors) + errs
         for p in probs:
             print(p)
-        print("%s: %d chunks, %s, %d problems" % (a.file, len(tr.chunks),
-                                                  "complete" if tr.complete else "incomplete",
-                                                  len(probs)))
+        for w in warns:
+            print("warning:", w)
+        print("%s: %d chunks, %s, %d problems%s" % (
+            a.file, len(tr.chunks), "complete" if tr.complete else "incomplete", len(probs),
+            ", %d warnings" % len(warns) if warns else ""))
         return 1 if probs else 0
     s = summary(tr)
     print("file:            %s (%d bytes, %.2f MB)" % (a.file, s["size"], s["size"] / 1e6))

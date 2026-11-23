@@ -14,6 +14,10 @@
 5. Replaying the recorded copper (spec section 8) gives the router's edges,
    vias, stubs and edge widths, at the end and after every route_net; ROUT
    equals routes(); the emission rules of spec section 5 on a hand-made run.
+6. The reader decisions of 2026-11-23 on hand-made files: RIP before the first
+   SNAP, corrupt RUN, id resynchronisation, error searches with bad cells, vias
+   outside the grid, RIP of another net's copper; check()'s errors and
+   warnings and the check command's exit status.
 
 The traced library must build: if it cannot, these tests fail (they are not
 skipped).
@@ -1044,6 +1048,206 @@ class Replay(unittest.TestCase):
         self.assertTrue(rec.closed)
         rec.close()                             # idempotent
         self.assertIsNone(r2._rec)
+
+
+# -- 6. reader decisions of 2026-11-23 (spec 4.1, 6, 7.14, 10) -------------------------------------
+def build_file(chunks):
+    """Bytes of a trace file: header, then (tag, fields dict or payload bytes) chunks, t = 0."""
+    b = bytearray(tf.HEADER.pack(tf.MAGIC, 1, 0, 0, 0.0))
+    for tag, f in chunks:
+        payload = f if isinstance(f, (bytes, bytearray)) else tf.pack(tag, f)
+        b += tf.CHUNK.pack(tag.encode(), len(payload), 0.0) + payload + b"\0" * (-len(payload) % 8)
+    return bytes(b)
+
+
+class Decisions(unittest.TestCase):
+    """Hand-made files for each point the spec settled on 2026-11-23 (second pass).
+
+    The grid is the sample RUN's 6 x 5 (nc = 30; valid cells 0..59)."""
+
+    def setUp(self):
+        f = sample_fields()
+        self.run = ("RUN ", f["RUN "])
+        self.bad_run = ("RUN ", b"\0" * 40)                     # too short: corrupt
+
+    @staticmethod
+    def cmit(cid, net, vias=()):
+        return ("CMIT", dict(copper_id=cid, net=net, flags=0, power=0, ctx=0, route_id=NONE32,
+                             width_mm=0.2, stubs=[], vias=list(vias), path=[1, 2]))
+
+    @staticmethod
+    def via(cid, net, i=1, j=1):
+        return ("VIA ", dict(copper_id=cid, net=net, i=i, j=j, power=0, added=1, ctx=0,
+                             route_id=NONE32))
+
+    @staticmethod
+    def srch(sid, src=(1,), tgt=(2,), flags=0):
+        return ("SRCH", dict(search_id=sid, route_id=NONE32, ctx=0, net=1, flags=flags,
+                             src=list(src), tgt=list(tgt), path=[], trace_cell=[], trace_d=[]))
+
+    @staticmethod
+    def rip(net, removed):
+        return ("RIP ", dict(net=net, ctx=0, route_id=NONE32, removed=list(removed)))
+
+    @staticmethod
+    def rnb(rid):
+        return ("RNB ", dict(route_id=rid, net=1, wide=0, power=0, pads=[], name="A", labels=[]))
+
+    @staticmethod
+    def rne(rid):
+        return ("RNE ", dict(route_id=rid, net=1, rips_after=0, status=0, ripped=[], failed=[]))
+
+    def snap(self):
+        g = sample_fields()["GRDS"]
+        return [("SNAP", b"\0" * 4), ("GRDS", dict(g, which=1))]
+
+    def levels(self, chunks):
+        tr = tf.read_trace(build_file(chunks))
+        errs, warns = tf.check(tr, levels=True)
+        return tr, errs, warns
+
+    def test_rip_before_first_snap(self):
+        """Decision 1: before the session's first SNAP a RIP may list the net's copper of the
+        session (router snapshotted before attaching) or nothing; both are clean."""
+        for removed, alive in (([0, 2], [1]), ([], [0, 1, 2])):
+            tr, errs, warns = self.levels([self.run, self.cmit(0, 1), self.cmit(1, 2),
+                                           self.via(2, 1), self.rip(1, removed)])
+            self.assertEqual((errs, warns), ([], []), removed)
+            self.assertEqual(sorted(tf.replay(tr).alive), alive)
+        # since RUN, not since an earlier session; a partial list is a warning
+        tr, errs, warns = self.levels([self.run, self.cmit(0, 1), self.run, self.cmit(1, 1),
+                                       self.cmit(2, 1), self.rip(1, [1])])
+        self.assertEqual(errs, [])
+        self.assertEqual(len(warns), 1)
+        self.assertIn("expected [1, 2]", warns[0])
+        # after a SNAP an empty list is a warning when the net has copper since then
+        tr, errs, warns = self.levels([self.run] + self.snap() + [self.cmit(0, 1), self.rip(1, [])])
+        self.assertEqual((errs, len(warns)), ([], 1))
+
+    def test_corrupt_run(self):
+        """Decision 2: a corrupt RUN starts a new session with no copper; its router chunks
+        are errors until the next valid RUN."""
+        g = sample_fields()["GRDS"]
+        other_grid = dict(which=0, nc=4, label="", T0=[0] * 4, T1=[0] * 4, W0=[0] * 4,
+                          W1=[0] * 4, novia=b"\0" * 4)
+        chunks = [self.run, self.cmit(0, 1), self.srch(0), self.bad_run, self.cmit(1, 1),
+                  self.srch(1), ("GRDS", other_grid), ("MARK", dict(level=1, text="ok")),
+                  self.run, ("GRDS", dict(g, which=0)), self.cmit(2, 1), self.srch(2)]
+        tr, errs, warns = self.levels(chunks)
+        # the reader reports only the RUN as corrupt: the GRDS is not checked against the
+        # previous session's grid
+        self.assertEqual(len(tr.errors), 1)
+        self.assertIsNone(tr.chunks[3].data)
+        self.assertIsNotNone(tr.chunks[6].data)
+        self.assertEqual(warns, [])
+        self.assertEqual(len(errs), 4, errs)                   # RUN, CMIT, SRCH, GRDS
+        self.assertTrue(all("whose RUN is corrupt" in e for e in errs[1:]), errs)
+        self.assertFalse(any("expected" in e for e in errs), errs)   # no id mismatch
+        self.assertEqual(sorted(tf.replay(tr, upto=2).alive), [0])
+        self.assertEqual(tf.replay(tr, upto=5).alive, {})      # previous copper gone
+        self.assertIsNone(tf.replay(tr, upto=7).run)
+        self.assertEqual(sorted(tf.replay(tr).alive), [2])
+        # a corrupt first RUN: chunks after it are errors, not "before any RUN"
+        tr, errs, warns = self.levels([self.bad_run, self.cmit(0, 1)])
+        self.assertEqual(len(errs), 2)
+        self.assertIn("RUN is corrupt", errs[1])
+
+    def test_id_resync(self):
+        """Decision 3: one error per gap, then the stored id is followed; a corrupt SRCH,
+        RNB or CMIT takes the next id, a corrupt VIA does not."""
+        for chunks in ([self.srch(0), self.srch(5), self.srch(6)],
+                       [self.cmit(0, 1), self.cmit(2, 1), self.via(3, 1), self.cmit(4, 1)],
+                       [self.rnb(0), self.rne(0), self.rnb(3), self.rne(3), self.rnb(4),
+                        self.rne(4)]):
+            tr, errs, warns = self.levels([self.run] + chunks)
+            self.assertEqual(len(errs), 1, errs)
+            self.assertIn("expected", errs[0])
+            self.assertEqual(warns, [])
+        # corrupt SRCH / CMIT / RNB in the sequence: only the corrupt chunk is reported
+        for chunks in ([self.srch(0), ("SRCH", b"\0" * 20), self.srch(2)],
+                       [self.cmit(0, 1), ("CMIT", b"\0" * 20), self.cmit(2, 1)],
+                       [self.rnb(0), self.rne(0), ("RNB ", b"\0" * 8), self.rnb(2), self.rne(2)]):
+            tr, errs, warns = self.levels([self.run] + chunks)
+            self.assertEqual(len(errs), 1, errs)
+            self.assertIn("payload too short", errs[0])
+        # a corrupt VIA that had created copper: the corrupt chunk, one mismatch, then in step
+        tr, errs, warns = self.levels([self.run, self.cmit(0, 1), ("VIA ", b"\0" * 8),
+                                       self.cmit(2, 1), self.cmit(3, 1)])
+        self.assertEqual(len(errs), 2, errs)
+        self.assertIn("copper_id 2, expected 1", errs[1])
+        self.assertEqual(sorted(tf.replay(tr).alive), [0, 2, 3])   # keyed by the stored id
+
+    def test_error_search_cells(self):
+        """Decision 4: src / tgt outside the grid are allowed when error is set."""
+        bad = (0xFFFFFFFF, 60)
+        tr, errs, warns = self.levels([self.run, self.srch(0, src=bad, tgt=bad,
+                                                           flags=tf.S_ERROR)])
+        self.assertEqual((tr.errors, errs, warns), ([], [], []))
+        tr, errs, warns = self.levels([self.run, self.srch(0, src=bad)])
+        self.assertEqual(len(errs), 1)
+        self.assertIn("src cell out of range", errs[0])
+
+    def test_via_outside_grid(self):
+        """Decision 5: a VIA or CMIT via outside the grid is a warning; the VIA keeps its
+        copper id."""
+        tr, errs, warns = self.levels([self.run, self.via(0, 1, i=-1, j=3), self.cmit(1, 1),
+                                       self.cmit(2, 1, vias=[(6, 0)]), self.via(3, 2, i=2, j=5)])
+        self.assertEqual(errs, [])
+        self.assertEqual(len(warns), 3, warns)
+        self.assertTrue(all("outside the grid" in w for w in warns))
+        self.assertEqual(sorted(tf.replay(tr).alive), [0, 1, 2, 3])
+
+    def test_rip_other_net_and_bad_ids(self):
+        """Decision 6: another net's copper of the session is removed with a warning;
+        a missing, earlier-session or already-removed id is an error."""
+        tr, errs, warns = self.levels([self.run, self.cmit(0, 1), self.cmit(1, 2),
+                                       self.rip(1, [0, 1]), self.rip(2, [])])
+        self.assertEqual(errs, [])
+        self.assertTrue(any("removes copper id 1 of net 2" in w for w in warns), warns)
+        self.assertEqual(tf.replay(tr).alive, {})
+        # after a SNAP the net-2 RIP expects nothing: its copper was removed already
+        tr, errs, warns = self.levels([self.run] + self.snap() + [
+            self.cmit(0, 1), self.cmit(1, 2), self.rip(1, [0, 1]), self.rip(2, [])])
+        self.assertEqual(errs, [])
+        self.assertEqual(len(warns), 2, warns)                 # other net, list not exact
+        cases = [([self.cmit(0, 1), self.rip(1, [0, 7])], "does not exist"),
+                 ([self.cmit(0, 1), self.run, self.rip(1, [0])], "earlier router session"),
+                 ([self.cmit(0, 1), self.rip(1, [0]), self.rip(1, [0])], "already removed")]
+        for chunks, text in cases:
+            tr, errs, warns = self.levels([self.run] + chunks)
+            self.assertEqual(len(errs), 1, errs)
+            self.assertIn(text, errs[0])
+        # check() without levels: warnings carry a prefix, errors do not
+        tr = tf.read_trace(build_file([self.run, self.cmit(0, 1), self.cmit(1, 2),
+                                       self.rip(1, [0, 1]), self.rip(1, [5])]))
+        probs = tf.check(tr)
+        self.assertEqual([p.startswith("warning: ") for p in probs], [True, True, False, True])
+
+    def test_command_line(self):
+        """The check command: clean output unchanged, warnings only exit 0, errors exit 1."""
+        import contextlib
+        import io
+        files = {"clean": [self.run, self.cmit(0, 1)],
+                 "warn": [self.run, self.via(0, 1, i=-1)],
+                 "error": [self.run, self.cmit(3, 1)]}
+        got = {}
+        for name, chunks in files.items():
+            path = tmp("cli_%s.grtrace" % name)
+            with open(path, "wb") as f:
+                f.write(build_file(chunks))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = tf._main(["check", path])
+            got[name] = (code, buf.getvalue().splitlines())
+        self.assertEqual(got["clean"], (0, ["%s: 2 chunks, incomplete, 0 problems"
+                                            % tmp("cli_clean.grtrace")]))
+        code, lines = got["warn"]
+        self.assertEqual(code, 0)
+        self.assertTrue(lines[0].startswith("warning: chunk 1 (VIA  at "), lines)
+        self.assertTrue(lines[-1].endswith("0 problems, 1 warnings"), lines)
+        code, lines = got["error"]
+        self.assertEqual(code, 1)
+        self.assertTrue(lines[-1].endswith("1 problems"), lines)
 
 
 class Library(unittest.TestCase):

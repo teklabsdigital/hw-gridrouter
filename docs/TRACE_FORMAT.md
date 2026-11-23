@@ -8,8 +8,8 @@ between the Python recorder (writer, `gridrouter/recorder.py` and
 reader (`viewer/core`). Each side is implemented from this document alone.
 
 - Name: "gridrouter trace". File extension `.grtrace`.
-- Version: major 1, minor 0. Clarified 2026-11-23 without a version change
-  (see [16](#16-clarifications)).
+- Version: major 1, minor 0. Clarified twice on 2026-11-23 without a version
+  change (see [16](#16-clarifications)).
 - The words MUST, MUST NOT, SHOULD and MAY are normative.
 
 Contents:
@@ -217,8 +217,7 @@ chunk starts at `chunk_offset + 16 + len + pad`.
 Every file a writer produces satisfies the bounds below. They are writer
 guarantees. A reader MAY treat a chunk that violates one of them as a
 **corrupt** chunk (report it and skip it, as for a too-short payload); a
-reader is not required to check any of them. Exceptions the current writer
-does not meet are listed under [Open points](#17-open-points).
+reader is not required to check any of them.
 
 | Chunk | Bound |
 |---|---|
@@ -227,8 +226,7 @@ does not meet are listed under [Open points](#17-open-points).
 | `RUN ` | `cell` finite and `> 0`; `origin_x`, `origin_y` finite |
 | `SRCH` | every `path` and `trace_cell` entry `< 2 * nc`; `ntrace_total <= 2 * nc`; `ntrace <= ntrace_total` |
 | `SRCH` | every `src` and `tgt` entry `< 2 * nc` when `error` is clear (the C core rejects a search with an invalid cell, so such a search always has `error` set) |
-| `CMIT` | every `path` entry `< 2 * nc`; every stub `layer <= 1`; every via `0 <= i < nx`, `0 <= j < ny` |
-| `VIA ` | `0 <= i < nx`, `0 <= j < ny` |
+| `CMIT` | every `path` entry `< 2 * nc`; every stub `layer <= 1` |
 | `DISC` | `layer` is 0 or 1 (the C core rejects other layers). `i`, `j` may lie outside the grid: the disc is clipped to it |
 | `RECT` | `op <= 2` |
 | `DROP` | `ok <= 2` |
@@ -238,6 +236,23 @@ does not meet are listed under [Open points](#17-open-points).
 
 Bounds that refer to `nx`, `ny` or `nc` use the `RUN ` of the chunk's session
 ([6](#6-order-guarantees) rule 3).
+
+Values that are **not** bounded, because the router accepts them:
+
+- **`src` and `tgt` of a `SRCH` with `error` set.** The writer stores them as
+  passed; a negative cell becomes a large `u32`. Such a chunk is valid. A
+  reader MUST NOT treat it as corrupt and does not report it; it keeps the
+  search's `search_id` and the rest of its fields.
+- **Via cells.** The C core does not reject an `add_via` whose `(i, j)` lies
+  outside the grid: it clips the via's discs. So a `VIA ` (with `added = 1`
+  or 0) or a `CMIT` via can hold an `(i, j)` outside `0 <= i < nx`,
+  `0 <= j < ny`. For a `CMIT` via this happens when user code passes
+  `commit` a path whose `(layer, idx)` pairs are not in canonical form
+  (`idx` outside `0 .. nc - 1`) although the encoded cells are valid. Such a
+  chunk is valid: it is not corrupt, a `VIA ` with `added = 1` takes its
+  copper id ([4.1](#41-ids)) and the copper is alive as [8](#8-copper-state-at-any-point-normative)
+  says. A reader MAY report it as a warning, and a viewer MAY leave the via
+  undrawn.
 
 The format sets no maximum grid size other than the `u32` cell bound above.
 The router itself (informative) supports at most 8192 cells per side, 16
@@ -281,14 +296,18 @@ Checking the sequences:
 - A corrupt `SRCH`, `RNB ` or `CMIT` (one whose payload cannot be read,
   [3.3](#33-general-chunk-rules)) is still identified by its tag, so its
   position in the sequence is known. A reader MAY count it, so that it takes
-  the next id and the following chunks keep their expected ids.
+  the next id and the following chunks keep their expected ids. Both
+  existing readers do.
 - A corrupt `VIA ` takes no copper id, because whether it has `added = 1` is
   unknown. If it did create copper, the next copper id in the file is one
   higher than the reader expects, and the reader reports that mismatch.
-
-How a reader continues after a reported mismatch (keep counting, or continue
-from the stored id) differs between the existing readers; see
-[Open points](#17-open-points).
+- **Resynchronising.** After a mismatch the reader reports one error and
+  continues from the stored id: the next expected id is the stored id plus
+  one. A gap in a sequence is therefore reported once, not at every later
+  chunk, and two readers that count a corrupt chunk differently agree again
+  from the next intact chunk of that sequence. A chunk keeps its stored id:
+  `RIP ` lists and `repeat_of` name copper and searches by the ids stored in
+  their chunks.
 
 ### 4.2 `ctx`: where a call happened
 
@@ -388,9 +407,12 @@ A writer MUST produce, and a reader MAY rely on, the following.
    `RIP `, `DROP`, `ROUT`. `NETS`, `MARK` and `BRD ` may appear before the
    first `RUN `. A reader reports a router chunk before the first `RUN ` as
    an error and MAY treat it as a corrupt chunk; it belongs to no session.
-   A router chunk after a corrupt `RUN ` (one the reader could not parse)
-   cannot be checked against that session's grid; how readers handle it
-   differs (see [Open points](#17-open-points)).
+   A corrupt `RUN ` (one the reader cannot parse) still starts a new
+   session, as rule 3 says: the previous session's copper is gone, and the
+   new session has no known grid. Every router chunk of that session is
+   reported as an error and MAY be treated as a corrupt chunk; none of them
+   changes the copper state. The next valid `RUN ` starts a usable session
+   again. Ids keep counting through such a session ([4.1](#41-ids)).
 3. A file may contain more than one `RUN `. Each `RUN ` starts a new router
    session (a new `Router` object was attached): all router state from the
    previous session (copper, grids, snapshot) is gone, and every later chunk
@@ -573,7 +595,8 @@ r_t, r_w` (offsets 0, 4, 8, 12, 16, 20). Radii in cells.
 | 28 | `u32` | route_id | `NONE32` unless inside `route_net` |
 
 A via occupies both router layers. It is drawn at cell `(i, j)` with
-`RUN `.`via_dia` / `via_drill`.
+`RUN `.`via_dia` / `via_drill`. `(i, j)` can lie outside the grid; the chunk
+is still valid ([3.4](#34-value-bounds)).
 
 ### 7.7 `SNAP` snapshot
 
@@ -823,7 +846,7 @@ Variable part, starting at offset 48:
 | Field | Type | Meaning |
 |---|---|---|
 | stubs | `nstub × (u32 layer, u32 reserved, f64 x0, f64 y0, f64 x1, f64 y1, f64 w)` | 48 bytes each; router-grid mm; in the order `commit` appended them to `Router.stubs[net]` |
-| vias | `nvia × (i32 i, i32 j)` | 8 bytes each; vias this commit created (its `add_via` calls that found no existing via of this net at `(i, j)`), in call order: layer changes along the path, then `end_via` |
+| vias | `nvia × (i32 i, i32 j)` | 8 bytes each; vias this commit created (its `add_via` calls that found no existing via of this net at `(i, j)`), in call order: layer changes along the path, then `end_via`. A via can lie outside the grid ([3.4](#34-value-bounds)) |
 | path | `cell[npath]` | the committed path |
 
 `struct` of a stub: `"<II5d"`; of a via: `"<ii"`.
@@ -888,20 +911,30 @@ has no `SNAP` for it. So:
   `nremoved = 0`.
 
 A reader cannot tell the two cases apart before the first `SNAP` of a
-session: there, `removed` is either empty or exactly the net's copper of the
-session not yet ripped. After a `SNAP` in the session, only the first case is
-possible.
+session. There, both are valid and a reader reports neither: `removed` is
+either empty (`nremoved = 0`), or exactly the net's copper of the session
+since its `RUN ` that no earlier `RIP ` listed. After a `SNAP` in the session,
+only the first case is possible, and the expected list is the net's copper
+since the last `SNAP` that no earlier `RIP ` listed.
 
 The recorder computes this by keeping, per net, the copper ids created since
 the last `SNAP`; `SNAP` and `RUN ` clear all those lists, `RIP ` empties the
 net's list. It writes the list if the router has a snapshot (`Router._snap`
 is set) and an empty list otherwise.
 
-A `RIP ` that lists a copper id that does not exist (no earlier creating
-chunk), that belongs to an earlier session, or that an earlier `RIP ` already
-removed, is an error, which the reader reports; such an id removes nothing.
-A `removed` list that is not ascending, or that is not exactly the list
-described above, is a warning ([10](#10-reader-algorithm)).
+Each listed copper id is checked in this order:
+
+1. an id that does not exist (no earlier creating chunk) is an **error**;
+2. an id created in an earlier session is an **error**;
+3. an id that an earlier `RIP ` already removed is an **error**;
+4. otherwise the id is removed, as [8](#8-copper-state-at-any-point-normative)
+   says. If it belongs to another net (of the same session), it is still
+   removed, and the reader MAY report a **warning**. The writer never
+   produces this.
+
+An id in cases 1 to 3 removes nothing. A `removed` list that is not strictly
+ascending, or that is not exactly the list described above, is a warning
+([10](#10-reader-algorithm)); the ids it lists are applied as above.
 
 ### 7.15 `DROP` drop_to_plane
 
@@ -962,10 +995,23 @@ Then these sections, in this order:
 
 **Layers**: `u32 n`, then `n × (i32 kicad_id, i32 type, str name)`.
 
-- `name` is the canonical KiCad layer name (`"F.Cu"`, `"In1.Cu"`, `"B.Cu"`,
-  `"F.SilkS"`, `"B.Mask"`, `"F.Paste"`, `"F.CrtYd"`, `"F.Fab"`,
-  `"Edge.Cuts"`, `"User.1"`, …), as from `BOARD.GetStandardLayerName`. Names
-  are the key; `kicad_id` is informational (KiCad 10 renumbered layer ids).
+- `name` is the canonical KiCad layer name. Writers write the name that
+  `BOARD.GetStandardLayerName(id)` returns in the KiCad version they run
+  with. KiCad 10 (checked with 10.0.8) returns the long names: `"F.Cu"`,
+  `"In1.Cu"` … `"B.Cu"`, `"F.Mask"`, `"B.Mask"`, `"F.Silkscreen"`,
+  `"B.Silkscreen"`, `"F.Adhesive"`, `"B.Adhesive"`, `"F.Paste"`,
+  `"B.Paste"`, `"F.Courtyard"`, `"B.Courtyard"`, `"F.Fab"`, `"B.Fab"`,
+  `"User.Drawings"`, `"User.Comments"`, `"User.Eco1"`, `"User.Eco2"`,
+  `"Edge.Cuts"`, `"Margin"`, `"Rescue"`, `"User.1"` … `"User.45"`.
+- Readers SHOULD accept the older short names as synonyms of the long ones:
+  `"F.SilkS"`, `"B.SilkS"` (silkscreen), `"F.CrtYd"`, `"B.CrtYd"`
+  (courtyard), `"F.Adhes"`, `"B.Adhes"` (adhesive), `"Dwgs.User"`,
+  `"Cmts.User"`, `"Eco1.User"`, `"Eco2.User"` (`User.Drawings`,
+  `User.Comments`, `User.Eco1`, `User.Eco2`). Names that are the same in
+  both forms (`F.Mask`, `F.Paste`, `F.Fab`, `Edge.Cuts`, `Margin`, copper)
+  need no mapping. `RUN `.`layer_name` uses the same names.
+- Names are the key; `kicad_id` is informational (KiCad 10 renumbered layer
+  ids).
 - `type`: for copper layers the KiCad `LAYER_T` value from
   `BOARD.GetLayerType(id)`; `-1` for non-copper layers.
 - Records below refer to layers by `layer_index`, the 0-based position in this
@@ -1021,7 +1067,7 @@ Record kinds (body layouts; offsets relative to the body start):
 | 4 | `i32` | net | KiCad net code or `-1` |
 | 8 | `i32` | fp | footprint index or `-1` |
 | 12 | `u32` | role | 0 pad, 1 graphic, 2 text (glyph outlines), 3 zone fill, 4 zone outline, 5 board outline, 6 rule area (keep-out) |
-| 16 | `u32` | sub | 0 = filled; > 0 = stroked with this line width in nm |
+| 16 | `u32` | sub | 0 = filled form; > 0 = stroked with this line width in nm (roles 4 to 6: see below) |
 | 20 | `u32` | npoly | |
 | 24 | | polygons | `npoly ×` ( `u32 ncont`, then `ncont ×` ( `u32 npts`, `i32 xy[2 * npts]` ) ) |
 
@@ -1035,6 +1081,32 @@ Record kinds (body layouts; offsets relative to the body start):
 - Zone fills are the unfractured fill (outline plus holes), one POLYSET per
   zone per layer. Text is converted to glyph outline polygons
   (`TransformTextToPolySet`), role 2.
+- **Area boundaries: roles 4 (zone outline), 5 (board outline) and 6 (rule
+  area).** These polygons mark the edge of an area. Writers use either form,
+  and readers MUST accept both for each of these roles:
+  - `sub = 0`: the filled form's geometry (first contour the outline, the
+    others holes, implicitly closed). A reader that draws these records
+    SHOULD draw each contour as a closed line, not fill the area; the line
+    width is the reader's choice.
+  - `sub > 0`: the stroked form. Each contour is a polyline of width `sub`;
+    a closed boundary repeats its first point at the end.
+
+  The writers in this repository: `gridrouter/kicad_trace.py` writes role 5
+  with `sub = 0` (the polygon from `BOARD.GetBoardPolygonOutlines`, with a
+  hole for each cut-out), and roles 4 and 6 with `sub = 0` (the zone's
+  outline). `examples/record_bench.py` writes role 5 with `sub = 50000`
+  (one closed rectangle, 0.05 mm wide) and role 6 with `sub = 0`. The C++
+  viewer (`viewer/core/src/display.cpp`) draws roles 4 to 6 as lines in both
+  cases: `sub = 0` contours closed at a 0.05 mm hairline, `sub > 0` contours
+  as written at width `sub`; it also hatches role 6, and takes the board's
+  extent from role 5.
+- **Overlap.** Within one POLYSET record, writers SHOULD NOT write polygons
+  that overlap one another; they unite them first (`kicad_trace.py` calls
+  `SHAPE_POLY_SET.Simplify` when a filled shape gives more than one
+  polygon). Readers MUST NOT rely on this for correctness: each polygon is
+  filled on its own, so overlapping polygons still cover the right area.
+  The only allowed visible effect of an overlap is that a translucent colour
+  is blended twice where the polygons overlap.
 
 **2 HOLE** (40 bytes, `struct` `"<iiiidIIii"`):
 
@@ -1118,6 +1190,11 @@ Let position P be "just after chunk P has been applied". Let R be the latest
 > every `copper_id` whose creating chunk (`CMIT`, or `VIA ` with `added = 1`)
 > is after R and at or before P, and which is not listed in any `RIP ` that is
 > after R and at or before P.
+
+If there is no `RUN ` at or before P, or R is corrupt, no copper is present
+([6](#6-order-guarantees) rule 2). A `RIP ` removes every listed id that
+exists, belongs to R's session and is not yet removed, whichever net it
+belongs to ([7.14](#714-rip--one-rip)).
 
 Nothing else adds or removes copper. In particular `SNAP`, `RBLD`, `GRDS`,
 `ROUT` and `BRD ` do not change the copper set. A viewer can therefore seek in
@@ -1215,10 +1292,11 @@ Readers SHOULD also check: `search_id` / `route_id` / `copper_id` sequences
 `cell < 2 * nc`.
 
 **Errors and warnings.** Corrupt chunks ([3.3](#33-general-chunk-rules),
-[3.4](#34-value-bounds)), id mismatches ([4.1](#41-ids)), router chunks
-before the first `RUN ` ([6](#6-order-guarantees) rule 2), a `route_id` that
-names no earlier `RNB `, and a `RIP ` that names a missing, earlier-session
-or already-removed copper id ([7.14](#714-rip--one-rip)) are errors. The
+[3.4](#34-value-bounds)), id mismatches ([4.1](#41-ids), reported once per
+gap), router chunks before the first `RUN ` or in a session whose `RUN ` is
+corrupt ([6](#6-order-guarantees) rule 2), a `route_id` that names no
+earlier `RNB `, and a `RIP ` that names a missing, earlier-session or
+already-removed copper id ([7.14](#714-rip--one-rip)) are errors. The
 following are inconsistencies a reader MAY report as **warnings**. None of
 them makes a chunk corrupt; a reader does not skip or reject a chunk because
 of them:
@@ -1234,9 +1312,23 @@ of them:
   existing `RNB ` other than the open one (rule 6);
 - `END ` counts or totals (`searches`, `routes`, `expanded_total`,
   `trace_entries`) that differ from the chunks;
-- a `RIP ` `removed` list that is not ascending, or not exactly the copper
-  [7.14](#714-rip--one-rip) describes;
+- a `RIP ` `removed` list that is not strictly ascending, or not exactly the
+  copper [7.14](#714-rip--one-rip) describes, and a `RIP ` that removes
+  another net's copper of the session;
+- a `VIA ` or `CMIT` via whose `(i, j)` lies outside the grid
+  ([3.4](#34-value-bounds));
 - the `SRCH` trace-field inconsistencies of [7.11](#711-srch-one-search).
+
+These are not reported at all: a `RIP ` with `nremoved = 0` before the
+session's first `SNAP` ([7.14](#714-rip--one-rip)), and `src` / `tgt` cells
+of any value in a `SRCH` with `error` set ([3.4](#34-value-bounds)).
+
+The Python reader (`python3 -m gridrouter.tracefile check`, `tracefile.check`)
+also reports these as warnings, which this section does not list: a chunk
+other than `SRCH`, `RBLD`, `RIP `, `CMIT` inside a `route_net`, a `SRCH` or
+`CMIT` whose `ctx` does not match the open `route_net`, a `SRCH` that lists a
+trace cell twice, an `RBLD` not followed by its `RIP ` chunks (rule 7), and
+a `DROP` not preceded by its chunks (rule 8).
 
 ---
 
@@ -1273,8 +1365,10 @@ of them:
     are repeats, but they are the large ones: a failed search explores
     everything it can reach before giving up. On this board 4 of 184
     searches are repeats, and they account for 34.8 % of all trace entries.
+    The whole file written by `examples/record_bench.py` is 21.8 MB.
   - The real 501 x 361 dongle board, with its fan-out, CAN bus, plane stubs,
-    main queue, rip-ups and polishing passes: about 80 to 240 MB.
+    main queue, rip-ups and polishing passes: estimated at 80 to 240 MB;
+    one run measured on 2026-11-23 wrote 145.8 MB.
   - A `BRD ` chunk is dominated by text glyph polygons and zone fills: a few
     MB.
 - No compression in 1.0, so the C++ reader stays dependency-free; `enc` is
@@ -1495,62 +1589,71 @@ field, size or number changed; files valid before are valid now.
 - [14](#14-what-the-format-does-not-capture) item 2: a snapshot made before
   attaching.
 
+**2026-11-23, second pass.** Open points 1 to 6 of [17](#17-open-points)
+settled by the project lead; open point 8 closed after checking
+`gridrouter/kicad_trace.py`; `BRD ` details from running KiCad 10. No byte layout, field, size or number changed; files valid
+before are valid now. Some files that a reader could report as corrupt or as
+having errors before are valid now (a `SRCH` with `error` set and invalid
+`src` / `tgt`, a via outside the grid, a `RIP ` of another net's copper).
+
+- [3.4](#34-value-bounds): `src` / `tgt` of a `SRCH` with `error` set are not
+  bounded; such a chunk is valid and is not reported (open point 4). Via
+  cells (`VIA `, `CMIT` vias) are not bounded; a via outside the grid is a
+  valid chunk, a `VIA ` with `added = 1` takes its copper id, and a reader
+  MAY warn (open point 5).
+- [4.1](#41-ids): after an id mismatch a reader reports one error and
+  continues from the stored id, so one gap gives one error; a reader MAY
+  count a corrupt `SRCH`, `RNB ` or `CMIT`, and both readers do (open point
+  3). The Python `check` now counts them too.
+- [6](#6-order-guarantees) rule 2 and [8](#8-copper-state-at-any-point-normative):
+  a corrupt `RUN ` starts a new session with no grid and no copper; its
+  router chunks are errors until the next valid `RUN ` (open point 2). The
+  Python reader now does this; before, it continued in the previous session.
+- [7.14](#714-rip--one-rip): before the session's first `SNAP`, an empty
+  list and the net's copper since `RUN ` are both valid without a warning
+  (open point 1). Each listed id is checked in a fixed order: missing,
+  earlier session or already removed is an error and removes nothing;
+  another net's copper of the session is removed, with a warning (open
+  point 6).
+- [7.18](#718-brd--kicad-board): layer names are those
+  `BOARD.GetStandardLayerName` returns in the writer's KiCad version; KiCad
+  10.0.8's list is given, and readers SHOULD accept the older short names as
+  synonyms. Roles 4 to 6 are area boundaries, in either the filled or the
+  stroked form, and both forms of the board outline that the writers produce
+  are described. Polygons within one POLYSET record SHOULD NOT overlap.
+  PADINFO `fp` is never `-1`: `gridrouter/kicad_trace.py` writes pads only
+  from their footprint, with that footprint's index (open point 8).
+- [10](#10-reader-algorithm): the error and warning lists follow the points
+  above; what is not reported at all; the extra warnings the Python reader
+  gives.
+- [12](#12-sizes): measured file sizes added (bench 21.8 MB, dongle
+  145.8 MB).
+- `examples/record_bench.py` writes KiCad 10's layer names
+  (`F.Silkscreen`), and the viewer's sample `small.grtrace` was regenerated
+  with it.
+
 ---
 
 ## 17. Open points
 
-Points the clarification could not settle without changing an
+Points the clarifications could not settle without changing an
 implementation, or that need a later version. Until settled, a file that
 triggers one of them may be read differently by the two existing readers.
+Settled points keep their numbers, because code comments refer to them.
 
-1. **`RIP ` before the session's first `SNAP`, router snapshotted before
-   attaching** ([7.14](#714-rip--one-rip)). The writer lists the net's copper
-   ids of the session, as 7.14 now says. The C++ reader expects an empty
-   list until a `SNAP` chunk of the session has been read (`Trace::on_rip`
-   in `viewer/core/src/trace.cpp`: `expected` is filled only
-   `if (snapped_ && …)`, and `snapped_` is set only by `on_snap` and cleared
-   by `on_run`), so it reports a warning for such a `RIP `. It still applies
-   the removal, so the copper state is right. The Python `check` accepts
-   both cases.
-2. **Router chunks after a corrupt `RUN `** ([6](#6-order-guarantees) rule
-   2). The C++ reader starts a new session at a corrupt `RUN ` and treats
-   every router chunk of that session as corrupt (no valid grid). The Python
-   reader ignores the corrupt `RUN `: later chunks are checked and replayed
-   against the previous session (or reported as "before any `RUN `" if there
-   is none), and the previous session's copper stays alive.
-3. **Continuing after an id mismatch** ([4.1](#41-ids)). The C++ reader
-   assigns ids by counting chunks of each tag (a corrupt `SRCH`, `RNB ` or
-   `CMIT` counts, a corrupt `VIA ` does not) and keeps the counted ids: after
-   one corrupt `VIA ` that created copper, every later copper chunk is
-   reported as a mismatch, and `RIP ` ids are resolved by the counted ids.
-   The Python reader does not count corrupt chunks, reports one mismatch,
-   then continues from the stored id, and `replay` keys copper by the stored
-   `copper_id`.
-4. **Invalid cells in a `SRCH` with `error` set**
-   ([3.4](#34-value-bounds)). A search whose sources or targets hold a cell
-   outside `0 .. 2 * nc - 1` raises `RouterError`, and the writer stores
-   `src` / `tgt` as passed (a negative cell becomes a large `u32`). The
-   Python `check` exempts `src` / `tgt` from the cell bound. The C++ reader
-   (`Trace::on_srch`) treats any `src`, `tgt` or `path` cell `>= 2 * nc` as
-   corrupt, so it skips such a search (it still takes its `search_id`).
-   Either the bound is relaxed for `src` / `tgt` of an `error` search, or the
-   writer changes.
-5. **`VIA ` outside the grid** ([3.4](#34-value-bounds)). The C core does not
-   reject an `add_via` whose `(i, j)` lies outside the grid: it clips the
-   discs. A direct `add_via` call with such a cell therefore produces a
-   `VIA ` with `added = 1` and an out-of-range `(i, j)`. The C++ reader
-   (`Trace::on_via`) treats it as corrupt, which also costs it that copper
-   id (open point 3). The same can happen in a `CMIT` via if user code
-   passes `commit` a path whose `(layer, idx)` pairs are not in canonical
-   form (`idx` outside `0 .. nc - 1`) although the encoded cells are valid.
-   The Python reader does not check via cells.
-6. **`RIP ` listing another net's copper** ([7.14](#714-rip--one-rip),
-   [8](#8-copper-state-at-any-point-normative)). Section 8 removes every
-   copper id a `RIP ` lists. The Python `replay` does so; its `check`
-   reports the list as not exact. The C++ reader reports an error and does
-   **not** remove a copper id of another net (`Trace::on_rip`), so the two
-   readers show different copper after such a `RIP `. The writer never
-   produces one.
+1. *Settled 2026-11-23 (second pass):* `RIP ` before the session's first
+   `SNAP`, router snapshotted before attaching. See
+   [7.14](#714-rip--one-rip).
+2. *Settled 2026-11-23 (second pass):* router chunks after a corrupt `RUN `.
+   See [6](#6-order-guarantees) rule 2.
+3. *Settled 2026-11-23 (second pass):* continuing after an id mismatch. See
+   [4.1](#41-ids).
+4. *Settled 2026-11-23 (second pass):* invalid cells in a `SRCH` with
+   `error` set. See [3.4](#34-value-bounds).
+5. *Settled 2026-11-23 (second pass):* `VIA ` and `CMIT` vias outside the
+   grid. See [3.4](#34-value-bounds).
+6. *Settled 2026-11-23 (second pass):* `RIP ` listing another net's copper.
+   See [7.14](#714-rip--one-rip).
 7. **`enc != 0` and appended fields** ([7.11](#711-srch-one-search),
    [11](#11-versioning)). The encoded trace data runs to the end of the
    payload, so a minor version that defines an `enc` value and also appends
@@ -1558,9 +1661,9 @@ triggers one of them may be read differently by the two existing readers.
    (for example, a length inside the encoding). The Python reader keeps all
    bytes after `path` as the encoded data; the C++ reader ignores them.
    Nothing written today is affected (`enc = 0`).
-8. **PADINFO `fp`** ([7.18](#718-brd--kicad-board)). Settled as "never
-   `-1`" from KiCad's model (every pad has a parent footprint) and from the
-   existing writers (`BoardWriter.padinfo` passes `fp` through; the tests
-   write valid indexes). `gridrouter/kicad_trace.py`, the KiCad board
-   writer, did not exist when this was written; it MUST follow this rule.
-   The C++ reader also accepts `-1`, which is allowed.
+8. *Settled 2026-11-23 (second pass):* PADINFO `fp` is never `-1`
+   ([7.18](#718-brd--kicad-board)). `gridrouter/kicad_trace.py` writes a
+   pad only while it walks the pads of a footprint, with that footprint's
+   index. The C++ reader also accepts `-1`, which is allowed.
+
+Only point 7 is open.
