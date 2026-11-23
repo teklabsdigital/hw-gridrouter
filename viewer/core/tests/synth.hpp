@@ -442,6 +442,12 @@ public:
 // second session (see the function for the exact sequence).
 std::vector<unsigned char> build_timeline_sample();
 
+// A random routing run of one to three sessions (nets N1..N4 on a 12 x 8
+// grid): commits, vias, rips (some listing another net's copper), snapshots,
+// route_net calls with searches, rebuilds and failed pads, drop_to_plane
+// calls, phases and boards.  Deterministic per seed.
+std::vector<unsigned char> random_timeline(std::uint32_t seed);
+
 } // namespace synth
 
 #endif // RV_TESTS_SYNTH_HPP

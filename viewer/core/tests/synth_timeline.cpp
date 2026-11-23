@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <random>
 #include <cstdlib>
 #include <functional>
 #include <queue>
@@ -506,5 +507,97 @@ std::vector<unsigned char> build_timeline_sample() {
     tw.end({});
     return tw.w.out;
 }
+
+namespace {
+Cell CellAt(std::uint32_t l, std::int32_t i, std::int32_t j) {
+    Cell c;
+    c.layer = l;
+    c.i = i;
+    c.j = j;
+    return c;
+}
+} // namespace
+
+// Moved here from test_timeline.cpp (M5) so other tests can use it.
+std::vector<unsigned char> random_timeline(std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    auto R = [&](std::uint32_t n) { return static_cast<std::uint32_t>(rng() % n); };
+    TimelineWriter tw;
+    tw.nets({{1, "N1"}, {2, "N2"}, {3, "N3"}, {4, "N4"}});
+    tw.run = make_run(12, 8, 8);
+    auto path = [&]() {
+        std::vector<Cell> p;
+        Cell c = CellAt(R(2), static_cast<std::int32_t>(R(12)), static_cast<std::int32_t>(R(8)));
+        p.push_back(c);
+        const std::uint32_t n = 1 + R(7);
+        for (std::uint32_t k = 0; k < n; ++k) {
+            if (R(5) == 0) {
+                c.layer ^= 1u;
+            } else {
+                c.i = std::max(0, std::min(11, c.i + static_cast<std::int32_t>(R(3)) - 1));
+                c.j = std::max(0, std::min(7, c.j + static_cast<std::int32_t>(R(3)) - 1));
+            }
+            p.push_back(c);
+        }
+        return p;
+    };
+    auto name = [](std::int32_t net) { return "N" + std::to_string(net); };
+    const std::uint32_t sessions = 1 + R(3);
+    for (std::uint32_t s = 0; s < sessions; ++s) {
+        if (R(2) == 0) tw.brd(tw.board("b", R(2) == 0));
+        tw.start(12, 8);
+        const std::uint32_t ops = 15 + R(40);
+        for (std::uint32_t k = 0; k < ops; ++k) {
+            const std::int32_t net = 1 + static_cast<std::int32_t>(R(4));
+            switch (R(11)) {
+            case 0:
+            case 1:
+            case 2: tw.commit(net, path(), R(2) ? 0.2 : 0.5, R(3) == 0 ? std::vector<std::pair<std::int32_t, std::int32_t>>{{static_cast<std::int32_t>(R(12)), static_cast<std::int32_t>(R(8))}} : std::vector<std::pair<std::int32_t, std::int32_t>>{}); break;
+            case 3: tw.via(net, static_cast<std::int32_t>(R(12)), static_cast<std::int32_t>(R(8))); break;
+            case 4: {
+                std::vector<std::uint32_t> extra;
+                if (R(4) == 0 && !tw.alive.empty()) {
+                    auto it = tw.alive.begin();
+                    std::advance(it, R(static_cast<std::uint32_t>(tw.alive.size())));
+                    if (it->second.net != net) extra.push_back(it->first);
+                }
+                tw.rip(net, 0, NONE32, extra);
+                break;
+            }
+            case 5:
+                if (R(3) == 0) tw.snap();
+                break;
+            case 6: {
+                const std::uint32_t r = tw.rnb(net, name(net), {{1.0, 1.0, 1, 2, "P1"}, {2.0, 1.5, 1, 2, "P2"}});
+                tw.srch(net, {CellAt(0, 4, 4)}, {CellAt(0, 8, 4)}, {}, 1 + R(5000), 1, r);
+                if (R(2) == 0) {
+                    const std::int32_t other = 1 + static_cast<std::int32_t>(R(4));
+                    tw.rbld(r, {name(other)}, {other});
+                    tw.rip(other, 1, r);
+                }
+                const std::vector<Cell> p = path();
+                tw.srch(net, {p.front()}, {p.back()}, p, 1 + R(5000), 1, r);
+                tw.commit(net, p, 0.2, {}, {}, 1, r);
+                std::vector<std::string> failed;
+                if (R(3) == 0) failed.push_back("P2");
+                if (R(4) == 0) failed.push_back("P1");
+                tw.rne(r, net, failed);
+                break;
+            }
+            case 7:
+                tw.srch(net, {CellAt(0, 2, 2), CellAt(0, 3, 2)}, {CellAt(1, 2, 2)}, {}, 1 + R(300), 2);
+                tw.drop(net, R(3), name(net), "P" + std::to_string(1 + R(2)));
+                break;
+            case 8: tw.mark(R(2), "phase " + std::to_string(k)); break;
+            case 9: tw.brd(tw.board("mid", R(2) == 0)); break;
+            default: tw.pad(net, 0.25 * R(12), 0.25 * R(8), 0.3); break;
+            }
+        }
+        if (R(2) == 0) tw.rout();
+    }
+    if (R(4) != 0) tw.end({});
+    return tw.w.out;
+}
+
 
 } // namespace synth

@@ -7,6 +7,10 @@
 // Everything drawn comes from the core's timeline (rv_get_timeline); the
 // bars are binned per point column when the width or the timeline changes,
 // and the playhead is a separate layer, so playing never redraws the strip.
+//
+// M5: the selected net's events (rv_net_events) are marked in the
+// selection colour: a mark in a strip under the phase bands for each, and
+// its search bars drawn over in that colour.
 
 import AppKit
 import RVKit
@@ -24,6 +28,8 @@ final class TimelineView: NSView {
     private var columnsWidth: CGFloat = -1
     private var time = 0.0
     private let playhead = NSView()
+    /// The selected net's events, ascending (M5).
+    private(set) var netEvents: [UInt32] = []
 
     static let phaseHeight: CGFloat = 15
     static let tickHeight: CGFloat = 9
@@ -58,6 +64,13 @@ final class TimelineView: NSView {
         columnsWidth = -1
         needsDisplay = true
         placePlayhead()
+    }
+
+    /// Mark the selected net's events (empty: none selected).
+    func setNetEvents(_ events: [UInt32]) {
+        guard events != netEvents else { return }
+        netEvents = events
+        needsDisplay = true
     }
 
     /// Move the playhead to playback time `t`.
@@ -96,6 +109,8 @@ final class TimelineView: NSView {
     private static let notFound = NSColor(srgbRed: 0.90, green: 0.36, blue: 0.32, alpha: 1)
     private static let rip = NSColor(srgbRed: 0.98, green: 0.65, blue: 0.20, alpha: 1)
     private static let failure = NSColor(srgbRed: 1.0, green: 0.25, blue: 0.25, alpha: 1)
+    private static let selected = NSColor(srgbRed: 0.35, green: 0.80, blue: 1.0, alpha: 1)
+    static let markHeight: CGFloat = 3
 
     private func binColumns() {
         let n = max(1, Int(bounds.width.rounded(.up)))
@@ -141,7 +156,7 @@ final class TimelineView: NSView {
         }
 
         // Search bars.
-        let top = TimelineView.phaseHeight + 3, bottom = h - TimelineView.tickHeight - 2
+        let top = TimelineView.phaseHeight + 3 + TimelineView.markHeight, bottom = h - TimelineView.tickHeight - 2
         let barArea = max(1, bottom - top)
         for (c, col) in columns.enumerated() where col.size > 0 || col.failed {
             let bh = 2 + CGFloat(col.size) * (barArea - 2)
@@ -161,6 +176,23 @@ final class TimelineView: NSView {
         }
         NSColor(white: 0.3, alpha: 1).setFill()
         NSRect(x: 0, y: bottom + 1, width: w, height: 1).fill()
+
+        // The selected net's events: a mark each under the phase bands, and
+        // its search bars over the others.
+        if !netEvents.isEmpty {
+            TimelineView.selected.setFill()
+            let n = tl.events.count
+            for i in netEvents where Int(i) < n {
+                let e = tl.events[Int(i)]
+                let x0 = x(of: e.start).rounded(.down), x1 = x(of: e.start + e.duration)
+                NSRect(x: x0, y: TimelineView.phaseHeight + 1, width: max(1, x1 - x0),
+                       height: TimelineView.markHeight).fill()
+                if e.kind == .search {
+                    let bh = 2 + CGFloat(e.size) * (barArea - 2)
+                    NSRect(x: x0, y: bottom - bh, width: 1, height: bh).fill()
+                }
+            }
+        }
     }
 
     // MARK: - Scrubbing

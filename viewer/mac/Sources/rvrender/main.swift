@@ -4,18 +4,22 @@
 //
 //   rvrender FILE OUT.png [--size WxH] [--board N] [--layers a,b,c | --all-layers]
 //                         [--hide-classes i,j] [--fit | --window x0,y0,x1,y1]
-//                         [--at FRACTION | --event N [--into F]] [--pacing PACING]
+//                         [--at FRACTION | --event N [--into F]] [--pacing PACING] [--select NET]
 //   rvrender FILE OUTDIR --frames N [same options]     N frames evenly through the run
 //   rvrender --compare GOLDEN.png NEW.png [--tolerance T] [--max-fraction F]
 //   rvrender --bench FILE [--size WxH] [--frames N] [--board N]
 //   rvrender --bench-playback FILE [--size WxH] [--speed S] [--frames N] [--bands B] [--pacing PACING]
+//                                  [--select NET]
 //   rvrender --selftest FILE [--size WxH]
+//   rvrender --repeat FILE [--size WxH] [--at FRACTION]   how repeatable the banded rasteriser is
 //
 // Without --at or --event the position is the end of the run (as after
 // opening a trace in the app).  --into F: F (0...1) of the way through event
 // N, e.g. part of a search's wavefront revealed (below 0.8) or settled.
 // PACING (how long each event lasts): fit[:SECONDS] (the default, 180 s),
-// nets, net:NET (one router net), skip-failed, real[:SLOWDOWN] (default 10).  Exit status 0 on success (and for
+// nets, net:NET (one router net), skip-failed, real[:SLOWDOWN] (default 10).
+// --select NET: select the net of that name (KiCad-style highlight), as a
+// click on it in the app does.  Exit status 0 on success (and for
 // --compare, images within tolerance), 1 on failure, 2 for bad usage.
 
 import CoreGraphics
@@ -33,11 +37,14 @@ func usage() -> Never {
     usage: rvrender FILE OUT.png [--size WxH] [--board N] [--layers a,b,c | --all-layers]
                                  [--hide-classes i,j] [--fit | --window x0,y0,x1,y1]
                                  [--at FRACTION | --event N [--into F]] [--pacing PACING]
+                                 [--select NET]
            rvrender FILE OUTDIR --frames N [options as above]
            rvrender --compare GOLDEN.png NEW.png [--tolerance T] [--max-fraction F]
            rvrender --bench FILE [--size WxH] [--frames N] [--board N]
            rvrender --bench-playback FILE [--size WxH] [--speed S] [--frames N] [--bands B] [--pacing PACING]
+                                          [--select NET]
            rvrender --selftest FILE [--size WxH]
+           rvrender --repeat FILE [--size WxH] [--at FRACTION]
     PACING: fit[:SECONDS], nets, net:NET, skip-failed, real[:SLOWDOWN]
     """, code: 2)
 }
@@ -62,6 +69,7 @@ struct Options {
     var bands = 0
     var into: Double?
     var pacing: Pacing?
+    var select: String?
 }
 
 /// "fit", "fit:60", "nets", "net:4", "skip-failed", "real", "real:10" (as rvdump).
@@ -147,6 +155,10 @@ func parseOptions(_ args: ArraySlice<String>) -> Options {
         case "--pacing":
             guard let p = parsePacing(value(a)) else { usage() }
             o.pacing = p
+        case "--select":
+            let v = value(a)
+            guard !v.isEmpty else { usage() }
+            o.select = v
         default:
             if a.hasPrefix("--") { usage() }
             o.positional.append(a)
@@ -166,6 +178,12 @@ func openSession(_ path: String, _ o: Options, needBoard: Bool = true) -> Sessio
         try s.open(path: path)
         try s.selectBoard(o.board)
         if let p = o.pacing { try s.setPacing(p) }
+        if let name = o.select {
+            try s.selectName(name)
+            if let sel = try s.selection(), sel.net == nil, sel.boardNets == 0 {
+                FileHandle.standardError.write(Data("rvrender: no net is named \(name); everything is dimmed\n".utf8))
+            }
+        }
         if let f = o.at { try s.seek(fraction: f) }
         if let e = o.event {
             let count = try s.position().eventCount
@@ -320,6 +338,11 @@ func render(_ o: Options) -> Int32 {
             print("  pacing \(try s.text(.pacing)); wavefront: \(p.cellsRevealed) entries revealed, "
                   + "\(waves.reduce(0) { $0 + Int($1.cells) }) cells drawn in \(waves.count) images"
                   + (p.settled ? ", settled" : ""))
+        }
+        if let sel = try s.selection() {
+            let hl = r.overlaySlots.first { $0.kind == .highlight }?.batchCount ?? 0
+            print("  selected \"\(sel.name)\"" + (sel.net.map { " (router net \($0))" } ?? " (no router net)")
+                  + ": \(sel.boardNets) board nets, \(sel.boardItems) board items, \(hl) highlight batches")
         }
         return 0
     } catch {
@@ -530,12 +553,39 @@ func benchPlayback(_ o: Options) -> Int32 {
             }
         }
         let fullStart = fullRedraw()
+        // With --select: the time to change the selection and show it, as a
+        // click in the app does: the core's call, the overlay copy, the
+        // planes, the net's history and timeline events, and the nets
+        // table's info and first 40 rows of cells.  Clear, then select again.
+        func timeSelect() throws(CoreError) -> [Double] {
+            guard let name = o.select else { return [] }
+            var ms: [Double] = []
+            for k in 0..<10 {
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                if k % 2 == 0 { try s.clearSelection() } else { try s.selectName(name) }
+                try sync(s, r)
+                r.render(view: view)
+                if let net = try s.selection()?.net {
+                    _ = try s.history(net: net)
+                    _ = try s.netEvents(net: net)
+                }
+                let info = try s.netsInfo()
+                for p in 0..<min(40, info.viewCount) {
+                    for c in NetColumn.allCases { _ = try s.netCell(at: p, column: c) }
+                }
+                ms.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6)
+            }
+            return ms
+        }
+        let selectStart = try timeSelect()
         try s.setPlaying(true)
         let dt = 1.0 / 60
         let limit = o.framesGiven ? o.frames : Int.max
         var all: [Double] = [], dynamic: [Double] = [], core: [Double] = [], raster: [Double] = []
         var pixels: [Double] = [], waveOnly: [Double] = []
         var planesRendered = 0, boardFrames = 0, frames = 0, waveFrames = 0
+        var worstDynamic: (ms: Double, frame: Int, event: String, caption: String, planes: Int, pixels: Int,
+                           core: Double) = (0, 0, "", "", 0, 0, 0)
         var playing = true
         while frames < limit && playing {
             // As the app's run loop does each frame: release what Core
@@ -561,6 +611,11 @@ func benchPlayback(_ o: Options) -> Int32 {
                     raster.append(Double(t2 - t1) / 1e6)
                     pixels.append(Double(r.lastRenderedPixels))
                     if n == 0 { waveOnly.append(ms) }
+                    if ms > worstDynamic.ms {
+                        let p = try s.position()
+                        worstDynamic = (ms, frames - 1, p.event.map { "event \($0)" } ?? "no event",
+                                        try s.text(.caption), n, r.lastRenderedPixels, Double(t1 - t0) / 1e6)
+                    }
                 }
                 planesRendered += n
                 playing = try s.position().playing
@@ -586,17 +641,35 @@ func benchPlayback(_ o: Options) -> Int32 {
         row("  core: clock + overlay copy, all frames", core)
         print(String(format: "  pixels rasterised per dynamic frame: median %.0f (view %d)", median(pixels),
                      o.width * o.height))
+        print(String(format: "  slowest dynamic frame: %.2f ms, frame %d (%@: %@), %d planes, %d pixels, core %.2f ms",
+                     worstDynamic.ms, worstDynamic.frame, worstDynamic.event, worstDynamic.caption,
+                     worstDynamic.planes, worstDynamic.pixels, worstDynamic.core))
         let fullEnd = fullRedraw()
         let nonEmpty = r.planes.filter { $0.image != nil }.count
         row("full redraw (pan/zoom), start of run", fullStart)
         row("full redraw (pan/zoom), end of run", fullEnd)
-        // A wavefront plane holds its grid-sized image, not a view-sized bitmap.
-        let bytes = r.planes.reduce(0) {
-            $0 + ($1.nearest ? ($1.image.map { $0.width * $0.height } ?? 0)
-                             : Int($1.pixelRect.width * $1.pixelRect.height)) * 4
+        if let name = o.select {
+            let sel = try s.selection()
+            let selectEnd = try timeSelect()
+            row("select / clear \(name), start", selectStart)
+            row("select / clear \(name), end", selectEnd)
+            print("  selected at the end: " + (sel.map { "\"\($0.name)\", \($0.boardItems) board items" } ?? "nothing"))
         }
+        // A plane's bitmap: a wavefront plane's is grid-sized, a cropped
+        // plane's its crop, a solid rectangle's 1 x 1.
+        let bytes = r.planes.reduce(0) { $0 + ($1.image.map { $0.width * $0.height } ?? 0) * 4 }
         print("  planes at the end: \(r.planes.count), \(nonEmpty) with content, "
               + String(format: "%.1f MB of bitmaps", Double(bytes) / 1e6))
+        let sizes = r.planes.compactMap { p -> String? in
+            guard let image = p.image else { return nil }
+            let name: String
+            switch p.kind {
+            case .slab(let k): name = "slab \(k)"
+            case .slot(let kind): name = "\(kind)"
+            }
+            return String(format: "%@ %.1f", name, Double(image.width * image.height * 4) / 1e6)
+        }
+        print("    MB by plane: " + sizes.joined(separator: ", "))
         return 0
     } catch {
         fail("\(error)")
@@ -870,6 +943,66 @@ func selfTest(_ o: Options) -> Int32 {
             print("selftest: pacing modes played to the end: " + line.joined(separator: "; "))
         }
 
+        // 7. The selection (M5): highlighted pictures against single-pass
+        // ones, mid-search, at a rip-up (ghosts) and at the end; a click on
+        // what a hit test reports selects its net; clearing restores the
+        // picture exactly.
+        if let i = searches.dropFirst(searches.count / 2).first(where: { tl.events[$0].net != nil }),
+           let net = tl.events[i].net {
+            let e = tl.events[i]
+            try s.seek(time: e.start + 0.5 * e.duration)
+            try sync(s, strict)
+            guard let before = strict.composite(view: try s.view()) else { fail("cannot make the image") }
+            let changed = try s.selectNet(net)
+            check(changed.contains(.selection) && changed.contains(.overlay),
+                  "selecting net \(net) changed \(changed.rawValue)")
+            try compareSinglePass("selected net \(net), search event \(i)")
+            var positions = 1
+            if let rip = tl.events.indices.first(where: { $0 > i && tl.events[$0].kind == .ripUp }) {
+                try s.seek(event: UInt32(rip))
+                try compareSinglePass("selected net \(net), rip-up event \(rip)")
+                positions += 1
+            }
+            try s.seek(event: UInt32(i))
+            try s.seek(time: e.start + 0.5 * e.duration)
+            try s.clearSelection()
+            try sync(s, strict)
+            guard let after = strict.composite(view: try s.view()) else { fail("cannot make the image") }
+            let (n, worst) = differingPixels(before, after, tolerance: 0)
+            check(n == 0, "selection cleared: \(n) pixels differ from before it (largest \(worst))")
+            // Clicks at the points of a coarse grid: the topmost hit with a
+            // net decides the selection.
+            try s.jump(toEnd: true)
+            let v = try s.view()
+            var clicks = 0, selected = 0
+            for gy in 1..<8 {
+                for gx in 1..<12 {
+                    let x = v.width * Double(gx) / 12, y = v.height * Double(gy) / 8
+                    let hits = try s.hitTest(viewX: x, viewY: y)
+                    try s.click(viewX: x, viewY: y)
+                    let sel = try s.selection()
+                    clicks += 1
+                    if let top = hits.first(where: { $0.net != nil || !$0.netName.isEmpty }) {
+                        selected += 1
+                        if let n = top.net {
+                            check(sel?.net == n, "click at (\(x), \(y)) on \(top.text): selected \(String(describing: sel))")
+                        } else {
+                            check(sel?.name == top.netName, "click at (\(x), \(y)) on \(top.text): selected \(String(describing: sel))")
+                        }
+                    } else {
+                        check(sel == nil, "click at (\(x), \(y)) on nothing: selected \(String(describing: sel))")
+                    }
+                }
+            }
+            if let sel = try s.selection() {
+                try compareSinglePass("selected \(sel.name) at the end")
+                positions += 1
+            }
+            try s.clearSelection()
+            print("selftest: selection: net \(net) at \(positions) positions compared; \(clicks) clicks, "
+                  + "\(selected) on a net")
+        }
+
         // 6. The end: the default position after opening.
         try s.jump(toEnd: true)
         let pe = try s.position()
@@ -889,6 +1022,55 @@ func selfTest(_ o: Options) -> Int32 {
     return 1
 }
 
+/// How repeatable the banded rasteriser is (M5 investigation): the same
+/// single-pass picture drawn 8 times with the default bands and with one,
+/// then the default bands, 2 and 3 bands against one band, with where the
+/// differing pixels lie.
+@MainActor
+func repeatTest(_ o: Options) -> Int32 {
+    guard o.positional.count == 1 else { usage() }
+    let s = openSession(o.positional[0], o)
+    let r = LayeredRenderer()
+    do {
+        try sync(s, r)
+        try s.zoom(by: 4, aboutX: Double(o.width) * 0.4, y: Double(o.height) * 0.6)
+        let v = try s.view()
+        for (label, bands) in [("default bands", 0), ("1 band", 1)] {
+            r.bands = bands
+            var worst = 0, worstAny = 0
+            guard let first = r.renderSinglePass(view: v) else { fail("no image") }
+            for _ in 0..<8 {
+                guard let x = r.renderSinglePass(view: v) else { fail("no image") }
+                worst = max(worst, differingPixels(first, x, tolerance: 48).0)
+                worstAny = max(worstAny, differingPixels(first, x, tolerance: 0).0)
+            }
+            print("\(label), drawn 9 times: up to \(worst) px off by more than 48, \(worstAny) px differ at all")
+        }
+        r.bands = 1
+        guard let one = r.renderSinglePass(view: v) else { fail("no image") }
+        for nb in [0, 2, 3] {
+            r.bands = nb
+            guard let x = r.renderSinglePass(view: v) else { fail("no image") }
+            let pa = pixels(of: x), pb = pixels(of: one)
+            var rows: [Int: Int] = [:], worst = 0
+            for i in stride(from: 0, to: pa.pixels.count, by: 4) {
+                var d = 0
+                for c in 0..<4 { d = max(d, abs(Int(pa.pixels[i + c]) - Int(pb.pixels[i + c]))) }
+                worst = max(worst, d)
+                if d > 0 { rows[(i / 4) / pa.width, default: 0] += 1 }
+            }
+            let n = nb == 0 ? ProcessInfo.processInfo.activeProcessorCount : nb
+            let seams = (1..<n).map { pa.height * $0 / n }
+            let near = rows.filter { kv in seams.contains { abs($0 - kv.key) <= 3 } }.values.reduce(0, +)
+            print("\(n) bands against 1: \(rows.values.reduce(0, +)) px differ (largest \(worst)) in \(rows.count) "
+                  + "rows; \(near) px within 3 rows of a seam")
+        }
+        return 0
+    } catch {
+        fail("\(error)")
+    }
+}
+
 let args = CommandLine.arguments.dropFirst()
 guard let first = args.first else { usage() }
 switch first {
@@ -896,5 +1078,6 @@ case "--compare": exit(compare(parseOptions(args.dropFirst())))
 case "--bench": exit(bench(parseOptions(args.dropFirst())))
 case "--bench-playback": exit(benchPlayback(parseOptions(args.dropFirst())))
 case "--selftest": exit(selfTest(parseOptions(args.dropFirst())))
+case "--repeat": exit(repeatTest(parseOptions(args.dropFirst())))
 default: exit(render(parseOptions(args)))
 }

@@ -27,8 +27,33 @@ Rgba with_alpha(Rgba c, double a) {
 
 constexpr std::uint64_t kGroupHilite = 1ull << 62;
 constexpr std::uint64_t kGroupMarker = 2ull << 62;
+constexpr std::uint64_t kGroupSelect = 3ull << 62; // board items of the selected net
+constexpr std::uint64_t kGroupDim = kGroupMarker | (1ull << 40);
+
+// Position of a sub-slot among the known ones of its rank (ascending).
+std::uint32_t sub_index(std::uint32_t s, const std::uint32_t *subs, std::uint32_t n) {
+    std::uint32_t k = 0;
+    while (k + 1 < n && subs[k + 1] <= s) ++k;
+    return k;
+}
 
 } // namespace
+
+std::uint32_t highlight_order(std::uint32_t order) {
+    static const std::uint32_t copper_subs[] = {0x08, 0x10, 0x14, 0x18, 0x20, 0x28, 0x30,
+                                                0x34, 0x38, 0x3A, 0x3C, 0x40, 0x50, 0x60};
+    static const std::uint32_t hole_subs[] = {0x10, 0x20, 0x28, 0x2C, 0x30};
+    const std::uint32_t rank = order >> 8, s = order & 0xFF;
+    std::uint32_t idx, sb;
+    if (rank == kRankHoles) {
+        idx = 71;
+        sb = sub_index(s, hole_subs, 5);
+    } else {
+        idx = rank < 100 ? 0 : (rank > 170 ? 70 : rank - 100);
+        sb = sub_index(s, copper_subs, 14);
+    }
+    return order_key(kRankHighlight, 0) + idx * 16 + sb;
+}
 
 int router_layers(const Trace &t, std::uint32_t session, const DisplayList *board, const Theme &theme,
                   const std::vector<std::pair<std::string, bool>> &layer_visible, RouterLayer rl[2]) {
@@ -88,13 +113,19 @@ void Overlay::build(const OverlayInput &in) {
     std::uint32_t session = e != kNone32 ? tl.events()[e].session : kNone32;
     if (e == kNone32 && !t.runs().empty()) session = static_cast<std::uint32_t>(t.runs().size() - 1);
     const bool have_run = session < t.runs().size() && t.runs()[session].valid;
+    // The slots of an event before the first RUN (a board written before
+    // the router started): those of the first session, empty.  M4 had no
+    // router slots there, so the first frame of the session changed the
+    // slot structure and every plane of a client was drawn again.
+    std::uint32_t layout_session = session;
+    if (e != kNone32 && session == kNone32 && !t.runs().empty()) layout_session = 0;
 
     // Router layers and slots: each router layer's wavefront image (under
     // the board's copper) and its ghosts, copper and vias (above the board's
     // tracks).
     RouterLayer rl[2];
-    if (have_run) {
-        const int nl = router_layers(t, session, in.board, theme, in.layer_visible, rl);
+    if (layout_session < t.runs().size() && t.runs()[layout_session].valid) {
+        const int nl = router_layers(t, layout_session, in.board, theme, in.layer_visible, rl);
         for (int k = 0; k < nl; ++k) {
             Slot s;
             s.kind = SlotKind::Wavefront;
@@ -118,6 +149,14 @@ void Overlay::build(const OverlayInput &in) {
         s.order_begin = order_key(kRankOverlay, 0);
         s.order_end = order_key(kRankOverlay + 1, 0);
         slots_.push_back(s);
+        s.kind = SlotKind::Dim;
+        s.order_begin = order_key(kRankDim, 0);
+        s.order_end = order_key(kRankDim + 1, 0);
+        slots_.push_back(s);
+        s.kind = SlotKind::Highlight;
+        s.order_begin = order_key(kRankHighlight, 0);
+        s.order_end = order_key(kRankHighlightEnd, 0);
+        slots_.push_back(s);
     }
     std::sort(slots_.begin(), slots_.end(), [](const Slot &a, const Slot &b) { return a.order_begin < b.order_begin; });
 
@@ -131,7 +170,9 @@ void Overlay::build(const OverlayInput &in) {
         const std::vector<CopperGeom> &geo = *in.geometry;
         const int nlayers = rl[1].name == rl[0].name ? 1 : 2;
 
-        // mode 0 routed, 1 ghost (with colour level), 2 highlight
+        // mode 0 routed, 1 ghost (with colour level), 2 highlight of the
+        // current commit; 3 and 4: routed and ghost of the selected net, in
+        // the selection slot
         auto add_copper = [&](std::uint32_t c, int mode, int level) {
             if (c >= geo.size() || !geo[c].drawable) return;
             const CopperGeom &g = geo[c];
@@ -139,14 +180,19 @@ void Overlay::build(const OverlayInput &in) {
             const std::uint64_t bit = mode == 2 ? 1 : 1ull << (c % 64);
             auto color_of = [&](const RouterLayer &l, double opacity) -> Rgba {
                 if (mode == 0) return with_opacity(l.color, opacity);
-                if (mode == 1)
-                    return with_alpha(mix_white(l.color, colors.ghost_white),
+                if (mode == 3) return mix_white(with_opacity(l.color, opacity), colors.select_white);
+                if (mode == 1 || mode == 4) {
+                    const Rgba gc = mix_white(l.color, colors.ghost_white);
+                    return with_alpha(mode == 4 ? mix_white(gc, colors.select_white) : gc,
                                       colors.ghost_alpha * level / static_cast<double>(kGhostLevels));
+                }
                 return with_alpha(mix_white(l.color, colors.hilite_white), 1.0);
             };
             auto order_of = [&](const RouterLayer &l, std::uint32_t routed_sub) {
                 if (mode == 0) return order_key(l.rank, routed_sub);
                 if (mode == 1) return order_key(l.rank, sub::kGhost);
+                if (mode == 3) return highlight_order(order_key(l.rank, routed_sub));
+                if (mode == 4) return highlight_order(order_key(l.rank, sub::kGhost));
                 return order_key(kRankOverlay, sub::kMarkCopper);
             };
             auto visible = [&](const RouterLayer &l) { return mode == 2 || l.visible; };
@@ -181,8 +227,9 @@ void Overlay::build(const OverlayInput &in) {
                 for (const auto &v : g.vias) b.circle(v[0], v[1], g.via_dia / 2, 0);
                 b.mask |= bit;
             }
-            if (mode == 0 && any && g.via_drill > 0) {
-                LBucket &b = lb.at(order_key(kRankHoles, sub::kRoutedDrill), Prim::Disc, 0, kClassRouted, kNone32,
+            if ((mode == 0 || mode == 3) && any && g.via_drill > 0) {
+                const std::uint32_t o = order_key(kRankHoles, sub::kRoutedDrill);
+                LBucket &b = lb.at(mode == 3 ? highlight_order(o) : o, Prim::Disc, 0, kClassRouted, kNone32,
                                    theme.via_hole, needs, group);
                 for (const auto &v : g.vias) b.circle(v[0], v[1], g.via_drill / 2, 0);
                 b.mask |= bit;
@@ -196,6 +243,13 @@ void Overlay::build(const OverlayInput &in) {
             std::vector<std::pair<std::uint32_t, double>> gh;
             tl.ghosts(in.time, gh);
             for (const auto &g : gh) add_copper(g.first, 1, ghost_level(g.second));
+            // The selected net's copper again, above the dim slot.
+            if (in.select_active && in.select_has_net) {
+                for (std::uint32_t c : alive)
+                    if (t.copper()[c].net == in.select_net) add_copper(c, 3, 0);
+                for (const auto &g : gh)
+                    if (t.copper()[g.first].net == in.select_net) add_copper(g.first, 4, ghost_level(g.second));
+            }
         }
 
         // Failed pads: a red ring with a cross.
@@ -264,6 +318,30 @@ void Overlay::build(const OverlayInput &in) {
             LBucket &b =
                 lb.at(order_key(kRankOverlay, sub::kMarkPads), Prim::Ring, w, kClassRouted, kNone32, colors.pads, 0, hg);
             for (const RoutePad &p : r.pads) b.circle(fr.x(p.cx), fr.y(p.cy), rr, w / 2);
+        }
+    }
+
+    // The selection: the dim rectangle and the board's copper of the net.
+    if (in.select_active) {
+        const std::array<float, 4> &r = in.dim_rect;
+        if (r[0] < r[2] && r[1] < r[3])
+            lb.at(order_key(kRankDim, 0), Prim::Fill, 0, kClassRouted, kNone32,
+                  with_alpha(theme.background, colors.dim_alpha), 0, kGroupDim)
+                .rect(r[0], r[1], r[2], r[3]);
+        if (in.select_board != nullptr) {
+            const DisplayList &sl = *in.select_board;
+            for (std::size_t k = 0; k < sl.batches.size(); ++k) {
+                const Batch &b = sl.batches[k];
+                if ((b.needs & in.classes) != b.needs) continue;
+                if (b.layer != kNone32 && (b.layer >= in.board_layer_visible.size() || !in.board_layer_visible[b.layer]))
+                    continue;
+                const bool hole = (b.order >> 8) == kRankHoles;
+                const std::uint64_t group =
+                    kGroupSelect | (static_cast<std::uint64_t>(in.select_build & 0xFFFFFFFu) << 24) | (k & 0xFFFFFFu);
+                LBucket &bk = lb.at(highlight_order(b.order), b.prim, b.width, b.cls, b.layer,
+                                    hole ? b.color : mix_white(b.color, colors.select_white), b.needs, group);
+                for (std::uint32_t q = 0; q < b.count; ++q) bk.copy_item(sl, b, q);
+            }
         }
     }
 

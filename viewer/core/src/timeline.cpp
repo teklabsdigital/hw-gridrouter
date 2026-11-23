@@ -470,6 +470,7 @@ void Timeline::build_failures() {
                 Failure f;
                 f.birth = e;
                 f.session = ev.session;
+                f.net = re.net;
                 f.name = r != nullptr ? r->name : std::string();
                 f.label = label;
                 if (r != nullptr) pad_position(*r, label, f);
@@ -484,6 +485,7 @@ void Timeline::build_failures() {
             Failure f;
             f.birth = e;
             f.session = ev.session;
+            f.net = d.net;
             f.name = d.name;
             f.label = d.pad_label;
             f.from_drop = true;

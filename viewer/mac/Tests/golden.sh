@@ -95,6 +95,12 @@ golden timeline_wave_found timeline --size 480x360 --event 17 --into 0.9
 # 25, the failed search for GND, settled: every state explored, no path,
 # the target in red.
 golden timeline_wave_failed timeline --size 480x360 --event 25 --into 0.9
+# M5 selection: /SIG highlighted at the end of the run (the second
+# session's copper over the "final" board; the board's /SIG pads and tracks
+# too), everything else dimmed.
+golden select_end timeline --size 480x360 --select /SIG
+# 16 again with /SIG selected: its ghost highlighted mid-run.
+golden select_ghost timeline --size 480x360 --event 16 --select /SIG
 
 if [ "$failures" -ne 0 ]; then
     echo "golden.sh: $failures of $cases cases FAILED"

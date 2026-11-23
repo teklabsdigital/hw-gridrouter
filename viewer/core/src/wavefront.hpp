@@ -37,16 +37,18 @@ class Trace;
 //   colour = lerp(mix_white(C, near_white), C, r), alpha = lerp(near_alpha, far_alpha, r);
 // frontier cells are mix_white(C, frontier_white) at frontier_alpha.
 struct WaveColors {
-    double near_white = 0.55;
-    double near_alpha = 0.60;
-    double far_alpha = 0.28;
-    double frontier_white = 0.85;
-    double frontier_alpha = 0.95;
+    // M5: a faint tint of the layer's own colour that keeps the board
+    // readable through it (M4 had 0.55, 0.60, 0.28, 0.85, 0.95).
+    double near_white = 0.18;
+    double near_alpha = 0.22;
+    double far_alpha = 0.08;
+    double frontier_white = 0.50;
+    double frontier_alpha = 0.55;
 };
 
 // The share of a wavefront's stored entries drawn as its frontier: the most
 // recently revealed max(1, ceil(n * kFrontierShare)) cells.
-constexpr double kFrontierShare = 0.04;
+constexpr double kFrontierShare = 0.02; // M4: 0.04
 std::uint32_t frontier_cells(std::uint32_t n);
 
 // What the images should show.

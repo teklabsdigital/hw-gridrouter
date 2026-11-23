@@ -154,9 +154,9 @@ TEST(wavefront_reveal_and_frontier_rules) {
     CHECK_EQ(rv::revealed_count(10, std::numeric_limits<double>::quiet_NaN()), 0u);
     CHECK_EQ(rv::frontier_cells(0), 1u);
     CHECK_EQ(rv::frontier_cells(1), 1u);
-    CHECK_EQ(rv::frontier_cells(25), 1u);
-    CHECK_EQ(rv::frontier_cells(26), 2u);
-    CHECK_EQ(rv::frontier_cells(148027), 5922u);
+    CHECK_EQ(rv::frontier_cells(50), 1u); // M5: 2 % (M4: 4 %)
+    CHECK_EQ(rv::frontier_cells(51), 2u);
+    CHECK_EQ(rv::frontier_cells(148027), 2961u);
 }
 
 TEST(wavefront_sample_has_wavefronts_and_the_same_timeline) {
@@ -274,8 +274,8 @@ TEST(wavefront_colours_frontier_and_hidden_layers) {
     // The source (cost 0): the near colour; the last revealed: the frontier.
     const double r0 = 200, g0 = 52, b0 = 52;
     auto white = [](double v, double f) { return v + (255 - v) * f; };
-    const std::uint32_t near = premul(white(r0, 0.55), white(g0, 0.55), white(b0, 0.55), 0.60);
-    const std::uint32_t front = premul(white(r0, 0.85), white(g0, 0.85), white(b0, 0.85), 0.95);
+    const std::uint32_t near = premul(white(r0, 0.18), white(g0, 0.18), white(b0, 0.18), 0.22);
+    const std::uint32_t front = premul(white(r0, 0.50), white(g0, 0.50), white(b0, 0.50), 0.55);
     CHECK_EQ(w->costs[0], 0);
     CHECK_EQ(pixel(wi.image(0), w->cells[0] % nc), near);
     const std::uint32_t last = w->cells[shown - 1];
@@ -298,7 +298,7 @@ TEST(wavefront_colours_frontier_and_hidden_layers) {
     for (std::int32_t c : w->costs) maxc = std::max(maxc, c);
     for (std::uint32_t k = 0; k + F < n; ++k)
         if (w->costs[k] == maxc && w->cells[k] / nc == 0)
-            CHECK_EQ(pixel(wi.image(0), w->cells[k] % nc), premul(r0, g0, b0, 0.28));
+            CHECK_EQ(pixel(wi.image(0), w->cells[k] % nc), premul(r0, g0, b0, 0.08));
     CHECK_EQ(wi.image(0).cells + wi.image(1).cells, n);
     // Hiding router layer 1 empties its image only.
     const std::uint32_t gen1 = wi.image(1).generation, gen0 = wi.image(0).generation;

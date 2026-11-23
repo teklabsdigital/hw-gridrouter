@@ -493,6 +493,205 @@ public final class Session {
         }
         return Overlay(list: DisplayList(copying: d), slots: result)
     }
+
+    // MARK: - Nets table (M5)
+
+    /// Bring the table to the position and describe it; call before reading rows.
+    public func netsInfo() throws(CoreError) -> NetsInfo {
+        var i = rv_nets_info()
+        try check(rv_nets_get(handle, &i))
+        return NetsInfo(rowCount: Int(i.row_count), viewCount: Int(i.view_count), generation: i.generation,
+                        sortColumn: NetColumn(rawValue: i.sort_column) ?? .name, descending: i.descending != 0,
+                        selectedPosition: i.selected_position == RV_NONE ? nil : Int(i.selected_position))
+    }
+
+    /// Sort by a column and keep the rows whose name contains `filter`.
+    public func setNetsView(column: NetColumn, descending: Bool, filter: String) throws(CoreError) {
+        try check(rv_nets_set_view(handle, column.rawValue, descending ? 1 : 0, filter))
+    }
+
+    /// The row at a view position (as of the last netsInfo()).
+    public func netRow(at position: Int) throws(CoreError) -> NetRow {
+        var r = rv_net_row()
+        try check(rv_nets_row(handle, UInt32(clamping: position), &r))
+        return NetRow(row: r.row, net: r.net, session: r.session == RV_NONE ? nil : r.session,
+                      name: r.name.map { String(cString: $0) } ?? "", named: r.named != 0,
+                      state: NetState(rawValue: r.state) ?? .notStarted)
+    }
+
+    /// A cell as the core formats it (as of the last netsInfo()).
+    public func netCell(at position: Int, column: NetColumn) throws(CoreError) -> String {
+        var text: UnsafePointer<CChar>?
+        try check(rv_nets_cell(handle, UInt32(clamping: position), column.rawValue, &text))
+        return text.map { String(cString: $0) } ?? ""
+    }
+
+    // MARK: - Selection (M5)
+
+    @discardableResult
+    public func selectNet(_ net: Int32) throws(CoreError) -> PlaybackChange {
+        var changed: UInt32 = 0
+        try check(rv_select_net(handle, net, &changed))
+        return PlaybackChange(rawValue: changed)
+    }
+
+    /// Select by name (router and board nets of that name); nil or "" clears.
+    @discardableResult
+    public func selectName(_ name: String?) throws(CoreError) -> PlaybackChange {
+        var changed: UInt32 = 0
+        try check(rv_select_name(handle, name ?? "", &changed))
+        return PlaybackChange(rawValue: changed)
+    }
+
+    @discardableResult
+    public func clearSelection() throws(CoreError) -> PlaybackChange {
+        var changed: UInt32 = 0
+        try check(rv_select_clear(handle, &changed))
+        return PlaybackChange(rawValue: changed)
+    }
+
+    /// The selected net, nil if none.
+    public func selection() throws(CoreError) -> NetSelection? {
+        var s = rv_selection()
+        try check(rv_selection_get(handle, &s))
+        guard s.active != 0 else { return nil }
+        return NetSelection(name: s.name.map { String(cString: $0) } ?? "", net: s.has_net != 0 ? s.net : nil,
+                            boardNets: s.board_nets, boardItems: s.board_items)
+    }
+
+    // MARK: - Hit testing (M5)
+
+    /// What is under a view point, topmost first.
+    public func hitTest(viewX: Double, viewY: Double) throws(CoreError) -> [Hit] {
+        var count: UInt32 = 0
+        try check(rv_hit_test(handle, viewX, viewY, &count))
+        var result: [Hit] = []
+        for index in 0..<count {
+            var h = rv_hit()
+            try check(rv_hit_get(handle, index, &h))
+            func str(_ p: UnsafePointer<CChar>?) -> String { p.map { String(cString: $0) } ?? "" }
+            result.append(Hit(kind: Hit.Kind(rawValue: h.kind) ?? .routed, text: str(h.text), netName: str(h.net_name),
+                              footprint: str(h.footprint), pad: str(h.pad), net: h.has_net != 0 ? h.net : nil,
+                              boardNet: h.board_net >= 0 ? h.board_net : nil, distance: h.distance,
+                              event: h.event == RV_NONE ? nil : h.event,
+                              layer: h.layer == RV_NONE ? nil : h.layer,
+                              routerLayer: h.router_layer == RV_NONE ? nil : h.router_layer))
+        }
+        return result
+    }
+
+    /// Status-line text for the cursor: the position and the topmost hit.
+    public func hoverStatus(viewX: Double, viewY: Double) throws(CoreError) -> String {
+        var text: UnsafePointer<CChar>?
+        try check(rv_hover_status(handle, viewX, viewY, &text))
+        return text.map { String(cString: $0) } ?? ""
+    }
+
+    /// A click: selects the net under the point, or clears the selection.
+    @discardableResult
+    public func click(viewX: Double, viewY: Double) throws(CoreError) -> PlaybackChange {
+        var changed: UInt32 = 0
+        try check(rv_click(handle, viewX, viewY, &changed))
+        return PlaybackChange(rawValue: changed)
+    }
+
+    // MARK: - History (M5)
+
+    /// The attempt history of a router net.
+    public func history(net: Int32) throws(CoreError) -> [HistoryEntry] {
+        var count: UInt32 = 0
+        try check(rv_net_history(handle, net, &count))
+        var result: [HistoryEntry] = []
+        result.reserveCapacity(Int(count))
+        for index in 0..<count {
+            var e = rv_history_entry()
+            try check(rv_history_get(handle, index, &e))
+            result.append(HistoryEntry(text: e.text.map { String(cString: $0) } ?? "", depth: Int(e.depth),
+                                       kind: e.kind, event: e.event == RV_NONE ? nil : e.event, flags: e.flags))
+        }
+        return result
+    }
+
+    /// The events of a router net, ascending (for timeline marks).
+    public func netEvents(net: Int32) throws(CoreError) -> [UInt32] {
+        var events: UnsafePointer<UInt32>?
+        var count: UInt32 = 0
+        try check(rv_net_events(handle, net, &events, &count))
+        guard let events, count > 0 else { return [] }
+        return Array(UnsafeBufferPointer(start: events, count: Int(count)))
+    }
+}
+
+// MARK: - Inspection types (M5)
+
+/// Columns of the nets table (rv_net_column).
+public enum NetColumn: UInt32, CaseIterable, Sendable {
+    case name = 0, net, session, state, routes, searches, found, notFound, commits, vias, rips, failedPads, expanded,
+         seconds, first, last, copper, failures
+
+    /// The core's title ("Net", "State", ...).
+    public var title: String { String(cString: rv_net_column_title(rawValue)) }
+    public var rightAligned: Bool { rv_net_column_align(rawValue) == 1 }
+}
+
+public enum NetState: UInt32, Sendable {
+    case notStarted = 0, routing, routed, complete, ripped, failed
+
+    public var name: String { String(cString: rv_net_state_name(rawValue)) }
+}
+
+public struct NetsInfo: Sendable, Equatable {
+    public let rowCount: Int
+    public let viewCount: Int
+    public let generation: UInt32
+    public let sortColumn: NetColumn
+    public let descending: Bool
+    /// View position of the selected net's row, nil if none is shown.
+    public let selectedPosition: Int?
+}
+
+public struct NetRow: Sendable {
+    public let row: UInt32
+    public let net: Int32
+    public let session: UInt32?
+    public let name: String
+    public let named: Bool
+    public let state: NetState
+}
+
+public struct NetSelection: Sendable, Equatable {
+    /// "" if unnamed.
+    public let name: String
+    /// The router net, nil if the name is no router net's.
+    public let net: Int32?
+    public let boardNets: UInt32
+    public let boardItems: UInt32
+}
+
+public struct Hit: Sendable {
+    public enum Kind: UInt32, Sendable {
+        case routed = 1, pad, track, via, zone, failure, wavefront
+    }
+    public let kind: Kind
+    public let text: String
+    public let netName: String
+    public let footprint: String
+    public let pad: String
+    public let net: Int32?
+    public let boardNet: Int32?
+    public let distance: Double
+    public let event: UInt32?
+    public let layer: UInt32?
+    public let routerLayer: UInt32?
+}
+
+public struct HistoryEntry: Sendable {
+    public let text: String
+    public let depth: Int
+    public let kind: UInt32
+    /// The event to seek to on double-click, nil if none.
+    public let event: UInt32?
+    public let flags: UInt32
 }
 
 // MARK: - Timeline and playback types (M3)
@@ -603,6 +802,10 @@ public struct PlaybackChange: OptionSet, Sendable {
     public static let board = PlaybackChange(rawValue: 4)
     /// What the wavefront images show.
     public static let wavefront = PlaybackChange(rawValue: 8)
+    /// The selected net (M5).
+    public static let selection = PlaybackChange(rawValue: 16)
+    /// The timeline's events or times (pacing; M5).
+    public static let timeline = PlaybackChange(rawValue: 32)
 }
 
 public enum StepKind: UInt32, CaseIterable, Sendable {
@@ -619,7 +822,7 @@ public enum PlaybackText: UInt32, Sendable {
 /// One overlay slot (`rv_slot`): a range of the order axis holding overlay batches.
 public struct OverlaySlot: Sendable {
     public enum Kind: UInt32, Sendable {
-        case routed = 0, drills = 1, markers = 2, wavefront = 3
+        case routed = 0, drills = 1, markers = 2, wavefront = 3, dim = 4, highlight = 5
     }
     public let kind: Kind
     public let orderBegin: UInt32

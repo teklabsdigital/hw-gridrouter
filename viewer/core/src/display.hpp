@@ -96,6 +96,13 @@ struct DisplayList {
 // Build the full display list of one board.
 DisplayList build_display_list(const BoardInfo &info, const BoardGeometry &geo, const Theme &theme);
 
+// The same list with only the copper of some board nets (M5, the net
+// highlight): pads on copper layers, zone fills, tracks, vias and holes
+// whose net code is in `nets`.  Keys and orders are as in the full list's
+// own build of these items (keys are positions in this list).
+DisplayList build_net_list(const BoardInfo &info, const BoardGeometry &geo, const Theme &theme,
+                           const std::vector<std::int32_t> &nets);
+
 // Signed area term of a closed contour, sum of x_i*y_{i+1} - x_{i+1}*y_i
 // (twice the area).  Positive for the outline of a filled polygon in the
 // display list, negative for its holes.

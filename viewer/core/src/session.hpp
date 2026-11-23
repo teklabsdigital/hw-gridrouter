@@ -7,6 +7,8 @@
 #ifndef RV_SESSION_HPP
 #define RV_SESSION_HPP
 
+#include "hittest.hpp"
+#include "inspect.hpp"
 #include "overlay.hpp"
 #include "playback.hpp"
 #include "routed.hpp"
@@ -66,6 +68,8 @@ public:
         player = Player();
         timeline_.reset();
         waves.reset();
+        picker.reset();
+        select_board_.reset();
         rebuild_timeline(true);
     }
 
@@ -77,6 +81,9 @@ public:
         geometry_.clear();
         overlay.reset();
         waves.reset();
+        picker.reset();
+        nets.clear();
+        select_board_.reset();
         player = Player();
         ++timeline_generation_;
         sig_valid_ = false;
@@ -126,12 +133,13 @@ public:
     struct Mark {
         double t = 0;
         std::uint32_t board = kNone32, outline = kNone32;
-        std::uint64_t overlay = 0, wave = 0;
+        std::uint64_t overlay = 0, wave = 0, selection = 0;
+        std::uint32_t timeline = 0;
     };
     Mark mark() {
         sync();
         return Mark{player.t, scene.effective_board(trace_.get()), scene.effective_outline(trace_.get()), sig_count_,
-                    wave_count_};
+                    wave_count_, selection_serial_, timeline_generation_};
     }
     std::uint32_t changed_since(const Mark &m) {
         const Mark now = mark();
@@ -140,6 +148,8 @@ public:
         if (now.board != m.board || now.outline != m.outline) f |= RV_CHANGED_BOARD;
         if (now.overlay != m.overlay) f |= RV_CHANGED_OVERLAY;
         if (now.wave != m.wave) f |= RV_CHANGED_WAVEFRONT;
+        if (now.selection != m.selection) f |= RV_CHANGED_SELECTION;
+        if (now.timeline != m.timeline) f |= RV_CHANGED_TIMELINE;
         return f;
     }
 
@@ -190,11 +200,43 @@ public:
     // Is the routed copper hidden because the board drawn holds it?
     bool routed_hidden() const;
 
+    // --- M5: selection, nets table, picking ----------------------------------
+
+    // The selection: nothing, a router net (with its name, if NETS names
+    // it), or a name alone (a board net that is no router net).
+    struct Selection {
+        bool active = false;
+        bool has_net = false;
+        std::int32_t net = 0;
+        std::string name; // "" for an unnamed router net: then no board item matches
+        bool operator==(const Selection &o) const {
+            return active == o.active && has_net == o.has_net && net == o.net && name == o.name;
+        }
+    };
+    const Selection &selection() const { return selection_; }
+    // Change the selection; in "one net" pacing a selected router net
+    // becomes the paced net.
+    void select(const Selection &s);
+    void select_net(std::int32_t net);
+    void select_name(const std::string &name); // "" clears
+    // Board net codes of the board drawn whose name is the selected name.
+    std::vector<std::int32_t> selected_board_nets();
+    // Board items (pads, zone fills, tracks, vias) of the selection on the board drawn.
+    std::uint32_t selected_board_items();
+
+    // The nets table, built on first use, values brought to the position.
+    NetTable &nets_now();
+
+    // What is under view point (vx, vy), topmost first.
+    std::vector<Hit> pick(double vx, double vy);
+
     // Board view state: selection, visibility, theme, camera, display list.
     Scene scene;
     Player player;
     Overlay overlay;
     WavefrontImages waves;
+    Picker picker;
+    NetTable nets;
 
     // Buffers that back borrowed pointers handed out through rv.h.
     std::string text;                              // rv_chunk_text
@@ -209,12 +251,19 @@ public:
     std::uint32_t c_overlay_epoch = 0xFFFFFFFFu;
     std::vector<rv_event> c_events;                // rv_get_timeline
     std::uint32_t c_events_generation = 0xFFFFFFFFu;
+    std::string cell_text;                         // rv_nets_cell
+    std::vector<Hit> hits;                         // rv_hit_test
+    std::string hover;                             // rv_hover_status
+    std::vector<HistoryEntry> history;             // rv_net_history
+    std::vector<std::uint32_t> net_event_list;     // rv_net_events
 
     void drop_borrowed() noexcept {
         text.clear();
         status.clear();
         text_out.clear();
         wavefront.reset();
+        cell_text.clear();
+        hover.clear();
     }
 
 private:
@@ -224,9 +273,11 @@ private:
         std::uint32_t timeline = 0, event = kNone32, visibility = 0, board = kNone32, outline = kNone32;
         bool hidden = false, settled = false;
         std::vector<std::pair<std::uint32_t, int>> ghosts;
+        std::uint64_t selection = 0; // M5: selection_serial_
         bool operator==(const Signature &o) const {
             return timeline == o.timeline && event == o.event && visibility == o.visibility && board == o.board &&
-                   outline == o.outline && hidden == o.hidden && settled == o.settled && ghosts == o.ghosts;
+                   outline == o.outline && hidden == o.hidden && settled == o.settled && ghosts == o.ghosts &&
+                   selection == o.selection;
         }
     };
     // What the wavefront images show (wavefront.hpp): a function of these.
@@ -255,6 +306,15 @@ private:
     std::uint64_t built_wave_ = ~0ull; // wave_count_ the images were brought to
     std::uint64_t built_wave_overlay_ = ~0ull; // sig_count_ then (the board's layer table may differ)
     PacingSettings pacing_;
+    // M5
+    Selection selection_;
+    std::uint64_t selection_serial_ = 0;
+    // The board's copper of the selected name: built for (board, serial).
+    std::shared_ptr<const DisplayList> select_board_;
+    std::uint32_t select_board_for_ = kNone32;
+    std::uint64_t select_board_serial_ = ~0ull;
+    std::uint32_t select_build_ = 0;
+    const DisplayList *selected_board_list();
 };
 
 } // namespace rv

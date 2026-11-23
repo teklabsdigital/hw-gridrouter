@@ -1,6 +1,7 @@
 // TraceDocument.swift: one open .grtrace file, read only.  The document owns
-// a core session; its window shows the board, the caption, the timeline,
-// the transport bar, the Appearance panel and the status line.
+// a core session; its window shows the inspector (nets table and history,
+// M5), the board, the caption, the timeline, the transport bar, the
+// Appearance panel and the status line.
 
 import AppKit
 import QuartzCore
@@ -62,6 +63,7 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
     let boardView: BoardView
     let timelineView: TimelineView
     let panel: AppearancePanel
+    let inspector: InspectorPanel
     private let status = NSTextField(labelWithString: "")
     private let message = NSTextField(labelWithString: "")
     let caption = NSTextField(labelWithString: "")
@@ -83,10 +85,11 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         boardView = BoardView(session: session)
         timelineView = TimelineView(session: session)
         panel = AppearancePanel(session: session)
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1200, height: 860),
+        inspector = InspectorPanel(session: session)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1480, height: 880),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
-        window.minSize = NSSize(width: 640, height: 440)
+        window.minSize = NSSize(width: 960, height: 520)
         super.init(window: window)
         window.delegate = self
         layout(in: window)
@@ -104,6 +107,12 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
             if reloadBoard { self.boardView.reload() } else { self.boardView.displayListChanged() }
         }
         timelineView.onScrub = { [weak self] phase, t in self?.scrub(phase, to: t) }
+        boardView.onSelect = { [weak self] changed in self?.selectionChanged(changed) }
+        inspector.onSelect = { [weak self] changed in self?.selectionChanged(changed) }
+        inspector.onSeek = { [weak self] event in
+            guard let self else { return }
+            self.apply((try? self.session.seek(event: event)) ?? [])
+        }
     }
 
     required init?(coder: NSCoder) {
@@ -117,6 +126,8 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         let bar = NSView()
         let divider = NSBox()
         divider.boxType = .separator
+        let leftDivider = NSBox()
+        leftDivider.boxType = .separator
         status.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
         status.textColor = .secondaryLabelColor
         status.lineBreakMode = .byTruncatingTail
@@ -129,9 +140,13 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         message.alignment = .center
         message.isHidden = true
         let transport = makeTransport()
-        for v in [boardView, panel, bar, divider, status, caption, timelineView, transport, message] as [NSView] {
+        for v in [boardView, panel, bar, divider, status, caption, timelineView, transport, message, inspector,
+                  leftDivider] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
         }
+        content.addSubview(inspector)
+        content.addSubview(leftDivider)
+        let left = leftDivider.trailingAnchor
         content.addSubview(boardView)
         content.addSubview(message)
         content.addSubview(caption)
@@ -142,21 +157,29 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         content.addSubview(bar)
         bar.addSubview(status)
         NSLayoutConstraint.activate([
-            boardView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            inspector.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            inspector.topAnchor.constraint(equalTo: content.topAnchor),
+            inspector.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            inspector.widthAnchor.constraint(equalToConstant: 340),
+            leftDivider.leadingAnchor.constraint(equalTo: inspector.trailingAnchor),
+            leftDivider.topAnchor.constraint(equalTo: content.topAnchor),
+            leftDivider.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            leftDivider.widthAnchor.constraint(equalToConstant: 1),
+            boardView.leadingAnchor.constraint(equalTo: left),
             boardView.topAnchor.constraint(equalTo: content.topAnchor),
             boardView.bottomAnchor.constraint(equalTo: caption.topAnchor, constant: -4),
             boardView.trailingAnchor.constraint(equalTo: divider.leadingAnchor),
             message.centerXAnchor.constraint(equalTo: boardView.centerXAnchor),
             message.centerYAnchor.constraint(equalTo: boardView.centerYAnchor),
-            caption.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 8),
+            caption.leadingAnchor.constraint(equalTo: left, constant: 8),
             caption.trailingAnchor.constraint(equalTo: divider.leadingAnchor, constant: -8),
             caption.heightAnchor.constraint(equalToConstant: 16),
             caption.bottomAnchor.constraint(equalTo: timelineView.topAnchor, constant: -3),
-            timelineView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            timelineView.leadingAnchor.constraint(equalTo: left),
             timelineView.trailingAnchor.constraint(equalTo: divider.leadingAnchor),
             timelineView.heightAnchor.constraint(equalToConstant: 56),
             timelineView.bottomAnchor.constraint(equalTo: transport.topAnchor),
-            transport.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 6),
+            transport.leadingAnchor.constraint(equalTo: left, constant: 6),
             transport.trailingAnchor.constraint(equalTo: divider.leadingAnchor, constant: -8),
             transport.heightAnchor.constraint(equalToConstant: 30),
             transport.bottomAnchor.constraint(equalTo: bar.topAnchor),
@@ -168,7 +191,7 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
             panel.topAnchor.constraint(equalTo: content.topAnchor),
             panel.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             panel.widthAnchor.constraint(equalToConstant: 240),
-            bar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            bar.leadingAnchor.constraint(equalTo: left),
             bar.trailingAnchor.constraint(equalTo: divider.leadingAnchor),
             bar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             bar.heightAnchor.constraint(equalToConstant: 22),
@@ -245,14 +268,32 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         panel.reload()
         timelineView.reload()
         boardView.reload()
+        inspector.reload()
+        updateNetMarks()
         updateTransport()
     }
 
     /// Bring the views up to date after a playback call.
     func apply(_ changed: PlaybackChange) {
         if changed.contains(.board) { panel.reload() }
+        if changed.contains(.timeline) { timelineView.reload() }
         if !changed.intersection([.board, .overlay, .wavefront]).isEmpty { boardView.refresh() }
         updateTransport()
+        inspector.update(playing: isPlaying)
+    }
+
+    /// The selection changed (a click on the board, a row of the table).
+    func selectionChanged(_ changed: PlaybackChange) {
+        apply(changed)
+        inspector.update(force: true)
+        updateNetMarks()
+        boardView.reportStatus()
+    }
+
+    /// The timeline marks of the selected net's events.
+    private func updateNetMarks() {
+        let net = (try? session.selection())?.net
+        timelineView.setNetEvents(net.flatMap { try? session.netEvents(net: $0) } ?? [])
     }
 
     /// Texts, the play button, the playhead and the clock.
@@ -378,9 +419,9 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         }
     }
 
-    /// The net "One net" would follow: the current event's (or the
-    /// route_net in progress).
-    var currentNet: Int32? { (try? session.position())?.net }
+    /// The net "One net" follows: the selected router net (M5), else the
+    /// current event's (or the route_net in progress).
+    var currentNet: Int32? { (try? session.selection())?.net ?? (try? session.position())?.net }
 
     /// Menu items and the transport popup carry the mode in their tag.
     @objc func setPacingMode(_ sender: Any?) {

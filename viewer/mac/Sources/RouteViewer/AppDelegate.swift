@@ -371,11 +371,174 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Pans and zooms through the view's own event handlers, mid-run
         // (router copper over the board), in a search when there is one.
         if midSearch == nil { c.seek(fraction: 0.5) } else { _ = seekMidSearch(c) }
+        // M5: select a net through the nets table; the gestures below then
+        // run with it highlighted.
+        failures += checkSelection(c, compareLayers)
         let g0 = DispatchTime.now().uptimeNanoseconds
         failures += checkGestures(c.boardView, session: s)
         print(String(format: "selftest: gestures took %.0f ms",
                      Double(DispatchTime.now().uptimeNanoseconds - g0) / 1e6))
+        failures += checkClicks(c)
         failures += checkPacing(c)
+        return failures
+    }
+
+    /// M5: a net selected through the nets table (the search's net at the
+    /// position, else the first row): the table, the history, the timeline
+    /// marks and the highlight, the layers against a single-pass render; and
+    /// "one net" pacing following the selection.  Leaves the net selected.
+    private func checkSelection(_ c: BoardWindowController,
+                                _ compareLayers: (String) -> (painted: Double, differing: Int, total: Int))
+        -> [String] {
+        var failures: [String] = []
+        let s = c.session
+        guard let info = try? s.netsInfo(), info.viewCount > 0 else {
+            print("selftest: selection: the nets table is empty: not checked")
+            return failures
+        }
+        if c.inspector.rowCount != info.viewCount {
+            failures.append("nets table shows \(c.inspector.rowCount) rows, the core has \(info.viewCount)")
+        }
+        let want = (try? s.position())?.net
+        var position = 0
+        if let want {
+            for p in 0..<info.viewCount where (try? s.netRow(at: p))?.net == want {
+                position = p
+                break
+            }
+        }
+        guard let row = try? s.netRow(at: position) else { return failures + ["nets table row \(position)"] }
+        // Where the time of a first selection goes, step by step (another
+        // net than the one selected below, first selected here).
+        var parts: [String] = []
+        func timed(_ label: String, _ f: () -> Void) {
+            let t = DispatchTime.now().uptimeNanoseconds
+            f()
+            parts.append(String(format: "%@ %.1f", label, Double(DispatchTime.now().uptimeNanoseconds - t) / 1e6))
+        }
+        if let other = try? s.netRow(at: (position + 1) % info.viewCount) {
+            timed("core") { _ = try? s.selectNet(other.net) }
+            timed("planes") { c.boardView.refresh() }
+            timed("history") { _ = try? s.history(net: other.net) }
+            timed("events") { _ = try? s.netEvents(net: other.net) }
+            timed("panel") { c.inspector.update(force: true) }
+            timed("all") { c.selectionChanged([.selection, .overlay]) }
+            timed("display") { c.window?.displayIfNeeded() }
+            _ = try? s.clearSelection()
+            c.selectionChanged([.selection, .overlay])
+            c.window?.displayIfNeeded()
+        }
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        c.inspector.selectRow(position)
+        c.window?.displayIfNeeded()
+        let selectMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+        let sel = try? s.selection()
+        if sel?.net != row.net { failures.append("selecting row \(position) (net \(row.net)) selected \(String(describing: sel))") }
+        if c.inspector.netsTable.selectedRow != (try? s.netsInfo())?.selectedPosition ?? -1 {
+            failures.append("the nets table's selected row is \(c.inspector.netsTable.selectedRow)")
+        }
+        if row.session != nil && c.inspector.historyCount == 0 { failures.append("no history for net \(row.net)") }
+        if row.session != nil && c.timelineView.netEvents.isEmpty { failures.append("no timeline marks for net \(row.net)") }
+        let slots = c.boardView.layered.overlaySlots
+        let dim = slots.first { $0.kind == .dim }?.batchCount ?? 0
+        let hl = slots.first { $0.kind == .highlight }?.batchCount ?? 0
+        if dim != 1 { failures.append("selected: \(dim) dim batches") }
+        let shown = compareLayers("selected")
+        // One net pacing follows the selection.
+        if c.setPacing(.oneNet) {
+            if (try? s.pacing())?.net != row.net { failures.append("one net pacing does not follow the selection") }
+            _ = c.setPacing(.fit)
+        } else {
+            failures.append("one net pacing could not be set with net \(row.net) selected")
+        }
+        print(String(format: "selftest: selected %@ (row %d of %d): %d history lines, %d timeline marks, "
+                        + "%d highlight batches; layers differ in %d px; select %.1f ms",
+                     row.name, position, info.viewCount, c.inspector.historyCount, c.timelineView.netEvents.count,
+                     hl, shown.differing, selectMs))
+        print("selftest: a first selection of another net, ms: " + parts.joined(separator: ", "))
+        return failures
+    }
+
+    /// M5: clicks and drags through the board view's own mouse handlers: a
+    /// click on a net selects it, a click on empty space clears, a drag that
+    /// starts on a net pans and selects nothing.
+    private func checkClicks(_ c: BoardWindowController) -> [String] {
+        var failures: [String] = []
+        let view = c.boardView, s = c.session
+        guard let window = view.window else { return ["the board view has no window"] }
+        view.zoomToFit()
+        view.flushRefresh()
+        func send(_ type: NSEvent.EventType, _ p: NSPoint) {
+            guard let e = NSEvent.mouseEvent(with: type, location: view.convert(p, to: nil), modifierFlags: [],
+                                             timestamp: ProcessInfo.processInfo.systemUptime,
+                                             windowNumber: window.windowNumber, context: nil, eventNumber: 0,
+                                             clickCount: 1, pressure: 1)
+            else { failures.append("could not make a mouse event"); return }
+            switch type {
+            case .leftMouseDown: view.mouseDown(with: e)
+            case .leftMouseDragged: view.mouseDragged(with: e)
+            default: view.mouseUp(with: e)
+            }
+        }
+        // A point on a net and a point on nothing, from a grid over the view.
+        var onNet: (NSPoint, Hit)?, empty: NSPoint?
+        let w = view.bounds.width, h = view.bounds.height
+        for gy in 1..<24 {
+            for gx in 1..<36 {
+                let p = NSPoint(x: w * CGFloat(gx) / 36, y: h * CGFloat(gy) / 24)
+                guard let hits = try? s.hitTest(viewX: Double(p.x), viewY: Double(p.y)) else { continue }
+                if hits.isEmpty, empty == nil { empty = p }
+                if onNet == nil, let top = hits.first(where: { $0.net != nil || !$0.netName.isEmpty }),
+                   top.netName != ((try? s.selection())?.name ?? "") {
+                    onNet = (p, top)
+                }
+            }
+        }
+        guard let (p, hit) = onNet else {
+            print("selftest: clicks: no net under any grid point: not checked")
+            return failures
+        }
+        // A press with a small wobble (under the slop) is still a click.
+        send(.leftMouseDown, p)
+        send(.leftMouseDragged, NSPoint(x: p.x + 1, y: p.y + 1))
+        send(.leftMouseUp, NSPoint(x: p.x + 1, y: p.y + 1))
+        let sel = try? s.selection()
+        if let n = hit.net, sel?.net != n {
+            failures.append("a click on \(hit.text) selected \(String(describing: sel))")
+        } else if hit.net == nil, sel?.name != hit.netName {
+            failures.append("a click on \(hit.text) selected \(String(describing: sel))")
+        }
+        if c.inspector.netsTable.selectedRow != (try? s.netsInfo())?.selectedPosition ?? -1 {
+            failures.append("after a click the nets table's selected row is \(c.inspector.netsTable.selectedRow)")
+        }
+        // A click on empty space clears.
+        var cleared = "not checked (no empty point)"
+        if let e = empty {
+            send(.leftMouseDown, e)
+            send(.leftMouseUp, e)
+            if (try? s.selection()) != nil { failures.append("a click on empty space did not clear the selection") }
+            cleared = "cleared"
+        }
+        // A drag from the net: pans by the drag, selects nothing.
+        let before = try? s.view()
+        send(.leftMouseDown, p)
+        send(.leftMouseDragged, NSPoint(x: p.x + 2, y: p.y))
+        send(.leftMouseDragged, NSPoint(x: p.x + 20, y: p.y + 10))
+        send(.leftMouseUp, NSPoint(x: p.x + 20, y: p.y + 10))
+        let after = try? s.view()
+        if let before, let after, abs(after.tx - before.tx - 20) > 1e-9 || abs(after.ty - before.ty - 10) > 1e-9 {
+            failures.append("a drag of (20, 10) moved the camera by (\(after.tx - before.tx), \(after.ty - before.ty))")
+        }
+        if empty != nil, (try? s.selection()) != nil { failures.append("a drag selected a net") }
+        // The hover text names what is under the pointer.
+        let status = (try? s.hoverStatus(viewX: Double(p.x + 20), viewY: Double(p.y + 10))) ?? ""
+        if !status.contains(hit.text) { failures.append("hover status \"\(status)\" does not name \(hit.text)") }
+        view.zoomToFit()
+        view.flushRefresh()
+        print("selftest: clicks: a click on \(hit.text) selected it; empty space \(cleared); a drag panned (20, 10) "
+              + "and selected nothing")
+        _ = try? s.clearSelection()
+        c.selectionChanged([.selection, .overlay])
         return failures
     }
 

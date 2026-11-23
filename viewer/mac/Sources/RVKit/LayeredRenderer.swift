@@ -85,8 +85,10 @@ public final class LayeredRenderer {
     public private(set) var lastRenderedPlanes = 0
     public private(set) var lastRenderedPixels = 0
 
-    /// Slot planes cover only the bounds of their batches (the default) or
-    /// the whole view.  Core Graphics anti-aliases a thin diagonal stroke a
+    /// Planes other than the bottom slab cover only the bounds of their
+    /// batches, and a plane that is one solid rectangle is a stretched
+    /// 1 x 1 image (the default); or every plane covers the whole view.
+    /// (The name is M4's, when only slot planes were cropped.)  Core Graphics anti-aliases a thin diagonal stroke a
     /// little differently at another bitmap offset, so a cropped plane can
     /// differ from a single-pass render by a few edge pixels; uncropped and
     /// with `bands` 1 the two are identical (the self-tests check both).
@@ -289,13 +291,18 @@ public final class LayeredRenderer {
         let w = max(1, Int((view.width * view.backing).rounded()))
         let h = max(1, Int((view.height * view.backing).rounded()))
         var rect: (x0: Int, y0: Int, x1: Int, y1: Int)?
+        if !bottom, cropsSlots, plane.items.count == 1, plane.items[0].primitive == .fill,
+           solidRectangle(plane, view: view, width: w, height: h) {
+            return 1
+        }
         if bottom {
             rect = (0, 0, w, h)
         } else if !plane.items.isEmpty {
-            if plane.isSlot, cropsSlots {
-                // Only the bounds of the slot's batches (board mm, which
+            if cropsSlots {
+                // Only the bounds of the plane's batches (board mm, which
                 // include half the stroke widths), plus 2 pixels for
-                // anti-aliasing.
+                // anti-aliasing.  M5: slabs too, not only slots (M4 kept
+                // every slab view-sized).
                 var b = plane.items[0].bbox
                 for item in plane.items.dropFirst() { b = b.union(item.bbox) }
                 let s = view.scale * view.backing
@@ -329,6 +336,43 @@ public final class LayeredRenderer {
         plane.frame = CGRect(x: CGFloat(rect.x0) / view.backing, y: CGFloat(rect.y0) / view.backing,
                              width: CGFloat(pw) / view.backing, height: CGFloat(ph) / view.backing)
         return pw * ph
+    }
+
+    /// A plane that is one filled axis-aligned rectangle of one colour (the
+    /// selection's dim rectangle, M5) becomes a 1 x 1 image stretched over
+    /// the rectangle, its edges rounded to whole pixels, instead of a
+    /// view-sized bitmap.  It can differ from a single-pass render only in
+    /// the anti-aliased edge pixels (the dim rectangle's edges lie 2 mm
+    /// outside everything drawn, where it changes nothing).  False if the
+    /// item is not such a rectangle.
+    private func solidRectangle(_ plane: Plane, view: ViewTransform, width w: Int, height h: Int) -> Bool {
+        let item = plane.items[0]
+        var r = CGRect.zero
+        guard item.path.isRect(&r) else { return false }
+        let s = view.scale * view.backing
+        let x0 = max(0, min(w, Int((r.minX * s + view.tx * view.backing).rounded())))
+        let y0 = max(0, min(h, Int((r.minY * s + view.ty * view.backing).rounded())))
+        let x1 = max(0, min(w, Int((r.maxX * s + view.tx * view.backing).rounded())))
+        let y1 = max(0, min(h, Int((r.maxY * s + view.ty * view.backing).rounded())))
+        plane.version += 1
+        guard x1 > x0, y1 > y0 else {
+            plane.image = nil
+            plane.frame = .zero
+            plane.pixelRect = .zero
+            return true
+        }
+        let buffer = PixelBuffer(width: 1, height: 1)
+        if let ctx = buffer.context(rows: 0..<1) {
+            ctx.clear(CGRect(x: 0, y: 0, width: 1, height: 1))
+            ctx.setFillColor(item.color)
+            ctx.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+        }
+        plane.image = buffer.takeImage()
+        plane.renders += 1
+        plane.pixelRect = CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
+        plane.frame = CGRect(x: CGFloat(x0) / view.backing, y: CGFloat(y0) / view.backing,
+                             width: CGFloat(x1 - x0) / view.backing, height: CGFloat(y1 - y0) / view.backing)
+        return true
     }
 
     // MARK: - Whole images (rvrender, self-tests)

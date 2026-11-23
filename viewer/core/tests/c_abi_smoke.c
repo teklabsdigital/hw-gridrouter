@@ -141,6 +141,42 @@ int main(void) {
         if (RV_CHANGED_WAVEFRONT != 8u || RV_SLOT_WAVEFRONT != 3u || RV_OBJ_WAVEFRONT != 11) ++failures;
     }
 
+    /* M5, inspection, from C with no trace open. */
+    {
+        rv_nets_info nets;
+        rv_net_row row;
+        rv_selection sel;
+        rv_hit hit;
+        rv_history_entry entry;
+        const uint32_t *events = NULL;
+        uint32_t changed = 9;
+        if (rv_nets_get(s, &nets) != RV_OK || nets.row_count != 0 || nets.view_count != 0) ++failures;
+        if (nets.selected_position != RV_NONE || nets.sort_column != RV_NETCOL_NAME) ++failures;
+        if (rv_nets_set_view(s, RV_NETCOL_SEARCHES, 1, "sig") != RV_OK) ++failures;
+        if (rv_nets_set_view(s, RV_NETCOL_COUNT, 0, NULL) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (rv_nets_row(s, 0, &row) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (rv_nets_cell(s, 0, RV_NETCOL_NAME, &text) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (strcmp(rv_net_column_title(RV_NETCOL_FAILED_PADS), "Failed pads") != 0) ++failures;
+        if (rv_net_column_align(RV_NETCOL_NAME) != 0 || rv_net_column_align(RV_NETCOL_VIAS) != 1) ++failures;
+        if (strcmp(rv_net_state_name(RV_NET_RIPPED), "ripped") != 0) ++failures;
+        if (strcmp(rv_net_state_name(RV_NET_STATE_COUNT), "") != 0) ++failures;
+        if (rv_select_name(s, "/SIG", &changed) != RV_OK || (changed & RV_CHANGED_SELECTION) == 0) ++failures;
+        if (rv_selection_get(s, &sel) != RV_OK || sel.active != 1 || sel.has_net != 0) ++failures;
+        if (strcmp(sel.name, "/SIG") != 0 || sel.board_nets != 0) ++failures;
+        if (rv_select_net(s, 3, &changed) != RV_OK || rv_selection_get(s, &sel) != RV_OK) ++failures;
+        if (sel.has_net != 1 || sel.net != 3) ++failures;
+        if (rv_select_clear(s, &changed) != RV_OK || rv_selection_get(s, &sel) != RV_OK || sel.active != 0) ++failures;
+        if (rv_hit_test(s, 10.0, 10.0, &count) != RV_OK || count != 0) ++failures;
+        if (rv_hit_get(s, 0, &hit) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (rv_hover_status(s, 10.0, 10.0, &text) != RV_OK || text == NULL) ++failures;
+        if (rv_click(s, 10.0, 10.0, NULL) != RV_OK) ++failures;
+        if (rv_net_history(s, 1, &count) != RV_OK || count != 0) ++failures;
+        if (rv_history_get(s, 0, &entry) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (rv_net_events(s, 1, &events, &count) != RV_OK || count != 0) ++failures;
+        if (RV_SLOT_DIM != 4u || RV_SLOT_HIGHLIGHT != 5u || RV_CHANGED_TIMELINE != 32u) ++failures;
+        if (RV_PICK_POINTS != 3.0 || RV_HIT_WAVEFRONT != 7u || RV_HIST_RIP_OTHER != 10u) ++failures;
+    }
+
     if (strcmp(rv_kind_tag(RV_CHUNK_BRD), "BRD ") != 0) ++failures;
     if (strcmp(rv_kind_tag(RV_CHUNK_KIND_COUNT), "????") != 0) ++failures;
     if (RV_NONE != 0xFFFFFFFFu || (RV_SRCH_HAS_TRACE >> 9) != 1u) ++failures;

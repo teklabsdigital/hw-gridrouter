@@ -9,6 +9,15 @@
 //                            optionally the time of SEEKS random seeks
 //                            (with the wavefront images) and of the worst
 //                            wavefront seek; PACING as in rvrender
+//   rvdump --nets [--at AT] [--sort COLUMN[:desc]] [--filter TEXT] FILE
+//                            the nets table at a position (default the end)
+//   rvdump --net NAME [--at AT] FILE
+//                            select a net by name: the highlight, its table
+//                            row, its attempt history and its events
+//   rvdump --hit X,Y [--at AT] [--bench N] FILE
+//                            what is under board point (X, Y) mm, in a
+//                            1600 x 1000 view fitted to the board, and the
+//                            time of N hit tests at random view points
 //
 // Exit status: 0 for a readable trace with no errors (complete, or a valid
 // file that is still being written: "incomplete"); 1 if the file cannot be
@@ -38,7 +47,12 @@ int usage() {
                  "       rvdump --search N FILE\n"
                  "       rvdump --board N|latest FILE\n"
                  "       rvdump --timeline [--bench SEEKS] [--pacing PACING] FILE\n"
-                 "PACING: fit[:SECONDS], nets, net:NET, skip-failed, real[:SLOWDOWN]\n");
+                 "       rvdump --nets [--at AT] [--sort COLUMN[:desc]] [--filter TEXT] FILE\n"
+                 "       rvdump --net NAME [--at AT] FILE\n"
+                 "       rvdump --hit X,Y [--at AT] [--bench N] FILE\n"
+                 "PACING: fit[:SECONDS], nets, net:NET, skip-failed, real[:SLOWDOWN]\n"
+                 "AT: a fraction of the timeline 0..1, or end (the default)\n"
+                 "COLUMN: a column title in lower case, spaces as '-' (name, state, failed-pads, ...)\n");
     return 2;
 }
 
@@ -521,14 +535,243 @@ int timeline(rv_session *s, double open_ms, uint32_t seeks) {
     return 0;
 }
 
+// --- M5: the nets table, a net's history, hit tests ---------------------------------
+
+// Display width of UTF-8 text: code points.
+std::size_t text_width(const char *t) {
+    std::size_t n = 0;
+    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(t); *p; ++p)
+        if ((*p & 0xC0) != 0x80) ++n;
+    return n;
+}
+
+void print_padded(const std::string &t, std::size_t width, bool right) {
+    const std::size_t w = text_width(t.c_str());
+    const std::string pad(width > w ? width - w : 0, ' ');
+    std::printf("%s", right ? (pad + t).c_str() : (t + pad).c_str());
+}
+
+// Seek to a fraction of the timeline (1.0: the end) and say where.
+void seek_to(rv_session *s, double at) {
+    rv_seek_fraction(s, at, nullptr);
+    const char *pos = "";
+    rv_text(s, RV_TEXT_POSITION, &pos);
+    std::printf("position:  %s\n", pos);
+}
+
+struct Opts {
+    double at = 1.0;
+    uint32_t sort = RV_NETCOL_NAME, desc = 0, bench = 0;
+    std::string filter;
+};
+
+// The nets table as a client shows it: every column, as text from the core.
+int nets(rv_session *s, const Opts &o) {
+    seek_to(s, o.at);
+    if (rv_nets_set_view(s, o.sort, o.desc, o.filter.c_str()) != RV_OK) {
+        std::fprintf(stderr, "rvdump: %s\n", rv_last_error(s));
+        return 2;
+    }
+    rv_nets_info info;
+    if (rv_nets_get(s, &info) != RV_OK) {
+        std::fprintf(stderr, "rvdump: %s\n", rv_last_error(s));
+        return 1;
+    }
+    std::printf("nets:      %u rows, %u shown, sorted by %s%s\n", info.row_count, info.view_count,
+                rv_net_column_title(info.sort_column), info.descending ? " (descending)" : "");
+    std::vector<std::vector<std::string>> cells(info.view_count, std::vector<std::string>(RV_NETCOL_COUNT));
+    std::vector<std::size_t> width(RV_NETCOL_COUNT);
+    for (uint32_t c = 0; c < RV_NETCOL_COUNT; ++c) width[c] = text_width(rv_net_column_title(c));
+    for (uint32_t p = 0; p < info.view_count; ++p)
+        for (uint32_t c = 0; c < RV_NETCOL_COUNT; ++c) {
+            const char *t = "";
+            if (rv_nets_cell(s, p, c, &t) == RV_OK) cells[p][c] = t;
+            width[c] = std::max(width[c], text_width(cells[p][c].c_str()));
+        }
+    for (uint32_t c = 0; c < RV_NETCOL_COUNT; ++c) {
+        if (c) std::printf("  ");
+        print_padded(rv_net_column_title(c), width[c], rv_net_column_align(c) == 1);
+    }
+    std::printf("\n");
+    for (uint32_t p = 0; p < info.view_count; ++p) {
+        for (uint32_t c = 0; c < RV_NETCOL_COUNT; ++c) {
+            if (c) std::printf("  ");
+            print_padded(cells[p][c], width[c], rv_net_column_align(c) == 1);
+        }
+        std::printf("\n");
+    }
+    return 0;
+}
+
+// One net by name: the selection, its history and its events.
+int net(rv_session *s, const char *name, const Opts &o) {
+    seek_to(s, o.at);
+    rv_display_list ov;
+    const rv_slot *slots = nullptr;
+    uint32_t nslots = 0;
+    rv_get_overlay(s, &ov, &slots, &nslots);
+    const double t0 = now_ms();
+    uint32_t changed = 0;
+    rv_select_name(s, name, &changed);
+    rv_get_overlay(s, &ov, &slots, &nslots);
+    const double select_ms = now_ms() - t0;
+    rv_selection sel;
+    rv_selection_get(s, &sel);
+    uint32_t dim = 0, hl = 0;
+    for (uint32_t k = 0; k < nslots; ++k) {
+        if (slots[k].kind == RV_SLOT_DIM) dim = slots[k].batch_count;
+        if (slots[k].kind == RV_SLOT_HIGHLIGHT) hl = slots[k].batch_count;
+    }
+    std::printf("selection: \"%s\"%s; %u board nets of that name, %u board items; overlay: dim %u, highlight %u "
+                "batches; select %.3f ms (with the overlay)\n",
+                sel.name, sel.has_net ? (" = router net " + std::to_string(sel.net)).c_str() : " (no router net)",
+                sel.board_nets, sel.board_items, dim, hl, select_ms);
+    if (!sel.has_net) return 0;
+    rv_nets_info info;
+    rv_nets_get(s, &info);
+    if (info.selected_position != RV_NONE) {
+        std::printf("row:      ");
+        for (uint32_t c = 0; c < RV_NETCOL_COUNT; ++c) {
+            const char *t = "";
+            rv_nets_cell(s, info.selected_position, c, &t);
+            std::printf(" %s %s%s", rv_net_column_title(c), t, c + 1 < RV_NETCOL_COUNT ? "," : "\n");
+        }
+    }
+    uint32_t n = 0;
+    if (rv_net_history(s, sel.net, &n) != RV_OK) {
+        std::fprintf(stderr, "rvdump: %s\n", rv_last_error(s));
+        return 1;
+    }
+    std::printf("history:   %u entries (event numbers 1-based, as shown)\n", n);
+    for (uint32_t k = 0; k < n; ++k) {
+        rv_history_entry e;
+        if (rv_history_get(s, k, &e) != RV_OK) continue;
+        char ev[24] = "";
+        if (e.event != RV_NONE) std::snprintf(ev, sizeof ev, "%u", e.event + 1);
+        std::printf("  %7s  %s%s\n", ev, std::string(e.depth * 2, ' ').c_str(), e.text);
+    }
+    const uint32_t *events = nullptr;
+    uint32_t ne = 0;
+    rv_net_events(s, sel.net, &events, &ne);
+    std::printf("events:    %u (timeline marks)\n", ne);
+    return 0;
+}
+
+// Hits at a board point (mm), with an 1600 x 1000 point view fitted to the
+// board; with --bench N also the time of N hit tests at pseudo-random view
+// points.
+int hit(rv_session *s, double x, double y, const Opts &o) {
+    rv_view_set_size(s, 1600, 1000, 2);
+    rv_view_fit(s);
+    seek_to(s, o.at);
+    double vx = 0, vy = 0;
+    rv_board_to_view(s, x, y, &vx, &vy);
+    uint32_t n = 0;
+    if (rv_hit_test(s, vx, vy, &n) != RV_OK) {
+        std::fprintf(stderr, "rvdump: %s\n", rv_last_error(s));
+        return 1;
+    }
+    std::printf("hits at (%.3f, %.3f) mm: %u (view %.1f, %.1f; tolerance %.0f points = %.4f mm)\n", x, y, n, vx, vy,
+                RV_PICK_POINTS, RV_PICK_POINTS / [&] {
+                    rv_view v;
+                    rv_view_get(s, &v);
+                    return v.scale;
+                }());
+    for (uint32_t k = 0; k < n; ++k) {
+        rv_hit h;
+        if (rv_hit_get(s, k, &h) == RV_OK) std::printf("  %u. %s (%.4f mm)\n", k + 1, h.text, h.distance);
+    }
+    const char *status = "";
+    rv_hover_status(s, vx, vy, &status);
+    std::printf("hover:     %s\n", status);
+    if (o.bench == 0) return 0;
+    std::vector<double> times;
+    uint64_t r = 88172645463325252ull, total = 0;
+    for (uint32_t k = 0; k < o.bench; ++k) {
+        r ^= r << 13;
+        r ^= r >> 7;
+        r ^= r << 17;
+        const double px = static_cast<double>(r % 160001) / 100.0, py = static_cast<double>((r >> 20) % 100001) / 100.0;
+        const double t0 = now_ms();
+        uint32_t c = 0;
+        rv_hit_test(s, px, py, &c);
+        times.push_back(now_ms() - t0);
+        total += c;
+    }
+    std::sort(times.begin(), times.end());
+    std::printf("bench:     %u hit tests: median %.4f ms, 99%% %.4f ms, max %.4f ms (%.2f hits on average)\n", o.bench,
+                times[times.size() / 2], times[times.size() * 99 / 100], times.back(),
+                static_cast<double>(total) / o.bench);
+    return 0;
+}
+
+bool parse_column(const char *spec, Opts *o) {
+    const char *colon = std::strchr(spec, ':');
+    const std::string name = colon ? std::string(spec, colon) : std::string(spec);
+    if (colon && std::strcmp(colon + 1, "desc") != 0 && std::strcmp(colon + 1, "asc") != 0) return false;
+    for (uint32_t c = 0; c < RV_NETCOL_COUNT; ++c) {
+        std::string t = rv_net_column_title(c);
+        for (char &ch : t) ch = ch == ' ' ? '-' : static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (t == name) {
+            o->sort = c;
+            o->desc = colon && std::strcmp(colon + 1, "desc") == 0 ? 1 : 0;
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
-    enum { Summary, Chunks, Search, Board, Timeline } mode = Summary;
+    enum { Summary, Chunks, Search, Board, Timeline, Nets, Net, Hit } mode = Summary;
     uint32_t search_id = 0;
     rv_pacing pacing = {RV_PACING_FIT, 0, 180.0, 10.0};
     const char *path = nullptr;
-    if (argc == 2 && argv[1][0] != '-') {
+    Opts opts;
+    const char *net_name = nullptr;
+    double hx = 0, hy = 0;
+    if (argc >= 3 && (std::strcmp(argv[1], "--nets") == 0 || std::strcmp(argv[1], "--net") == 0 ||
+                      std::strcmp(argv[1], "--hit") == 0)) {
+        int a = 2;
+        if (std::strcmp(argv[1], "--nets") == 0) {
+            mode = Nets;
+        } else if (std::strcmp(argv[1], "--net") == 0) {
+            mode = Net;
+            net_name = argv[a++];
+        } else {
+            mode = Hit;
+            char *end = nullptr;
+            hx = std::strtod(argv[a], &end);
+            if (end == argv[a] || *end != ',') return usage();
+            const char *ys = end + 1;
+            hy = std::strtod(ys, &end);
+            if (end == ys || *end != '\0') return usage();
+            ++a;
+        }
+        for (; a + 1 < argc; a += 2) {
+            const char *v = argv[a + 1];
+            if (std::strcmp(argv[a], "--at") == 0) {
+                char *end = nullptr;
+                opts.at = std::strcmp(v, "end") == 0 ? 1.0 : std::strtod(v, &end);
+                if (std::strcmp(v, "end") != 0 && (end == v || *end != '\0' || !(opts.at >= 0 && opts.at <= 1)))
+                    return usage();
+            } else if (std::strcmp(argv[a], "--sort") == 0 && mode == Nets) {
+                if (!parse_column(v, &opts)) return usage();
+            } else if (std::strcmp(argv[a], "--filter") == 0 && mode == Nets) {
+                opts.filter = v;
+            } else if (std::strcmp(argv[a], "--bench") == 0 && mode == Hit) {
+                char *end = nullptr;
+                const unsigned long n = std::strtoul(v, &end, 10);
+                if (end == v || *end != '\0' || n > 10000000ul) return usage();
+                opts.bench = static_cast<uint32_t>(n);
+            } else {
+                return usage();
+            }
+        }
+        if (a != argc - 1) return usage();
+        path = argv[a];
+    } else if (argc == 2 && argv[1][0] != '-') {
         path = argv[1];
     } else if (argc == 3 && std::strcmp(argv[1], "--chunks") == 0) {
         mode = Chunks;
@@ -599,6 +842,12 @@ int main(int argc, char **argv) {
             rc = board(s, search_id);
         } else if (mode == Timeline) {
             rc = timeline(s, open_ms, search_id);
+        } else if (mode == Nets) {
+            rc = nets(s, opts);
+        } else if (mode == Net) {
+            rc = net(s, net_name, opts);
+        } else if (mode == Hit) {
+            rc = hit(s, hx, hy, opts);
         } else {
             rc = search(s, search_id);
         }

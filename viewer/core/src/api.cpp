@@ -1023,4 +1023,259 @@ rv_status rv_set_pacing(rv_session *session, const rv_pacing *pacing, uint32_t *
     });
 }
 
+// --- M5: nets table, selection, hit testing, history ---------------------------------
+
+const char *rv_net_state_name(uint32_t state) {
+    return rv::net_state_name(state);
+}
+
+const char *rv_net_column_title(uint32_t column) {
+    return rv::net_column_title(column);
+}
+
+uint32_t rv_net_column_align(uint32_t column) {
+    return column < rv::netcol::Count ? rv::net_column_align(column) : 0u;
+}
+
+rv_status rv_nets_get(rv_session *session, rv_nets_info *out) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        rv_nets_info i;
+        std::memset(&i, 0, sizeof i);
+        i.selected_position = RV_NONE;
+        i.sort_column = rv::netcol::Name;
+        if (s.has_trace()) {
+            const rv::NetTable &t = s.nets_now();
+            i.row_count = static_cast<uint32_t>(t.rows().size());
+            i.view_count = static_cast<uint32_t>(t.view().size());
+            i.generation = t.generation();
+            i.sort_column = t.sort_column();
+            i.descending = t.descending() ? 1u : 0u;
+            const rv::Session::Selection &sel = s.selection();
+            if (sel.active && sel.has_net) {
+                const uint32_t e = s.event();
+                const uint32_t sess = e != RV_NONE ? s.timeline()->events()[e].session : RV_NONE;
+                uint32_t best = RV_NONE;
+                for (uint32_t k = 0; k < t.view().size(); ++k) {
+                    const rv::NetRow &r = t.rows()[t.view()[k]];
+                    if (r.net != sel.net) continue;
+                    if (r.session == sess) {
+                        best = k;
+                        break;
+                    }
+                    if (best == RV_NONE || r.session != RV_NONE) best = k; // the latest session's row
+                }
+                i.selected_position = best;
+            }
+        }
+        *out = i;
+    });
+}
+
+rv_status rv_nets_set_view(rv_session *session, uint32_t column, uint32_t descending, const char *filter) {
+    return guarded(session, [&](rv::Session &s) {
+        require_index(column, rv::netcol::Count, "nets column");
+        s.nets.set_view(column, descending != 0, filter != nullptr ? filter : "");
+    });
+}
+
+rv_status rv_nets_row(rv_session *session, uint32_t position, rv_net_row *out) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        const rv::NetTable &t = s.nets;
+        require_index(position, t.view().size(), "nets row");
+        const uint32_t r = t.view()[position];
+        const rv::NetRow &x = t.rows()[r];
+        const rv::NetNow n = r < t.now().size() ? t.now()[r] : rv::NetNow();
+        rv_net_row o;
+        std::memset(&o, 0, sizeof o);
+        o.seconds = x.seconds;
+        o.expanded = x.expanded;
+        o.name = x.name.c_str();
+        o.row = r;
+        o.net = x.net;
+        o.session = x.session;
+        o.named = x.named ? 1u : 0u;
+        o.state = static_cast<uint32_t>(n.state);
+        o.routes = x.routes;
+        o.searches = x.searches;
+        o.found = x.found;
+        o.not_found = x.not_found;
+        o.commits = x.commits;
+        o.vias = x.vias;
+        o.rips = x.rips;
+        o.failed_pads = x.failed_pads;
+        o.first_event = x.first_event;
+        o.last_event = x.last_event;
+        o.copper = n.copper;
+        o.failures = n.failures;
+        *out = o;
+    });
+}
+
+rv_status rv_nets_cell(rv_session *session, uint32_t position, uint32_t column, const char **text) {
+    if (text != nullptr) *text = nullptr;
+    return guarded(session, [&](rv::Session &s) {
+        require_out(text, "text");
+        const rv::NetTable &t = s.nets;
+        require_index(position, t.view().size(), "nets row");
+        require_index(column, rv::netcol::Count, "nets column");
+        s.cell_text = t.cell(t.view()[position], column);
+        *text = s.cell_text.c_str();
+    });
+}
+
+rv_status rv_select_net(rv_session *session, int32_t net, uint32_t *changed) {
+    return playback(session, changed, [&](rv::Session &s) { s.select_net(net); });
+}
+
+rv_status rv_select_name(rv_session *session, const char *name, uint32_t *changed) {
+    return playback(session, changed, [&](rv::Session &s) { s.select_name(name != nullptr ? name : ""); });
+}
+
+rv_status rv_select_clear(rv_session *session, uint32_t *changed) {
+    return playback(session, changed, [&](rv::Session &s) { s.select(rv::Session::Selection()); });
+}
+
+rv_status rv_selection_get(rv_session *session, rv_selection *out) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        rv_selection o;
+        std::memset(&o, 0, sizeof o);
+        const rv::Session::Selection &sel = s.selection();
+        o.name = sel.name.c_str();
+        o.active = sel.active ? 1u : 0u;
+        o.has_net = sel.has_net ? 1u : 0u;
+        o.net = sel.net;
+        if (s.has_trace()) {
+            o.board_nets = static_cast<uint32_t>(s.selected_board_nets().size());
+            o.board_items = s.selected_board_items();
+        }
+        *out = o;
+    });
+}
+
+rv_status rv_hit_test(rv_session *session, double vx, double vy, uint32_t *count) {
+    if (count != nullptr) *count = 0;
+    return guarded(session, [&](rv::Session &s) {
+        require_out(count, "count");
+        require_finite(vx, "vx");
+        require_finite(vy, "vy");
+        s.hits.clear();
+        s.hits = s.pick(vx, vy);
+        *count = static_cast<uint32_t>(s.hits.size());
+    });
+}
+
+rv_status rv_hit_get(rv_session *session, uint32_t index, rv_hit *out) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        require_index(index, s.hits.size(), "hit");
+        const rv::Hit &h = s.hits[index];
+        rv_hit o;
+        std::memset(&o, 0, sizeof o);
+        o.distance = h.dist;
+        o.cost = h.cost;
+        o.net_name = h.net_name.c_str();
+        o.footprint = h.footprint.c_str();
+        o.pad = h.pad.c_str();
+        o.text = h.text.c_str();
+        o.kind = h.kind;
+        o.order = h.order;
+        o.layer = h.layer;
+        o.router_layer = h.router_layer;
+        o.net = h.net;
+        o.has_net = h.has_net ? 1u : 0u;
+        o.board_net = h.board_net;
+        o.copper = h.copper;
+        o.event = h.event;
+        o.record = h.record;
+        o.cell = h.cell;
+        o.order_index = h.order_index;
+        *out = o;
+    });
+}
+
+rv_status rv_hover_status(rv_session *session, double vx, double vy, const char **text) {
+    if (text != nullptr) *text = nullptr;
+    return guarded(session, [&](rv::Session &s) {
+        require_out(text, "text");
+        require_finite(vx, "vx");
+        require_finite(vy, "vy");
+        const rv::Camera &c = s.scene.camera;
+        const rv::DisplayList &dl = fit_list(s);
+        double bx, by;
+        c.to_board(vx, vy, bx, by);
+        const double zoom = 100.0 * c.scale() / c.fit_scale(dl.extent, dl.has_extent);
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "X %.4f mm   Y %.4f mm   zoom %.0f%%", bx, by, zoom);
+        s.hover = buf;
+        const std::vector<rv::Hit> hits = s.pick(vx, vy);
+        if (!hits.empty()) s.hover += "   ·   " + hits.front().text;
+        *text = s.hover.c_str();
+    });
+}
+
+rv_status rv_click(rv_session *session, double vx, double vy, uint32_t *changed) {
+    return playback(session, changed, [&](rv::Session &s) {
+        require_finite(vx, "vx");
+        require_finite(vy, "vy");
+        const std::vector<rv::Hit> hits = s.pick(vx, vy);
+        for (const rv::Hit &h : hits) {
+            if (h.has_net) {
+                s.select_net(h.net);
+                return;
+            }
+            if (h.board_net >= 0 && !h.net_name.empty()) {
+                s.select_name(h.net_name);
+                return;
+            }
+        }
+        s.select(rv::Session::Selection());
+    });
+}
+
+rv_status rv_net_history(rv_session *session, int32_t net, uint32_t *count) {
+    if (count != nullptr) *count = 0;
+    return guarded(session, [&](rv::Session &s) {
+        require_out(count, "count");
+        s.history.clear();
+        const rv::Timeline *t = s.timeline();
+        if (t != nullptr) s.history = rv::net_history(s.trace(), *t, net);
+        *count = static_cast<uint32_t>(s.history.size());
+    });
+}
+
+rv_status rv_history_get(rv_session *session, uint32_t index, rv_history_entry *out) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        require_index(index, s.history.size(), "history entry");
+        const rv::HistoryEntry &h = s.history[index];
+        rv_history_entry o;
+        std::memset(&o, 0, sizeof o);
+        o.text = h.text.c_str();
+        o.depth = h.depth;
+        o.kind = h.kind;
+        o.event = h.event;
+        o.chunk = h.chunk;
+        o.session = h.session;
+        o.flags = h.flags;
+        *out = o;
+    });
+}
+
+rv_status rv_net_events(rv_session *session, int32_t net, const uint32_t **events, uint32_t *count) {
+    if (events != nullptr) *events = nullptr;
+    if (count != nullptr) *count = 0;
+    return guarded(session, [&](rv::Session &s) {
+        require_out(events, "events");
+        require_out(count, "count");
+        s.net_event_list.clear();
+        const rv::Timeline *t = s.timeline();
+        if (t != nullptr) s.net_event_list = rv::net_events(s.trace(), *t, net);
+        *events = s.net_event_list.empty() ? nullptr : s.net_event_list.data();
+        *count = static_cast<uint32_t>(s.net_event_list.size());
+    });
+}
+
 } // extern "C"

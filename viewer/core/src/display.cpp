@@ -71,8 +71,9 @@ struct Bucket {
 
 class Builder {
 public:
-    Builder(const BoardInfo &info, const BoardGeometry &geo, const Theme &theme)
-        : info_(info), geo_(geo), theme_(theme) {}
+    Builder(const BoardInfo &info, const BoardGeometry &geo, const Theme &theme,
+            const std::vector<std::int32_t> *nets = nullptr)
+        : info_(info), geo_(geo), theme_(theme), nets_(nets) {}
 
     DisplayList run();
 
@@ -101,6 +102,7 @@ private:
     const BoardInfo &info_;
     const BoardGeometry &geo_;
     const Theme &theme_;
+    const std::vector<std::int32_t> *nets_; // only items of these nets (build_net_list), else all
     std::map<Key, Bucket> buckets_;
     std::vector<LayerEntry> by_index_; // indexed by BRD layer index
     std::vector<float> tmp_;
@@ -397,16 +399,26 @@ void Builder::layer_table() {
 
 DisplayList Builder::run() {
     layer_table();
+    auto wanted = [&](std::int32_t net) {
+        return nets_ == nullptr || std::find(nets_->begin(), nets_->end(), net) != nets_->end();
+    };
     for (const Polyset &p : geo_.polysets) {
+        if (nets_ != nullptr) {
+            // Net copper only: pads on copper layers and zone fills.
+            const bool copper = by_index_.at(static_cast<std::size_t>(p.layer_index)).cls.kind == LayerKind::Copper;
+            if (!((p.role == 0 && copper) || p.role == 3) || !wanted(p.net)) continue;
+        }
         polyset(p);
         ++by_index_.at(static_cast<std::size_t>(p.layer_index)).items;
     }
     for (const BoardTrack &t : geo_.tracks) {
+        if (!wanted(t.net)) continue;
         track(t);
         ++by_index_.at(static_cast<std::size_t>(t.layer_index)).items;
     }
     std::set<std::tuple<std::int32_t, std::int32_t, std::int32_t>> via_drills;
     for (const BoardVia &v : geo_.vias) {
+        if (!wanted(v.net)) continue;
         via(v);
         via_drills.insert(std::make_tuple(v.x, v.y, v.drill));
         for (LayerEntry &le : by_index_) {
@@ -420,6 +432,7 @@ DisplayList Builder::run() {
     for (const Hole &h : geo_.holes) {
         // A via drill written both as a VIA and as a HOLE is drawn once.
         if (h.fp < 0 && h.plated && h.shape == 0 && via_drills.count(std::make_tuple(h.x, h.y, h.w)) != 0) continue;
+        if (!wanted(h.net)) continue;
         hole(h);
     }
 
@@ -491,6 +504,11 @@ DisplayList Builder::run() {
 
 DisplayList build_display_list(const BoardInfo &info, const BoardGeometry &geo, const Theme &theme) {
     return Builder(info, geo, theme).run();
+}
+
+DisplayList build_net_list(const BoardInfo &info, const BoardGeometry &geo, const Theme &theme,
+                           const std::vector<std::int32_t> &nets) {
+    return Builder(info, geo, theme, &nets).run();
 }
 
 } // namespace rv

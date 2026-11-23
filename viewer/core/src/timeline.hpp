@@ -86,6 +86,7 @@ struct Phase {
 struct Failure {
     std::uint32_t birth = 0, death = kNone32; // alive at events [birth, death)
     std::uint32_t session = kNone32;
+    std::int32_t net = 0;     // router net: the RNE's or the DROP's (M5)
     std::string name, label;
     bool placed = false;      // position known
     bool from_drop = false;

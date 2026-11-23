@@ -15,10 +15,15 @@
  *     calls that change a session are rv_open, rv_close, rv_refresh,
  *     rv_board_select, rv_layer_set_visible, rv_class_set_visible, the
  *     playback calls (rv_advance, rv_play, rv_set_direction, rv_set_speed,
- *     rv_speed_step, rv_seek_*, rv_step, rv_jump, rv_set_pacing), and the
- *     calls that return a borrowed buffer (rv_chunk_text, rv_wavefront,
- *     rv_view_status, rv_text, rv_get_display_list, rv_get_overlay), each
- *     of which replaces only the buffer it returned before;
+ *     rv_speed_step, rv_seek_*, rv_step, rv_jump, rv_set_pacing), the
+ *     selection calls (rv_select_net, rv_select_name, rv_select_clear,
+ *     rv_click), rv_nets_set_view, and the calls that return a borrowed
+ *     buffer (rv_chunk_text, rv_wavefront, rv_view_status, rv_text,
+ *     rv_get_display_list, rv_get_overlay, rv_nets_get, rv_nets_cell,
+ *     rv_hit_test, rv_hover_status, rv_net_history, rv_net_events), each of
+ *     which replaces only the buffer it returned before (rv_nets_get and
+ *     rv_nets_set_view replace the table's rows and cell texts; rv_hit_test
+ *     the hits);
  *     rv_get_wavefront_image may change the pixels of every wavefront image
  *     (not their addresses within one image size).  The camera calls
  *     (rv_view_*) never invalidate a display list.
@@ -29,7 +34,8 @@
  * the camera.  Milestone M3: the timeline, the playback clock, and the
  * overlay of router copper, rip-up ghosts, failure markers and the current
  * event.  Milestone M4: the wavefront of each search as images, and pacing
- * modes.
+ * modes.  Milestone M5: the nets table, the net selection and its
+ * highlight, hit testing, and the attempt history of a net.
  *
  * The trace file format is docs/TRACE_FORMAT.md in the router repository.
  */
@@ -47,7 +53,7 @@ extern "C" {
  * compares this compile-time value with rv_api_version() at run time to make
  * sure it was linked against the core it was compiled for.
  */
-#define RV_API_VERSION 5u
+#define RV_API_VERSION 6u
 
 /* "No id": an absent search, route, copper or session index. */
 #define RV_NONE 0xFFFFFFFFu
@@ -404,8 +410,8 @@ typedef enum rv_object_class {
     RV_OBJ_OUTLINE = 9,      /* board outline (Edge.Cuts) */
     RV_OBJ_ROUTED = 10,      /* router copper and rip-up ghosts (overlay, M3) */
     RV_OBJ_WAVEFRONT = 11    /* the wavefront images (M4) */
-    /* Reserved for a later milestone, not produced by this version:
-     * 12 net highlight (M5). */
+    /* M5: the net highlight is no class of its own: it follows the classes
+     * and layers of what it highlights (see rv_select_net). */
 } rv_object_class;
 
 /* Number of object classes this core produces (12). */
@@ -736,6 +742,9 @@ rv_status rv_position_get(rv_session *session, rv_position *out);
                                    revealed, visibility): fetch them again and compare each
                                    image's generation.  RV_CHANGED_OVERLAY or BOARD may also
                                    change an image's order or layer. */
+#define RV_CHANGED_SELECTION 16u /* M5: the selection changed (the overlay too) */
+#define RV_CHANGED_TIMELINE 32u  /* M5: the timeline was repaced (one-net pacing follows the
+                                    selection): fetch rv_get_timeline again */
 
 /*
  * The clock.  rv_advance moves t by dt * speed * direction seconds of wall
@@ -836,6 +845,8 @@ rv_status rv_text(rv_session *session, uint32_t which, const char **text);
 #define RV_SLOT_DRILLS 1u  /* router via drills, in the hole slot */
 #define RV_SLOT_MARKERS 2u /* markers and highlights, above everything */
 #define RV_SLOT_WAVEFRONT 3u /* M4: one router layer's wavefront image; no batches */
+#define RV_SLOT_DIM 4u       /* M5: the dim rectangle of the net highlight */
+#define RV_SLOT_HIGHLIGHT 5u /* M5: the selected net's copper, drawn again brightened */
 
 typedef struct rv_slot {
     uint32_t kind;         /* RV_SLOT_* */
@@ -874,10 +885,12 @@ rv_status rv_get_overlay(rv_session *session, rv_display_list *out, const rv_slo
  * layer's theme colour C; r = a cell's cost so far / the largest cost of the
  * search's stored entries, or its position in the order / (n - 1) when the
  * search stored no costs):
- *   colour = lerp(C mixed 55 % toward white, C, r),
- *   alpha  = lerp(0.60, 0.28, r);
- *   the frontier, the most recently revealed max(1, ceil(n * 0.04)) cells:
- *   C mixed 85 % toward white, alpha 0.95.
+ *   colour = lerp(C mixed 18 % toward white, C, r),
+ *   alpha  = lerp(0.22, 0.08, r);
+ *   the frontier, the most recently revealed max(1, ceil(n * 0.02)) cells:
+ *   C mixed 50 % toward white, alpha 0.55.
+ * (M5 made these subtler: a faint tint of the layer colour that keeps the
+ * board readable; API 5 had 55 %, 0.60 to 0.28, 0.04 and 85 % at 0.95.)
  * The images are empty when the class RV_OBJ_WAVEFRONT or the layer is
  * hidden, and between searches.  They are a pure function of the position,
  * the visibility and the trace: playing to a position and seeking to it,
@@ -966,6 +979,273 @@ const char *rv_pacing_mode_name(uint32_t mode);
  * nothing changes).  `changed` (may be NULL) gets RV_CHANGED_* bits. */
 rv_status rv_set_pacing(rv_session *session, const rv_pacing *pacing, uint32_t *changed);
 rv_status rv_get_pacing(rv_session *session, rv_pacing *out);
+
+/* ==== M5: nets table, selection and highlight, hit testing, history ========
+ *
+ * Router nets are those of the NETS chunks (rv_net); a board net is a
+ * (code, name) of the BRD drawn.  They are matched by name only, exactly
+ * (case and all): a router net selects every board net of the same name on
+ * the board drawn.  A router net without a name (no NETS entry, or "")
+ * matches no board item; a board item without a net (code -1, or a net
+ * with the name "") is never highlighted and selects nothing.  Codes are
+ * never compared: the router's and KiCad's numbering differ.
+ */
+
+/* ---- the nets table ------------------------------------------------------------
+ *
+ * One row per (router session, router net) that any chunk is about, plus a
+ * row without a session (session RV_NONE) for each net that NETS names but no
+ * chunk mentions.  Totals are a pure function of the file; the "now" columns
+ * (state, copper, failures) a function of the position as well (a row of an
+ * earlier session shows that session's end; a row without a session is
+ * always "not started").  Column rules:
+ *   routes      RNB chunks; searches, found, not found: SRCH (RV_SRCH_FOUND)
+ *   commits     CMIT chunks; vias: vias of its CMITs plus VIAs with added = 1
+ *   rips        rip-up events that removed at least one of its copper items
+ *   failed pads RNE failed labels plus DROPs with ok = 0
+ *   expanded    sum of its searches' expanded states
+ *   seconds     router time: each route_net call's t(RNE) - t(RNB) (an
+ *               unfinished call: to the session's last chunk) plus duration_s
+ *               of its searches outside route_net (ctx != 1)
+ *   first, last its first and last event: events of its chunks other than
+ *               PAD, RECT, DISC and VIA with added = 0, and the rip-ups that
+ *               removed its copper (as rv_net_events)
+ *   copper      its copper items alive; failures: its failed pads shown
+ *   state       the first of: routing (a route_net call of the net is in
+ *               progress: its RNB event at or before the position, its RNE
+ *               after), failed (failures > 0), ripped (the last change to its
+ *               copper removed some), complete (its latest route_net call
+ *               returned status 0 with no failed pads and none of its copper
+ *               was removed since), routed (copper > 0), not started.
+ * Sorting: by any column, either direction; ties by session, then net code
+ * (both ascending).  Names compare ASCII case-insensitively.  Filtering:
+ * rows whose name contains the filter, ASCII case-insensitively.
+ */
+typedef enum rv_net_state {
+    RV_NET_NOT_STARTED = 0,
+    RV_NET_ROUTING = 1,
+    RV_NET_ROUTED = 2,
+    RV_NET_COMPLETE = 3,
+    RV_NET_RIPPED = 4,
+    RV_NET_FAILED = 5,
+    RV_NET_STATE_COUNT = 6
+} rv_net_state;
+
+/* Name of a state ("not started", ...), "" if out of range.  Static. */
+const char *rv_net_state_name(uint32_t state);
+
+typedef enum rv_net_column {
+    RV_NETCOL_NAME = 0, RV_NETCOL_NET = 1, RV_NETCOL_SESSION = 2, RV_NETCOL_STATE = 3,
+    RV_NETCOL_ROUTES = 4, RV_NETCOL_SEARCHES = 5, RV_NETCOL_FOUND = 6, RV_NETCOL_NOT_FOUND = 7,
+    RV_NETCOL_COMMITS = 8, RV_NETCOL_VIAS = 9, RV_NETCOL_RIPS = 10, RV_NETCOL_FAILED_PADS = 11,
+    RV_NETCOL_EXPANDED = 12, RV_NETCOL_SECONDS = 13, RV_NETCOL_FIRST = 14, RV_NETCOL_LAST = 15,
+    RV_NETCOL_COPPER = 16, RV_NETCOL_FAILURES = 17,
+    RV_NETCOL_COUNT = 18
+} rv_net_column;
+
+/* Column title ("Net", "State", ...) and alignment (0 left, 1 right).
+ * Static; "" and 0 for an unknown column. */
+const char *rv_net_column_title(uint32_t column);
+uint32_t rv_net_column_align(uint32_t column);
+
+typedef struct rv_nets_info {
+    uint32_t row_count;     /* rows of the table */
+    uint32_t view_count;    /* rows passing the filter */
+    uint32_t generation;    /* changes whenever a value shown or the view changes */
+    uint32_t sort_column;   /* RV_NETCOL_* */
+    uint32_t descending;    /* 1 if sorted descending */
+    uint32_t selected_position; /* view position of the selected net's row in the position's
+                                   session (else its latest row), RV_NONE if none is shown */
+} rv_nets_info;
+
+/* Bring the table to the position (it is built on first use) and describe
+ * it.  Call it before reading rows after any change. */
+rv_status rv_nets_get(rv_session *session, rv_nets_info *out);
+
+/* Sort by column (descending if 1) and keep the rows whose name contains
+ * filter (NULL or "" keeps all).  Default: name, ascending, no filter. */
+rv_status rv_nets_set_view(rv_session *session, uint32_t column, uint32_t descending, const char *filter);
+
+typedef struct rv_net_row {
+    double seconds;
+    int64_t expanded;
+    const char *name;       /* borrowed: the NETS name, else "net <code>" */
+    uint32_t row;           /* index in the table (stable until the table is rebuilt) */
+    int32_t net;            /* router net code */
+    uint32_t session;       /* RUN index, RV_NONE for a net no chunk mentions */
+    uint32_t named;         /* 1 if NETS gives it a name (it can match board nets) */
+    uint32_t state;         /* rv_net_state, at the position */
+    uint32_t routes, searches, found, not_found, commits, vias, rips, failed_pads;
+    uint32_t first_event;   /* RV_NONE if none */
+    uint32_t last_event;
+    uint32_t copper;        /* at the position */
+    uint32_t failures;      /* at the position */
+} rv_net_row;
+
+/* The row at view position (after sorting and filtering) as of the last
+ * rv_nets_get. */
+rv_status rv_nets_row(rv_session *session, uint32_t position, rv_net_row *out);
+
+/* A cell as text (numbers formatted, events 1-based, "—" for none), as of
+ * the last rv_nets_get.  Borrowed until the next rv_nets_cell call or any
+ * call that changes the session. */
+rv_status rv_nets_cell(rv_session *session, uint32_t position, uint32_t column, const char **text);
+
+/* ---- the selection and its highlight -----------------------------------------
+ *
+ * At most one net is selected.  While one is, the overlay dims everything
+ * and draws the net's copper again, brightened (KiCad's net highlight):
+ *   - an RV_SLOT_DIM slot (order rank 955, between Edge.Cuts and the
+ *     markers) holds one RV_FILL rectangle in the background colour at alpha
+ *     0.65 over everything drawn (the board's content and the router grid,
+ *     2 mm beyond), so all below is mixed 65 % toward the background;
+ *   - an RV_SLOT_HIGHLIGHT slot (ranks 960 to 969) holds copies of the
+ *     net's copper: the board's pads on copper layers, zone fills, tracks,
+ *     vias and their holes (board nets matched by name), and the router's
+ *     copper, vias, drills and ghosts of the selected router net; each in its
+ *     colour mixed 30 % toward white with its alpha kept (holes keep their
+ *     colours), each shown only when what it copies is shown (class, layer,
+ *     and router copper not hidden by the board).  Their stacking keeps the
+ *     copper layers' order (B.Cu lowest) and, within a layer, the sub-slot
+ *     order; holes above all copper.  Unlike KiCad, the highlighted items are
+ *     drawn above every layer's dimmed content, not in their layer's place.
+ * The markers (failed pads, the current event) are drawn above both, undimmed.
+ * Both slots are present whenever a trace is open (empty without a
+ * selection, so drawing is unchanged then).  The selection is kept across
+ * rv_refresh and cleared by rv_open and rv_close.  In "one net" pacing,
+ * selecting a router net makes it the paced net (RV_CHANGED_TIMELINE).
+ * `changed` (may be NULL) of the calls below gets RV_CHANGED_* bits.
+ */
+
+/* Select router net `net` (any code; its NETS name, if any, matches board nets). */
+rv_status rv_select_net(rv_session *session, int32_t net, uint32_t *changed);
+/* Select by name: the router net of that name (the lowest code) if there is
+ * one, and the board nets of that name.  NULL or "" clears. */
+rv_status rv_select_name(rv_session *session, const char *name, uint32_t *changed);
+rv_status rv_select_clear(rv_session *session, uint32_t *changed);
+
+typedef struct rv_selection {
+    const char *name;      /* borrowed; "" if none or unnamed */
+    uint32_t active;       /* 1 if a net is selected */
+    uint32_t has_net;      /* 1 if it is a router net */
+    int32_t net;           /* the router net, if has_net */
+    uint32_t board_nets;   /* board nets of that name on the board drawn */
+    uint32_t board_items;  /* their pads (copper layers), zone fills, tracks and vias */
+    uint32_t reserved;     /* 0 */
+} rv_selection;
+
+rv_status rv_selection_get(rv_session *session, rv_selection *out);
+
+/* ---- hit testing ---------------------------------------------------------------------
+ *
+ * What is under a view point, as drawn now: router copper alive (when its
+ * class and layer are shown and the board does not hold the routing), the
+ * board's pads on copper layers, tracks, vias and zone fills (when their
+ * class and a layer they are on are shown), failed-pad markers (always), and
+ * the wavefront cell revealed under the point (when shown).  An item is hit
+ * within 3 view points of its edge (RV_PICK_POINTS); a zone fill or a
+ * wavefront cell only from inside.  Topmost first: failure markers, then
+ * the shapes (router copper, pads, tracks, vias) by draw order from the top,
+ * then the areas (zone fills, wavefront cells) by draw order from the top;
+ * ties: the item written later first, then the nearer.
+ */
+#define RV_PICK_POINTS 3.0
+
+#define RV_HIT_ROUTED 1u    /* router copper (a commit's path, stub or via, or a VIA) */
+#define RV_HIT_PAD 2u
+#define RV_HIT_TRACK 3u
+#define RV_HIT_VIA 4u
+#define RV_HIT_ZONE 5u
+#define RV_HIT_FAILURE 6u
+#define RV_HIT_WAVEFRONT 7u
+
+typedef struct rv_hit {
+    double distance;       /* mm from the item's edge, 0 inside */
+    int64_t cost;          /* WAVEFRONT: cost so far, -1 if not stored */
+    const char *net_name;  /* borrowed: router or board net name, "" if none */
+    const char *footprint; /* PAD: footprint reference, "" if none */
+    const char *pad;       /* PAD: pad number (nearest PADINFO of its footprint), "" if none */
+    const char *text;      /* one line describing it */
+    uint32_t kind;         /* RV_HIT_* */
+    uint32_t order;        /* draw order */
+    uint32_t layer;        /* board layer index, RV_NONE if none */
+    uint32_t router_layer; /* ROUTED, WAVEFRONT: 0 or 1, else RV_NONE */
+    int32_t net;           /* router net, if has_net */
+    uint32_t has_net;
+    int32_t board_net;     /* board net code, -1 if none */
+    uint32_t copper;       /* ROUTED: copper index (as rv_info's copper ids are counted) */
+    uint32_t event;        /* ROUTED: the event that made it; FAILURE: that reported it;
+                              WAVEFRONT: the search event; else RV_NONE */
+    uint32_t record;       /* PAD, ZONE, TRACK, VIA: index of its record among the BRD's
+                              records of that kind; FAILURE: failure index; WAVEFRONT: search_id */
+    uint32_t cell;         /* WAVEFRONT: the cell (layer * nx * ny + j * nx + i) */
+    uint32_t order_index;  /* WAVEFRONT: its position in the expansion order (0-based) */
+} rv_hit;
+
+/* Hit test at view point (vx, vy); stores the number of hits.  The hits
+ * stay readable with rv_hit_get until the next rv_hit_test or any call that
+ * changes the session. */
+rv_status rv_hit_test(rv_session *session, double vx, double vy, uint32_t *count);
+rv_status rv_hit_get(rv_session *session, uint32_t index, rv_hit *out);
+
+/* Status-line text for the cursor: rv_view_status's text and, after " · ",
+ * the topmost hit's text.  Borrowed until the next rv_hover_status call or
+ * any call that changes the session. */
+rv_status rv_hover_status(rv_session *session, double vx, double vy, const char **text);
+
+/* A click at view point (vx, vy): selects the net of the topmost hit that
+ * has one (a router net for router copper, failures and wavefront cells; a
+ * board item's net by name), or clears the selection when no hit has one. */
+rv_status rv_click(rv_session *session, double vx, double vy, uint32_t *changed);
+
+/* ---- the attempt history of a net ---------------------------------------------------
+ *
+ * The chunks about router net `net` in file order, as entries with a depth:
+ *   depth 0  "router session N"
+ *   depth 1  each route_net call ("route_net K/M NAME, P pads: ok" / "raised" /
+ *            "n pads failed" / "not finished"); searches, commits, vias and
+ *            rip-ups outside route_net; drop_to_plane calls; rip-ups that
+ *            removed its copper ("ripped up by the route_net of NAME", by "its
+ *            own route_net", by "drop_to_plane" or by "a direct rip")
+ *   depth 2  inside a route_net call: its searches (result, cost, path cells,
+ *            states expanded, seconds, "repeats search N"), commits, rebuilds
+ *            ("rebuild: rips up A, B"), what it returned, its failed pads;
+ *            a drop_to_plane's failed pad
+ * Rip-up cause: the RIP's route_id names the route_net call that ripped
+ * (ctx 1); ctx 2 is drop_to_plane; anything else is a direct rip.
+ */
+#define RV_HIST_SESSION 0u
+#define RV_HIST_ROUTE 1u
+#define RV_HIST_SEARCH 2u
+#define RV_HIST_COMMIT 3u
+#define RV_HIST_VIA 4u
+#define RV_HIST_RIPPED 5u     /* a rip-up removed its copper */
+#define RV_HIST_REBUILD 6u    /* its route_net ripped other nets */
+#define RV_HIST_FAILURE 7u    /* a failed pad */
+#define RV_HIST_RETURN 8u     /* a route_net call returned */
+#define RV_HIST_DROP 9u
+#define RV_HIST_RIP_OTHER 10u /* a RIP of this net that removed none of its copper */
+
+typedef struct rv_history_entry {
+    const char *text;  /* borrowed */
+    uint32_t depth;
+    uint32_t kind;     /* RV_HIST_* */
+    uint32_t event;    /* the event to seek to; RV_NONE without events */
+    uint32_t chunk;
+    uint32_t session;
+    uint32_t flags;    /* RV_EVF_FOUND, RV_EVF_FAILED, RV_EVF_ERROR */
+} rv_history_entry;
+
+/* Build the history of router net `net`; stores the number of entries.
+ * The entries stay readable with rv_history_get until the next
+ * rv_net_history or any call that changes the session. */
+rv_status rv_net_history(rv_session *session, int32_t net, uint32_t *count);
+rv_status rv_history_get(rv_session *session, uint32_t index, rv_history_entry *out);
+
+/* The events of router net `net`, ascending: those of its history entries
+ * other than session headers (for marks on a timeline).  Borrowed until the
+ * next rv_net_events or any call that changes the session. */
+rv_status rv_net_events(rv_session *session, int32_t net, const uint32_t **events, uint32_t *count);
 
 #ifdef __cplusplus
 } /* extern "C" */

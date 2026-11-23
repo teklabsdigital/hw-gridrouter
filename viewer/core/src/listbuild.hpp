@@ -39,6 +39,7 @@ struct LKey {
 struct LBucket {
     std::vector<float> xy;
     std::vector<std::uint32_t> contours; // first point (local), count
+    std::vector<std::uint32_t> polys;    // Fill: first contour (local), count
     std::vector<float> segs, circles;
     std::uint32_t items = 0;
     std::uint64_t mask = 0; // free for the caller: which members of the group are in it
@@ -77,6 +78,58 @@ struct LBucket {
     void circle(double x, double y, double r, double pad) {
         circles.insert(circles.end(), {static_cast<float>(x), static_cast<float>(y), static_cast<float>(r)});
         grow(x, y, r + pad);
+        ++items;
+    }
+    // A filled rectangle, outline oriented positive (rv.h, RV_FILL).
+    void rect(double x0, double y0, double x1, double y1) {
+        polys.push_back(static_cast<std::uint32_t>(contours.size() / 2));
+        polys.push_back(1);
+        contours.push_back(static_cast<std::uint32_t>(xy.size() / 2));
+        contours.push_back(4);
+        xy.insert(xy.end(), {static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(x1), static_cast<float>(y0),
+                             static_cast<float>(x1), static_cast<float>(y1), static_cast<float>(x0), static_cast<float>(y1)});
+        grow(x0, y0, 0);
+        grow(x1, y1, 0);
+        ++items;
+    }
+    // Item k of batch b of list l, copied (any primitive; the bucket must
+    // be of the same primitive).
+    void copy_item(const DisplayList &l, const Batch &b, std::uint32_t k) {
+        const std::uint32_t i = b.first + k;
+        auto copy_contour = [&](std::uint32_t c, double pad) {
+            const std::uint32_t p0 = l.contours[2 * static_cast<std::size_t>(c)];
+            const std::uint32_t n = l.contours[2 * static_cast<std::size_t>(c) + 1];
+            contours.push_back(static_cast<std::uint32_t>(xy.size() / 2));
+            contours.push_back(n);
+            for (std::uint32_t q = 0; q < n; ++q) {
+                const float x = l.xy[2 * static_cast<std::size_t>(p0 + q)], y = l.xy[2 * static_cast<std::size_t>(p0 + q) + 1];
+                xy.push_back(x);
+                xy.push_back(y);
+                grow(x, y, pad);
+            }
+        };
+        switch (b.prim) {
+        case Prim::Fill: {
+            const std::uint32_t c0 = l.polys[2 * static_cast<std::size_t>(i)];
+            const std::uint32_t nc = l.polys[2 * static_cast<std::size_t>(i) + 1];
+            polys.push_back(static_cast<std::uint32_t>(contours.size() / 2));
+            polys.push_back(nc);
+            for (std::uint32_t c = 0; c < nc; ++c) copy_contour(c0 + c, 0);
+            break;
+        }
+        case Prim::Stroke: copy_contour(i, b.width / 2.0); break;
+        case Prim::Segs: {
+            const float *s = &l.segs[4 * static_cast<std::size_t>(i)];
+            seg(s[0], s[1], s[2], s[3], b.width / 2.0);
+            return;
+        }
+        case Prim::Disc:
+        case Prim::Ring: {
+            const float *c = &l.circles[3 * static_cast<std::size_t>(i)];
+            circle(c[0], c[1], c[2], b.prim == Prim::Ring ? b.width / 2.0 : 0.0);
+            return;
+        }
+        }
         ++items;
     }
 };
@@ -122,7 +175,13 @@ public:
             const auto point_base = static_cast<std::uint32_t>(out.xy.size() / 2);
             const auto contour_base = static_cast<std::uint32_t>(out.contours.size() / 2);
             switch (bt.prim) {
-            case Prim::Fill: bt.first = static_cast<std::uint32_t>(out.polys.size() / 2); break; // not produced
+            case Prim::Fill:
+                bt.first = static_cast<std::uint32_t>(out.polys.size() / 2);
+                for (std::size_t i = 0; i < b.polys.size(); i += 2) {
+                    out.polys.push_back(b.polys[i] + contour_base);
+                    out.polys.push_back(b.polys[i + 1]);
+                }
+                break;
             case Prim::Stroke: bt.first = contour_base; break;
             case Prim::Segs:
                 bt.first = static_cast<std::uint32_t>(out.segs.size() / 4);

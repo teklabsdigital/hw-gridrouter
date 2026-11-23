@@ -21,6 +21,13 @@ final class BoardView: NSView {
     var onStatus: ((String) -> Void)?
     /// Called with a message to show over the board, nil for none.
     var onMessage: ((String?) -> Void)?
+    /// Called after a click changed the selection (M5), with what changed.
+    var onSelect: ((PlaybackChange) -> Void)?
+
+    /// A press that moves less than this (points) before it is released is
+    /// a click (it selects); one that moves further is a drag (it pans,
+    /// from the press point on, and selects nothing).
+    static let clickSlop: CGFloat = 3
 
     private let root = CALayer()
     private var planeLayers: [CALayer] = []
@@ -29,6 +36,8 @@ final class BoardView: NSView {
     private var structure = -1
     private var refreshScheduled = false
     private var lastDrag: NSPoint?
+    private var pressPoint: NSPoint?
+    private var dragging = false
     private var cursor: NSPoint?
 
     /// Duration of the last refresh's rasterising, seconds, and planes redrawn.
@@ -232,9 +241,11 @@ final class BoardView: NSView {
         reportStatus()
     }
 
+    /// The status line: the cursor's position and what is under it (the
+    /// core's text), else the zoom.
     func reportStatus() {
         guard let onStatus else { return }
-        if let cursor, let text = try? session.statusText(viewX: Double(cursor.x), viewY: Double(cursor.y)) {
+        if let cursor, let text = try? session.hoverStatus(viewX: Double(cursor.x), viewY: Double(cursor.y)) {
             onStatus(text)
         } else if let v = try? session.view() {
             onStatus(String(format: "zoom %.0f%%", v.zoomPercent))
@@ -245,20 +256,35 @@ final class BoardView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        lastDrag = convert(event.locationInWindow, from: nil)
-        NSCursor.closedHand.set()
+        let p = convert(event.locationInWindow, from: nil)
+        lastDrag = p
+        pressPoint = p
+        dragging = false
     }
 
     override func mouseDragged(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         cursor = p
+        if !dragging {
+            // Still a click until the pointer leaves the slop around the press.
+            guard let press = pressPoint, hypot(p.x - press.x, p.y - press.y) >= BoardView.clickSlop else { return }
+            dragging = true
+            NSCursor.closedHand.set()
+        }
         if let last = lastDrag { pan(p.x - last.x, p.y - last.y) }
         lastDrag = p
     }
 
     override func mouseUp(with event: NSEvent) {
+        let wasClick = pressPoint != nil && !dragging
+        let p = pressPoint ?? convert(event.locationInWindow, from: nil)
         lastDrag = nil
+        pressPoint = nil
+        dragging = false
         NSCursor.arrow.set()
+        if wasClick, let changed = try? session.click(viewX: Double(p.x), viewY: Double(p.y)), !changed.isEmpty {
+            onSelect?(changed)
+        }
     }
 
     override func mouseMoved(with event: NSEvent) {

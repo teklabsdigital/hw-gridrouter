@@ -120,85 +120,7 @@ int check_against_naive(const rv::Trace &t, const rv::Timeline &tl) {
 
 // --- random routing runs ---------------------------------------------------------
 
-std::vector<unsigned char> random_run(std::uint32_t seed) {
-    std::mt19937 rng(seed);
-    auto R = [&](std::uint32_t n) { return static_cast<std::uint32_t>(rng() % n); };
-    synth::TimelineWriter tw;
-    tw.nets({{1, "N1"}, {2, "N2"}, {3, "N3"}, {4, "N4"}});
-    tw.run = synth::make_run(12, 8, 8);
-    auto path = [&]() {
-        std::vector<Cell> p;
-        Cell c = C(R(2), static_cast<std::int32_t>(R(12)), static_cast<std::int32_t>(R(8)));
-        p.push_back(c);
-        const std::uint32_t n = 1 + R(7);
-        for (std::uint32_t k = 0; k < n; ++k) {
-            if (R(5) == 0) {
-                c.layer ^= 1u;
-            } else {
-                c.i = std::max(0, std::min(11, c.i + static_cast<std::int32_t>(R(3)) - 1));
-                c.j = std::max(0, std::min(7, c.j + static_cast<std::int32_t>(R(3)) - 1));
-            }
-            p.push_back(c);
-        }
-        return p;
-    };
-    auto name = [](std::int32_t net) { return "N" + std::to_string(net); };
-    const std::uint32_t sessions = 1 + R(3);
-    for (std::uint32_t s = 0; s < sessions; ++s) {
-        if (R(2) == 0) tw.brd(tw.board("b", R(2) == 0));
-        tw.start(12, 8);
-        const std::uint32_t ops = 15 + R(40);
-        for (std::uint32_t k = 0; k < ops; ++k) {
-            const std::int32_t net = 1 + static_cast<std::int32_t>(R(4));
-            switch (R(11)) {
-            case 0:
-            case 1:
-            case 2: tw.commit(net, path(), R(2) ? 0.2 : 0.5, R(3) == 0 ? std::vector<std::pair<std::int32_t, std::int32_t>>{{static_cast<std::int32_t>(R(12)), static_cast<std::int32_t>(R(8))}} : std::vector<std::pair<std::int32_t, std::int32_t>>{}); break;
-            case 3: tw.via(net, static_cast<std::int32_t>(R(12)), static_cast<std::int32_t>(R(8))); break;
-            case 4: {
-                std::vector<std::uint32_t> extra;
-                if (R(4) == 0 && !tw.alive.empty()) {
-                    auto it = tw.alive.begin();
-                    std::advance(it, R(static_cast<std::uint32_t>(tw.alive.size())));
-                    if (it->second.net != net) extra.push_back(it->first);
-                }
-                tw.rip(net, 0, synth::NONE32, extra);
-                break;
-            }
-            case 5:
-                if (R(3) == 0) tw.snap();
-                break;
-            case 6: {
-                const std::uint32_t r = tw.rnb(net, name(net), {{1.0, 1.0, 1, 2, "P1"}, {2.0, 1.5, 1, 2, "P2"}});
-                tw.srch(net, {C(0, 4, 4)}, {C(0, 8, 4)}, {}, 1 + R(5000), 1, r);
-                if (R(2) == 0) {
-                    const std::int32_t other = 1 + static_cast<std::int32_t>(R(4));
-                    tw.rbld(r, {name(other)}, {other});
-                    tw.rip(other, 1, r);
-                }
-                const std::vector<Cell> p = path();
-                tw.srch(net, {p.front()}, {p.back()}, p, 1 + R(5000), 1, r);
-                tw.commit(net, p, 0.2, {}, {}, 1, r);
-                std::vector<std::string> failed;
-                if (R(3) == 0) failed.push_back("P2");
-                if (R(4) == 0) failed.push_back("P1");
-                tw.rne(r, net, failed);
-                break;
-            }
-            case 7:
-                tw.srch(net, {C(0, 2, 2), C(0, 3, 2)}, {C(1, 2, 2)}, {}, 1 + R(300), 2);
-                tw.drop(net, R(3), name(net), "P" + std::to_string(1 + R(2)));
-                break;
-            case 8: tw.mark(R(2), "phase " + std::to_string(k)); break;
-            case 9: tw.brd(tw.board("mid", R(2) == 0)); break;
-            default: tw.pad(net, 0.25 * R(12), 0.25 * R(8), 0.3); break;
-            }
-        }
-        if (R(2) == 0) tw.rout();
-    }
-    if (R(4) != 0) tw.end({});
-    return tw.w.out;
-}
+std::vector<unsigned char> random_run(std::uint32_t seed) { return synth::random_timeline(seed); }
 
 // --- the overlay as text, for comparing states ---------------------------------------
 
@@ -660,8 +582,9 @@ TEST(commit_geometry_in_board_mm) {
     CHECK_EQ(segs, 1u);
     CHECK_EQ(discs, 4u);
     CHECK_EQ(drills, 2u);
-    // Per router layer a wavefront slot and a routed slot, then drills, markers.
-    CHECK_EQ(ov.slots().size(), std::size_t(6));
+    // Per router layer a wavefront slot and a routed slot, then drills, the
+    // M5 dim and highlight slots (empty without a selection), markers.
+    CHECK_EQ(ov.slots().size(), std::size_t(8));
 }
 
 // --- ghosts, failures, the board ------------------------------------------------------
@@ -882,7 +805,7 @@ TEST(router_outline_without_a_board) {
     const rv_slot *slots = nullptr;
     CHECK_EQ(rv_get_overlay(s.s, &d, &slots, &n), RV_OK);
     CHECK(d.batch_count > 0);
-    CHECK_EQ(n, 6u);
+    CHECK_EQ(n, 8u); // M5: with the empty dim and highlight slots
     CHECK_EQ(slots[0].kind, RV_SLOT_WAVEFRONT);
     CHECK_EQ(slots[0].batch_count, 0u);
     CHECK_EQ(slots[1].kind, RV_SLOT_ROUTED);

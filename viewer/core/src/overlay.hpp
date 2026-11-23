@@ -49,6 +49,19 @@ constexpr std::uint32_t kMarkPads = 0x30;
 constexpr std::uint32_t kMarkVia = 0x38;
 } // namespace sub
 
+// M5, the net highlight: two slots between Edge.Cuts (rank 950) and the
+// markers (kRankOverlay).  The dim slot holds one rectangle of the
+// background colour over everything drawn below it; the highlight slot holds
+// copies of the selected net's copper, brightened, in an order of their own
+// (highlight_order) that keeps their relative stacking.
+constexpr std::uint32_t kRankDim = 955;
+constexpr std::uint32_t kRankHighlight = 960;
+constexpr std::uint32_t kRankHighlightEnd = 970;
+// The order in the highlight slot of an item drawn at `order` below: copper
+// ranks (100 to 170, B.Cu to F.Cu) and the hole slot keep their order, and
+// so do the sub-slots within each.
+std::uint32_t highlight_order(std::uint32_t order);
+
 constexpr std::uint32_t kClassRouted = 10;    // rv_object_class RV_OBJ_ROUTED
 constexpr std::uint32_t kClassWavefront = 11; // rv_object_class RV_OBJ_WAVEFRONT
 constexpr std::uint32_t kKeyBase = 0x80000000u; // overlay keys never collide with board keys
@@ -56,7 +69,7 @@ constexpr std::uint32_t kKeyBase = 0x80000000u; // overlay keys never collide wi
 // Slot kinds; values match RV_SLOT_* in rv.h.  A Wavefront slot holds no
 // batches: its content is the wavefront image of its router layer
 // (wavefront.hpp), drawn at order_begin.
-enum class SlotKind : std::uint32_t { Routed = 0, Drills = 1, Markers = 2, Wavefront = 3 };
+enum class SlotKind : std::uint32_t { Routed = 0, Drills = 1, Markers = 2, Wavefront = 3, Dim = 4, Highlight = 5 };
 
 // One router layer of a session as the overlay and the wavefront see it.
 struct RouterLayer {
@@ -93,6 +106,12 @@ struct OverlayColors {
     double ghost_alpha = 0.75; // alpha of a fresh ghost
     double ghost_white = 0.5;  // ghosts are the layer colour mixed this far toward white
     double hilite_white = 0.6; // the current commit, mixed this far toward white
+    // M5: the net highlight.  Everything below the dim slot is mixed this far
+    // toward the background (a rectangle of the background at this alpha);
+    // the selected net's copper is drawn again above it, its colour mixed
+    // this far toward white (alpha kept; holes keep their colours).
+    double dim_alpha = 0.65;
+    double select_white = 0.3;
 };
 
 // Ghost alpha is quantised to this many levels, so the overlay changes at
@@ -119,6 +138,15 @@ struct OverlayInput {
     std::uint32_t event = kNone32;
     bool suppress_routed = false; // the board drawn already holds this routing
     bool settled = false;         // a search event in its settled part (playback.hpp)
+    // M5: the net highlight.  Active: dim everything and draw the selection.
+    bool select_active = false;
+    bool select_has_net = false;   // a router net is selected: its copper is highlighted
+    std::int32_t select_net = 0;
+    const DisplayList *select_board = nullptr; // the board's copper of the selected net (build_net_list)
+    std::uint32_t select_build = 0;            // changes whenever select_board is rebuilt
+    std::vector<bool> board_layer_visible;     // by board layer index, for select_board
+    std::uint32_t classes = 0;                 // visible object classes, bit per class
+    std::array<float, 4> dim_rect{{0, 0, 0, 0}}; // what the dim rectangle covers, mm
 };
 
 class Overlay {
