@@ -1,0 +1,9 @@
+gridrouter/libgridrouter.dylib
+gridrouter/libgridrouter.so
+gridrouter/gridrouter.dll
+gridrouter/*.tmp
+gridrouter/*.obj
+gridrouter/*.exp
+gridrouter/*.lib
+__pycache__/
+.DS_Store
