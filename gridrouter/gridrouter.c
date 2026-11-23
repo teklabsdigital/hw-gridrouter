@@ -87,6 +87,12 @@ struct rt_router {
     int32_t *path;
     int32_t npath, cappath;
     int64_t stat_push, stat_pop, stat_maxheap;     /* last search */
+#ifdef RT_TRACE
+    uint32_t *tr_cell;                      /* caller's buffer, NULL = off */
+    int32_t *tr_cost;                       /* optional: d (cost so far) of that first expansion */
+    int32_t tr_cap, tr_n;                   /* buffer capacity; distinct cells the last search expanded */
+    uint32_t *tr_mark;                      /* per (layer, cell): tgen of the search that recorded it */
+#endif
 
     int32_t *disc[RT_MAXR + 1];
     int32_t ndisc[RT_MAXR + 1];
@@ -173,6 +179,9 @@ void rt_free(rt_router *r)
     free(r->prevd);
     free(r->touched);
     free(r->tmark);
+#ifdef RT_TRACE
+    free(r->tr_mark);
+#endif
     for (uint32_t f = 0; f < r->nbk; f++)
         free(r->bk[f].a);
     free(r->bk);
@@ -686,6 +695,9 @@ int rt_search(rt_router *r, int32_t net, const int32_t *src, int32_t nsrc,
     const int32_t nc = r->nc, nx = r->nx, ny = r->ny, K = r->K, START = r->nd;
     const int64_t h_max = r->h_max, h_min = r->h_min, h_off = r->h_off;
     r->npath = 0;
+#ifdef RT_TRACE
+    r->tr_n = 0;
+#endif
     if (relax && !r->snapped)
         return RT_ESTATE;
     for (int32_t k = 0; k < ntgt; k++)
@@ -710,10 +722,20 @@ int rt_search(rt_router *r, int32_t net, const int32_t *src, int32_t nsrc,
     }
     if (++r->tgen == 0) {
         memset(r->tmark, 0, (size_t)nc * 2 * sizeof(uint32_t));
+#ifdef RT_TRACE
+        if (r->tr_mark)
+            memset(r->tr_mark, 0, (size_t)nc * 2 * sizeof(uint32_t));
+#endif
         r->tgen = 1;
     }
     const uint32_t tgen = r->tgen;
     const uint32_t *tmark = r->tmark;
+#ifdef RT_TRACE
+    uint32_t *const tr_cell = r->tr_cell, *const tr_mark = r->tr_mark;
+    int32_t *const tr_cost = r->tr_cost;
+    const int32_t tr_cap = r->tr_cap;
+    int32_t tr_n = 0;
+#endif
     int32_t *const dist = r->dist;
     uint8_t *const prevd = r->prevd;
     const int lev = wide ? 1 : 0;
@@ -797,6 +819,17 @@ int rt_search(rt_router *r, int32_t net, const int32_t *src, int32_t nsrc,
         const int32_t layer = (int32_t)(o >> 31), j = (int32_t)((o >> 18) & 0x1FFF),
                       i = (int32_t)((o >> 5) & 0x1FFF), dr = (int32_t)(o & 31);
         const int32_t idx = j * nx + i, ls = layer * nc + idx;
+#ifdef RT_TRACE
+        if (tr_cell && tr_mark[ls] != tgen) {   /* first expansion of (layer, cell) */
+            tr_mark[ls] = tgen;
+            if (tr_n < tr_cap) {
+                tr_cell[tr_n] = (uint32_t)ls;
+                if (tr_cost)
+                    tr_cost[tr_n] = d;
+            }
+            tr_n++;
+        }
+#endif
         const int is_t = tmark[ls] == tgen;
         if (via_goal) {
             if (is_t || via_ok(r, idx, net)) {
@@ -868,6 +901,9 @@ int rt_search(rt_router *r, int32_t net, const int32_t *src, int32_t nsrc,
 #undef RELAX
 
 done:
+#ifdef RT_TRACE
+    r->tr_n = tr_n;
+#endif
     if (out_expanded)
         *out_expanded = expanded;
     if (rc == 0 && found >= 0) {
@@ -941,3 +977,33 @@ void rt_stats(rt_router *r, int64_t *out3)
     out3[1] = r->stat_pop;
     out3[2] = r->stat_maxheap;
 }
+#ifdef RT_TRACE
+
+/* ---- search trace (only with -DRT_TRACE) ------------------------------------ */
+
+int rt_trace(rt_router *r, uint32_t *cells, int32_t *cost, int32_t cap)
+{
+    if (!r || cap < 0)
+        return RT_EARG;
+    if (!cells) {                           /* off; tr_mark stays allocated */
+        r->tr_cell = NULL;
+        r->tr_cost = NULL;
+        r->tr_cap = 0;
+        return 0;
+    }
+    if (!r->tr_mark) {                      /* zeroed: tgen is never 0 during a search */
+        r->tr_mark = calloc((size_t)r->nc * 2, sizeof(uint32_t));
+        if (!r->tr_mark)
+            return RT_ENOMEM;
+    }
+    r->tr_cell = cells;
+    r->tr_cost = cost;
+    r->tr_cap = cap;
+    return 0;
+}
+
+int32_t rt_trace_count(rt_router *r)
+{
+    return r ? r->tr_n : RT_EARG;
+}
+#endif

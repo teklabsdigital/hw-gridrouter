@@ -94,5 +94,16 @@ RT_API int rt_search(rt_router *r, int32_t net, const int32_t *src, int32_t nsrc
 RT_API int rt_get_path(rt_router *r, int32_t *out, int32_t cap);
 /* Heap pushes, pops and peak heap size of the last search. */
 RT_API void rt_stats(rt_router *r, int64_t *out3);
+#ifdef RT_TRACE
+
+/* Search trace, compiled in only with -DRT_TRACE.  While cells != NULL, each
+ * rt_search writes layer * nc + idx of every (layer, cell) it expands, once, at
+ * its first expansion, in pop order, and the cost so far of that expansion to
+ * cost (if not NULL).  Only the first cap entries are written.  cells == NULL
+ * turns tracing off.  The buffers must outlive every search while it is on. */
+RT_API int rt_trace(rt_router *r, uint32_t *cells, int32_t *cost, int32_t cap);
+/* Distinct (layer, cell) expanded by the last search; may exceed cap. */
+RT_API int32_t rt_trace_count(rt_router *r);
+#endif
 
 #endif
