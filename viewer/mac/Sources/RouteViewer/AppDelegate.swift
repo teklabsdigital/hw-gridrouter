@@ -201,45 +201,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !window.isVisible { failures.append("board window is not visible") }
         if window.title != name { failures.append("window title \"\(window.title)\", expected \"\(name)\"") }
         if controller.panel.layerRowCount == 0 { failures.append("Appearance panel lists no layers") }
-        if controller.panel.classRowCount != 10 {
+        if controller.panel.classRowCount != 11 {
             failures.append("Appearance panel lists \(controller.panel.classRowCount) object classes")
         }
 
         let view = controller.boardView
-        guard let image = view.renderImage() else { return failures + ["board view rendered nothing"] }
-        let batches = view.renderer.batchCount
+        // A full redraw of every plane, timed.
+        view.layered.invalidate()
+        view.refresh()
+        let fullRender = view.lastRenderSeconds
+        let layered = view.layered
+        let batches = layered.batchCount
         if batches == 0 { failures.append("display list is empty") }
-        let background = view.renderer.background
-        let pixels = SelfTestPixels.rgba(image)
-        let bg = SelfTestPixels.rgba(of: background)
-        var painted = 0
-        for i in stride(from: 0, to: pixels.count, by: 4) where !SelfTestPixels.close(pixels, i, bg, 6) {
-            painted += 1
-        }
-        let total = image.width * image.height
-        if painted == 0 { failures.append("offscreen render shows only the background") }
 
-        // The view's own drawing path (draw(_:) into a bitmap) must give the
-        // same picture, the right way up.
-        var differing = -1
-        if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
-            view.cacheDisplay(in: view.bounds, to: rep)
-            if let cached = rep.cgImage, cached.width == image.width, cached.height == image.height {
-                let other = SelfTestPixels.rgba(cached)
-                differing = 0
-                for i in stride(from: 0, to: pixels.count, by: 4) where !SelfTestPixels.close(pixels, i, other, i, 8) {
-                    differing += 1
-                }
-                if differing > total / 100 {
-                    failures.append("view drawing differs from the render in \(differing) of \(total) pixels")
-                }
-            } else {
-                failures.append("could not capture the board view")
+        /// The layer tree on screen against a single-pass render of every
+        /// batch: the planes must add up to the same picture, the right way
+        /// up.  Cropped slot planes may differ in a few edge pixels of thin
+        /// strokes (LayeredRenderer.cropsSlots); anything more is a failure.
+        func compareLayers(_ label: String) -> (painted: Double, differing: Int, total: Int) {
+            view.refresh()
+            guard let vt = try? controller.session.view(), let single = layered.renderSinglePass(view: vt),
+                  let captured = view.captureLayers()
+            else {
+                failures.append("\(label): could not render or capture the board view")
+                return (0, -1, 0)
             }
+            guard captured.width == single.width, captured.height == single.height else {
+                failures.append("\(label): capture \(captured.width)x\(captured.height), render \(single.width)x\(single.height)")
+                return (0, -1, 0)
+            }
+            // RV_SELFTEST_DUMP=DIR keeps both pictures.
+            if let dir = ProcessInfo.processInfo.environment["RV_SELFTEST_DUMP"] {
+                for (image, suffix) in [(single, "single"), (captured, "layers")] {
+                    let url = URL(fileURLWithPath: dir).appendingPathComponent("\(label)_\(suffix).png")
+                    try? NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])?.write(to: url)
+                }
+            }
+            let a = SelfTestPixels.rgba(single), b = SelfTestPixels.rgba(captured)
+            let bg = SelfTestPixels.rgba(of: layered.background)
+            var painted = 0, differing = 0
+            for i in stride(from: 0, to: a.count, by: 4) {
+                if !SelfTestPixels.close(a, i, bg, 6) { painted += 1 }
+                if !SelfTestPixels.close(a, i, b, i, 48) { differing += 1 }
+            }
+            let total = single.width * single.height
+            if painted == 0 { failures.append("\(label): the render shows only the background") }
+            if differing > total / 2000 {
+                failures.append("\(label): the layers on screen differ from a single-pass render in \(differing) of \(total) pixels")
+            }
+            return (100 * Double(painted) / Double(total), differing, total)
         }
-        print(String(format: "selftest: %@: %d batches, %dx%d px, %.1f%% painted, view capture differs in %d px, render %.2f ms",
-                     name, batches, image.width, image.height, 100 * Double(painted) / Double(total), differing,
-                     view.lastRenderSeconds * 1000))
+        let first = compareLayers("opened")
+        print(String(format: "selftest: %@: %d batches (%d board, %d overlay) in %d planes, %d px, %.1f%% painted, "
+                        + "layers differ from single pass in %d px, render %.2f ms",
+                     name, batches, layered.boardBatchCount, layered.overlayBatchCount, layered.planes.count,
+                     first.total, first.painted, first.differing, fullRender * 1000))
+
+        let playback = checkPlayback(controller, compareLayers)
+        failures += playback
         document.close()
         // The self-test's file must not have been opened a second time by
         // AppKit (as a command-line argument) nor added to Open Recent.
@@ -250,6 +269,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if controller2.recentDocumentURLs.contains(where: { $0.lastPathComponent == name }) {
             failures.append("\(name) is in Open Recent")
         }
+        return failures
+    }
+
+    /// Play the run from the start through the window's own clock path
+    /// (accelerated: large frames), then seek, step and compare the layers
+    /// with a single-pass render in mid-run.
+    private func checkPlayback(_ c: BoardWindowController,
+                               _ compareLayers: (String) -> (painted: Double, differing: Int, total: Int))
+        -> [String] {
+        var failures: [String] = []
+        guard c.timelineView.eventCount > 0 else {
+            print("selftest: no routing events: playback not checked")
+            return failures
+        }
+        let s = c.session
+        c.goToStart(nil)
+        guard let p0 = try? s.position() else { return ["no position"] }
+        if p0.time != 0 { failures.append("Go to Start left t = \(p0.time)") }
+        if c.timelineView.playheadX > 2 { failures.append("playhead at x \(c.timelineView.playheadX) at the start") }
+        c.togglePlay(nil)
+        if !c.isPlaying { failures.append("Play did not start playing") }
+        if !c.isClockRunning { failures.append("the display link is not running while playing") }
+        let frames = 60
+        let dt = p0.total / max(p0.speed, 1e-9) / Double(frames - 10)
+        var overlays = Set<UInt32>(), frame = 0
+        func renders() -> Int { c.boardView.layered.planes.reduce(0) { $0 + $1.renders } }
+        let rendersBefore = renders()
+        while c.isPlaying && frame < frames {
+            c.advanceClock(by: dt)
+            if let g = c.boardView.layered.overlayList?.generation { overlays.insert(g) }
+            frame += 1
+        }
+        let planesRedrawn = renders() - rendersBefore
+        guard let pe = try? s.position() else { return failures + ["no position"] }
+        if !pe.atEnd || c.isPlaying { failures.append("playing did not stop at the end (t = \(pe.time))") }
+        if c.isClockRunning { failures.append("the display link still runs after the end") }
+        let copper = (try? s.facts().copperCount) ?? 0
+        if copper > 0 && overlays.count < 2 { failures.append("the overlay never changed while playing") }
+        if c.caption.stringValue.isEmpty || c.positionLabel.stringValue.isEmpty {
+            failures.append("caption or position readout is empty")
+        }
+        let atEnd = c.timelineView.playheadX
+        if atEnd < c.timelineView.bounds.width - 3 { failures.append("playhead at x \(atEnd) at the end") }
+
+        // Mid-run: the router copper is drawn by the overlay.
+        c.seek(fraction: 0.5)
+        let mid = compareLayers("mid-run")
+        let pm = try? s.position()
+        c.setStepKind(nil)
+        c.stepForward(nil)
+        let ps = try? s.position()
+        if ps?.time ?? 0 <= pm?.time ?? 0 || ps?.playing == true || ps?.fraction != 0 {
+            failures.append("Step Forward did not move to the next event start, paused")
+        }
+        print(String(format: "selftest: played %d frames: %d overlay lists, %d planes redrawn; mid-run: %d copper, "
+                        + "%d ghosts, layers differ in %d px; caption \"%@\"",
+                     frame, overlays.count, planesRedrawn, pm?.copperAlive ?? 0, pm?.ghosts ?? 0, mid.differing,
+                     c.caption.stringValue))
         return failures
     }
 
@@ -296,6 +373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         viewMenu.addItem(withTitle: "Zoom to Fit", action: #selector(BoardWindowController.zoomToFit(_:)),
                          keyEquivalent: "0")
         addSubmenu(viewMenu, to: mainMenu)
+        addSubmenu(makePlaybackMenu(), to: mainMenu)
 
         let windowMenu = NSMenu(title: "Window")
         windowMenu.addItem(withTitle: "Minimize",
@@ -309,6 +387,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.windowsMenu = windowMenu
 
         return mainMenu
+    }
+
+    /// The Playback menu.  Its items go to the key window's
+    /// BoardWindowController through the responder chain; the keys without
+    /// modifiers (space, arrows, Home, End) are the transport's shortcuts.
+    private func makePlaybackMenu() -> NSMenu {
+        let menu = NSMenu(title: "Playback")
+        func key(_ special: NSEvent.SpecialKey) -> String { String(Character(special.unicodeScalar)) }
+        func add(_ title: String, _ action: Selector, _ key: String,
+                 _ modifiers: NSEvent.ModifierFlags = []) {
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
+            item.keyEquivalentModifierMask = modifiers
+        }
+        add("Play", #selector(BoardWindowController.togglePlay(_:)), " ")
+        add("Play Backward", #selector(BoardWindowController.playBackward(_:)), "")
+        menu.addItem(.separator())
+        add("Step Forward", #selector(BoardWindowController.stepForward(_:)), key(.rightArrow))
+        add("Step Backward", #selector(BoardWindowController.stepBackward(_:)), key(.leftArrow))
+        add("Next Net", #selector(BoardWindowController.nextNet(_:)), key(.rightArrow), [.shift])
+        add("Previous Net", #selector(BoardWindowController.previousNet(_:)), key(.leftArrow), [.shift])
+        let stepBy = NSMenu(title: "Step By")
+        for kind in StepKind.allCases {
+            let item = stepBy.addItem(withTitle: kind.name.prefix(1).uppercased() + kind.name.dropFirst(),
+                                      action: #selector(BoardWindowController.setStepKind(_:)), keyEquivalent: "")
+            item.tag = Int(kind.rawValue)
+        }
+        let stepByItem = menu.addItem(withTitle: "Step By", action: nil, keyEquivalent: "")
+        stepByItem.submenu = stepBy
+        menu.addItem(.separator())
+        add("Go to Start", #selector(BoardWindowController.goToStart(_:)), key(.home))
+        add("Go to End", #selector(BoardWindowController.goToEnd(_:)), key(.end))
+        menu.addItem(.separator())
+        add("Faster", #selector(BoardWindowController.faster(_:)), "]", [.command])
+        add("Slower", #selector(BoardWindowController.slower(_:)), "[", [.command])
+        return menu
     }
 
     private func addSubmenu(_ submenu: NSMenu, to menu: NSMenu) {

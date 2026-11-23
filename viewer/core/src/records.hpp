@@ -106,9 +106,10 @@ struct Disc {
 struct Via {
     std::uint32_t chunk = kNone32;
     std::uint32_t copper_id_field = kNone32; // as stored
-    std::uint32_t copper = kNone32;          // assigned by the rule of 4.1
+    std::uint32_t copper = kNone32;          // index into Trace::copper() if added, else kNone32
     std::int32_t net = 0, i = 0, j = 0, power = 0;
     bool added = false;
+    bool off_grid = false; // (i, j) outside the grid: valid, but not drawn (17 open point 5)
     std::uint32_t ctx = 0, route_id = kNone32;
 };
 
@@ -190,9 +191,13 @@ struct Search {
     std::int32_t gi = 0, gj = 0, rips_at_call = 0;
     std::int64_t max_cost = -1, cost = -1, expanded = -1;
     double duration_s = 0;
-    std::uint32_t nsrc = 0, ntgt = 0, npath = 0, ntrace = 0, ntrace_total = 0;
+    std::uint32_t nsrc = 0, ntgt = 0, npath = 0, ntrace = 0, ntrace_total = 0; // as stored
     std::uint32_t repeat_of = kNone32, enc = 0;
-    std::vector<std::uint32_t> cells;   // src, then tgt, then path
+    // Source and target cells kept in `cells`.  Equal to nsrc and ntgt,
+    // except in a search with `error` set whose sources or targets hold
+    // cells outside the grid: those are dropped (17 open point 4).
+    std::uint32_t nsrc_kept = 0, ntgt_kept = 0;
+    std::vector<std::uint32_t> cells;   // kept src, then kept tgt, then path
     std::uint64_t trace_cell_offset = 0; // file offsets of this chunk's own arrays (0 = none)
     std::uint64_t trace_d_offset = 0;
     // The search whose stored arrays are this search's wavefront: itself,
@@ -201,8 +206,8 @@ struct Search {
 
     bool has(std::uint32_t flag) const { return (flags & flag) != 0; }
     const std::uint32_t *src() const { return cells.data(); }
-    const std::uint32_t *tgt() const { return cells.data() + nsrc; }
-    const std::uint32_t *path() const { return cells.data() + nsrc + ntgt; }
+    const std::uint32_t *tgt() const { return cells.data() + nsrc_kept; }
+    const std::uint32_t *path() const { return cells.data() + nsrc_kept + ntgt_kept; }
 };
 
 // A search's wavefront, loaded on demand and shared through the cache.
@@ -230,12 +235,13 @@ struct Stub {
 
 struct GridPoint {
     std::int32_t i = 0, j = 0;
+    bool off_grid = false; // outside the grid: valid, but not drawn (17 open point 5)
 };
 
 struct Commit {
     std::uint32_t chunk = kNone32;
     std::uint32_t copper_id_field = kNone32; // as stored
-    std::uint32_t copper = kNone32;          // assigned by the rule of 4.1
+    std::uint32_t copper = kNone32;          // index into Trace::copper()
     std::int32_t net = 0;
     std::uint32_t flags = 0;
     std::int32_t power = 0;
@@ -260,6 +266,7 @@ struct Rip {
     std::int32_t net = 0;
     std::uint32_t ctx = 0, route_id = kNone32;
     std::vector<std::uint32_t> removed; // copper ids as stored
+    std::vector<std::uint32_t> applied; // indices into Trace::copper() this RIP removed
 };
 
 struct Drop {
@@ -404,9 +411,13 @@ struct End {
 
 // --- derived -----------------------------------------------------------------------
 
-// One copper item: a CMIT, or a VIA with added = 1.  The index into
-// Trace::copper() is the copper_id assigned by the rule of 4.1.
+// One copper item: a CMIT, or a VIA with added = 1, in file order.  `id` is
+// its copper_id: the one the rule of 4.1 assigns, except after an id
+// mismatch, where the reader reports one error and continues from the
+// stored id (17 open point 3).  In a file without mismatches the index into
+// Trace::copper() equals the id.
 struct Copper {
+    std::uint32_t id = kNone32;
     std::uint32_t chunk = kNone32;      // creating chunk
     std::uint32_t session = kNone32;
     Kind kind = Kind::Unknown;          // Cmit or Via

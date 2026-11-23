@@ -269,6 +269,298 @@ public final class Session {
         try check(rv_view_status(handle, viewX, viewY, &text))
         return text.map { String(cString: $0) } ?? ""
     }
+
+    // MARK: - Chunks
+
+    /// The four-character tag of chunk `index` ("ROUT", ...).
+    public func chunkTag(_ index: UInt32) throws(CoreError) -> String {
+        var c = rv_chunk_info()
+        try check(rv_chunk(handle, index, &c))
+        return withUnsafeBytes(of: c.tag) { raw in
+            String(decoding: raw.prefix(4), as: UTF8.self)
+        }
+    }
+
+    /// One line describing chunk `index`.
+    public func chunkText(_ index: UInt32) throws(CoreError) -> String {
+        var text: UnsafePointer<CChar>?
+        try check(rv_chunk_text(handle, index, &text))
+        return text.map { String(cString: $0) } ?? ""
+    }
+
+    // MARK: - Timeline (M3)
+
+    /// The timeline's generation (changes on open and refresh), without copying it.
+    public func timelineGeneration() throws(CoreError) -> UInt32 {
+        var t = rv_timeline()
+        try check(rv_get_timeline(handle, &t))
+        return t.generation
+    }
+
+    /// A copy of the timeline: events, ticks and phases.
+    public func timeline() throws(CoreError) -> Timeline {
+        var t = rv_timeline()
+        try check(rv_get_timeline(handle, &t))
+        var events: [TimelineEvent] = []
+        events.reserveCapacity(Int(t.event_count))
+        if let p = t.events {
+            for e in UnsafeBufferPointer(start: p, count: Int(t.event_count)) {
+                events.append(TimelineEvent(start: e.start, duration: e.duration, size: e.size,
+                                            kind: TimelineEvent.Kind(rawValue: e.kind) ?? .end, flags: e.flags,
+                                            chunk: e.chunk, lastChunk: e.last_chunk,
+                                            phase: e.phase == RV_NONE ? nil : e.phase,
+                                            board: e.board == RV_NONE ? nil : e.board))
+            }
+        }
+        func copy(_ p: UnsafePointer<Double>?, _ n: UInt32) -> [Double] {
+            guard let p, n > 0 else { return [] }
+            return Array(UnsafeBufferPointer(start: p, count: Int(n)))
+        }
+        let rips = copy(t.rip_ticks, t.rip_tick_count)
+        let failures = copy(t.failure_ticks, t.failure_tick_count)
+        let total = t.total, routerSeconds = t.router_seconds, generation = t.generation
+        var phases: [TimelinePhase] = []
+        for index in 0..<t.phase_count {
+            var p = rv_phase_info()
+            try check(rv_phase(handle, index, &p))
+            phases.append(TimelinePhase(start: p.start, end: p.end, label: p.label.map { String(cString: $0) } ?? "",
+                                        event: p.event))
+        }
+        return Timeline(events: events, ripTicks: rips, failureTicks: failures, phases: phases, total: total,
+                        routerSeconds: routerSeconds, generation: generation)
+    }
+
+    /// The playback position and what is shown there.
+    public func position() throws(CoreError) -> PlaybackPosition {
+        var p = rv_position()
+        try check(rv_position_get(handle, &p))
+        return PlaybackPosition(time: p.time, total: p.total, fraction: p.fraction, speed: p.speed,
+                                routerTime: p.router_time, event: p.event == RV_NONE ? nil : p.event,
+                                eventCount: p.event_count, playing: p.playing != 0, direction: p.direction,
+                                atEnd: p.at_end != 0, cellsRevealed: p.cells_revealed, copperAlive: p.copper_alive,
+                                ghosts: p.ghosts, failures: p.failures, routedHidden: p.routed_hidden != 0)
+    }
+
+    // MARK: - Playback (M3)
+
+    /// Move the clock by `seconds` of wall time (nothing while paused).
+    @discardableResult
+    public func advance(by seconds: Double) throws(CoreError) -> PlaybackChange {
+        var changed: UInt32 = 0
+        try check(rv_advance(handle, seconds, &changed))
+        return PlaybackChange(rawValue: changed)
+    }
+
+    @discardableResult
+    public func setPlaying(_ playing: Bool) throws(CoreError) -> PlaybackChange {
+        var changed: UInt32 = 0
+        try check(rv_play(handle, playing ? 1 : 0, &changed))
+        return PlaybackChange(rawValue: changed)
+    }
+
+    /// +1 forward, -1 backward.
+    public func setDirection(_ direction: Int32) throws(CoreError) {
+        try check(rv_set_direction(handle, direction))
+    }
+
+    /// Snaps to the nearest of the core's speeds.
+    public func setSpeed(_ speed: Double) throws(CoreError) {
+        try check(rv_set_speed(handle, speed))
+    }
+
+    /// Move along the core's list of speeds (clamped).
+    public func stepSpeed(by steps: Int32) throws(CoreError) {
+        try check(rv_speed_step(handle, steps))
+    }
+
+    @discardableResult
+    public func seek(time: Double) throws(CoreError) -> PlaybackChange {
+        var changed: UInt32 = 0
+        try check(rv_seek_time(handle, time, &changed))
+        return PlaybackChange(rawValue: changed)
+    }
+
+    @discardableResult
+    public func seek(fraction: Double) throws(CoreError) -> PlaybackChange {
+        var changed: UInt32 = 0
+        try check(rv_seek_fraction(handle, fraction, &changed))
+        return PlaybackChange(rawValue: changed)
+    }
+
+    /// To the start of event `index`.
+    @discardableResult
+    public func seek(event index: UInt32) throws(CoreError) -> PlaybackChange {
+        var changed: UInt32 = 0
+        try check(rv_seek_event(handle, index, &changed))
+        return PlaybackChange(rawValue: changed)
+    }
+
+    /// To the start (false) or the end (true).
+    @discardableResult
+    public func jump(toEnd: Bool) throws(CoreError) -> PlaybackChange {
+        var changed: UInt32 = 0
+        try check(rv_jump(handle, toEnd ? 1 : 0, &changed))
+        return PlaybackChange(rawValue: changed)
+    }
+
+    /// To the next (direction > 0) or previous event of a kind; pauses.
+    /// Empty when there is none in that direction.
+    @discardableResult
+    public func step(_ kind: StepKind, direction: Int32) throws(CoreError) -> PlaybackChange {
+        var changed: UInt32 = 0
+        try check(rv_step(handle, kind.rawValue, direction, &changed))
+        return PlaybackChange(rawValue: changed)
+    }
+
+    /// The caption, position readout or speed readout for the position.
+    public func text(_ which: PlaybackText) throws(CoreError) -> String {
+        var text: UnsafePointer<CChar>?
+        try check(rv_text(handle, which.rawValue, &text))
+        return text.map { String(cString: $0) } ?? ""
+    }
+
+    // MARK: - Overlay (M3)
+
+    /// The overlay list's generation, without copying it.
+    public func overlayGeneration() throws(CoreError) -> UInt32 {
+        var d = rv_display_list()
+        var slots: UnsafePointer<rv_slot>?
+        var count: UInt32 = 0
+        try check(rv_get_overlay(handle, &d, &slots, &count))
+        return d.generation
+    }
+
+    /// A copy of the overlay list and its slots, or nil when its generation is `since`.
+    public func overlay(ifChangedSince since: UInt32? = nil) throws(CoreError) -> Overlay? {
+        var d = rv_display_list()
+        var slots: UnsafePointer<rv_slot>?
+        var count: UInt32 = 0
+        try check(rv_get_overlay(handle, &d, &slots, &count))
+        if let since, since == d.generation { return nil }
+        var result: [OverlaySlot] = []
+        if let slots {
+            for s in UnsafeBufferPointer(start: slots, count: Int(count)) {
+                result.append(OverlaySlot(kind: OverlaySlot.Kind(rawValue: s.kind) ?? .markers,
+                                          orderBegin: s.order_begin, orderEnd: s.order_end,
+                                          layer: s.layer == RV_NONE ? nil : s.layer,
+                                          firstBatch: Int(s.first_batch), batchCount: Int(s.batch_count),
+                                          generation: s.generation,
+                                          bbox: (s.bbox.0, s.bbox.1, s.bbox.2, s.bbox.3)))
+            }
+        }
+        return Overlay(list: DisplayList(copying: d), slots: result)
+    }
+}
+
+// MARK: - Timeline and playback types (M3)
+
+public struct TimelineEvent: Sendable {
+    public enum Kind: UInt32, Sendable {
+        case session = 0, snapshot, search, commit, via, ripUp, routeBegin, routeEnd, drop, phase, board, end
+
+        /// The core's name of the kind ("search", ...).
+        public var name: String { String(cString: rv_event_kind_name(rawValue)) }
+    }
+    public static let found: UInt32 = 1 << 0
+    public static let failed: UInt32 = 1 << 1
+    public static let error: UInt32 = 1 << 2
+
+    public let start: Double
+    public let duration: Double
+    /// Searches: relative size 0...1 (log scale); else 0.
+    public let size: Float
+    public let kind: Kind
+    /// RV_EVF_* bits (`found`, `failed`, `error` above).
+    public let flags: UInt32
+    public let chunk: UInt32
+    public let lastChunk: UInt32
+    public let phase: UInt32?
+    public let board: UInt32?
+
+    public var isFound: Bool { flags & TimelineEvent.found != 0 }
+    public var isFailed: Bool { flags & (TimelineEvent.failed | TimelineEvent.error) != 0 }
+}
+
+public struct TimelinePhase: Sendable {
+    public let start: Double
+    public let end: Double
+    public let label: String
+    public let event: UInt32
+}
+
+public struct Timeline: Sendable {
+    public let events: [TimelineEvent]
+    public let ripTicks: [Double]
+    public let failureTicks: [Double]
+    public let phases: [TimelinePhase]
+    /// Playback seconds of the whole run at 1x.
+    public let total: Double
+    public let routerSeconds: Double
+    public let generation: UInt32
+}
+
+public struct PlaybackPosition: Sendable {
+    public let time: Double
+    public let total: Double
+    public let fraction: Double
+    public let speed: Double
+    public let routerTime: Double
+    public let event: UInt32?
+    public let eventCount: UInt32
+    public let playing: Bool
+    public let direction: Int32
+    public let atEnd: Bool
+    public let cellsRevealed: UInt32
+    public let copperAlive: UInt32
+    public let ghosts: UInt32
+    public let failures: UInt32
+    public let routedHidden: Bool
+}
+
+/// What a playback call changed (RV_CHANGED_*).
+public struct PlaybackChange: OptionSet, Sendable {
+    public let rawValue: UInt32
+    public init(rawValue: UInt32) { self.rawValue = rawValue }
+    /// The playhead and the texts.
+    public static let position = PlaybackChange(rawValue: 1)
+    /// The overlay list.
+    public static let overlay = PlaybackChange(rawValue: 2)
+    /// The static display list (board or outline).
+    public static let board = PlaybackChange(rawValue: 4)
+}
+
+public enum StepKind: UInt32, CaseIterable, Sendable {
+    case event = 0, search, commit, net, ripUp, failure, phase
+
+    /// The core's name of the kind ("event", "search", ...).
+    public var name: String { String(cString: rv_step_kind_name(rawValue)) }
+}
+
+public enum PlaybackText: UInt32, Sendable {
+    case caption = 0, position = 1, speed = 2
+}
+
+/// One overlay slot (`rv_slot`): a range of the order axis holding overlay batches.
+public struct OverlaySlot: Sendable {
+    public enum Kind: UInt32, Sendable {
+        case routed = 0, drills = 1, markers = 2
+    }
+    public let kind: Kind
+    public let orderBegin: UInt32
+    public let orderEnd: UInt32
+    /// Board layer index of a routed slot.
+    public let layer: UInt32?
+    public let firstBatch: Int
+    public let batchCount: Int
+    public let generation: UInt32
+    /// min x, min y, max x, max y, mm; zeros when empty.
+    public let bbox: (Float, Float, Float, Float)
+}
+
+/// A copy of the overlay list and its slots.
+public struct Overlay: Sendable {
+    public let list: DisplayList
+    public let slots: [OverlaySlot]
 }
 
 // MARK: - Value types
@@ -329,6 +621,9 @@ public struct DisplayBatch: Sendable {
     public let count: Int
     /// min x, min y, max x, max y, mm.
     public let bbox: (Float, Float, Float, Float)
+
+    /// The object class of router copper and ghosts (RV_OBJ_ROUTED).
+    public static let routedClass: UInt32 = RV_OBJ_ROUTED.rawValue
 }
 
 /// A copy of the core's display list (see `rv_display_list` in rv.h).

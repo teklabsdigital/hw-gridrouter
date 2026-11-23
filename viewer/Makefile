@@ -6,11 +6,13 @@
 #   make test      build and run the core tests, the C99 header smoke test and the golden images
 #   make asan      the core tests and smoke test under AddressSanitizer + UndefinedBehaviorSanitizer
 #   make dump      build/rvdump (trace inspector) and build/rvsynth (synthetic test trace writer)
-#   make render    build rvrender; draw the stress board and the recorder sample into build/render/
+#   make render    build rvrender; draw the stress board, frames of the synthetic routing run and
+#                  the recorder sample into build/render/
 #   make golden    render the golden cases and compare them with mac/Tests/golden/*.png
 #   make golden-update  replace mac/Tests/golden/*.png with fresh renders (review them first)
 #   make app       swift build -c release, then wrap it into build/Visual Gridrouter.app
-#   make selftest  build the app and run its binary with --selftest, without and with a trace
+#   make selftest  build the app and run its binary with --selftest, without and with traces;
+#                  then rvrender --selftest (playback, seeking, layers against one pass)
 #   make run       open the app bundle
 #   make clean     remove build/ and .build/
 
@@ -83,9 +85,10 @@ $(BUILD)/rvdump: tools/rvdump.cpp $(CORE_SRC) $(CORE_HDR)
 	@mkdir -p $(BUILD)
 	$(CXX) $(CXXFLAGS_RV) -o $@ tools/rvdump.cpp $(CORE_SRC)
 
-$(BUILD)/rvsynth: tools/rvsynth.cpp core/tests/synth.cpp core/tests/synth_board.cpp core/tests/synth.hpp
+SYNTH_SRC := core/tests/synth.cpp core/tests/synth_board.cpp core/tests/synth_timeline.cpp
+$(BUILD)/rvsynth: tools/rvsynth.cpp $(SYNTH_SRC) core/tests/synth.hpp
 	@mkdir -p $(BUILD)
-	$(CXX) $(CXXFLAGS_RV) -I core/tests -o $@ tools/rvsynth.cpp core/tests/synth.cpp core/tests/synth_board.cpp
+	$(CXX) $(CXXFLAGS_RV) -I core/tests -o $@ tools/rvsynth.cpp $(SYNTH_SRC)
 
 dump: $(BUILD)/rvdump $(BUILD)/rvsynth
 
@@ -100,6 +103,8 @@ render: rvrender $(BUILD)/rvsynth
 	./$(BUILD)/rvsynth --stress $(BUILD)/render/stress.grtrace
 	$(RVRENDER) $(BUILD)/render/stress.grtrace $(BUILD)/render/stress.png --size 1600x1150
 	$(RVRENDER) $(BUILD)/render/stress.grtrace $(BUILD)/render/stress_closeup.png --size 1600x1000 --window 104,54,124,66.5
+	./$(BUILD)/rvsynth --timeline $(BUILD)/render/timeline.grtrace
+	$(RVRENDER) $(BUILD)/render/timeline.grtrace $(BUILD)/render/timeline --frames 12 --size 800x600
 	@if [ -f $(SAMPLE) ]; then \
 		$(RVRENDER) $(SAMPLE) $(BUILD)/render/small_final.png --size 1200x800 && \
 		$(RVRENDER) $(SAMPLE) $(BUILD)/render/small_placed.png --size 1200x800 --board 0; \
@@ -118,14 +123,21 @@ app:
 	$(SWIFT_BUILD)
 	sh mac/bundle.sh
 
-# Three runs: the welcome window; the recorder's sample (if present); the
-# synthetic stress board.  Each opens one window and exits by itself.
-selftest: app $(BUILD)/rvsynth
+# App runs: the welcome window; the recorder's sample (if present); the
+# synthetic stress board; the synthetic routing run.  Each opens one window
+# and exits by itself.  Then rvrender's playback self-test (no window) on
+# the routing run and the sample.
+selftest: app rvrender $(BUILD)/rvsynth
 	"./$(APP)/Contents/MacOS/$(EXE)" --selftest
 	@if [ -f $(SAMPLE) ]; then "./$(APP)/Contents/MacOS/$(EXE)" --selftest $(SAMPLE); \
 	else echo "selftest: $(SAMPLE) not present, skipped"; fi
 	./$(BUILD)/rvsynth --stress $(BUILD)/selftest-stress.grtrace
 	"./$(APP)/Contents/MacOS/$(EXE)" --selftest $(BUILD)/selftest-stress.grtrace
+	./$(BUILD)/rvsynth --timeline $(BUILD)/selftest-timeline.grtrace
+	"./$(APP)/Contents/MacOS/$(EXE)" --selftest $(BUILD)/selftest-timeline.grtrace
+	$(RVRENDER) --selftest $(BUILD)/selftest-timeline.grtrace
+	@if [ -f $(SAMPLE) ]; then $(RVRENDER) --selftest $(SAMPLE); \
+	else echo "selftest: $(SAMPLE) not present, skipped"; fi
 
 run:
 	open "$(APP)"

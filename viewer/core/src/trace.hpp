@@ -33,6 +33,59 @@
 
 namespace rv {
 
+// One id sequence of 4.1 (search_id, route_id or copper_id).  Each chunk of
+// the kind takes the next index (its position in the table); its id is the
+// expected one, or, after a mismatch, the stored one: the reader reports the
+// mismatch once and continues from the stored id (17 open point 3).  Ids
+// resolve to indices through index_of().
+class IdSeq {
+public:
+    // A chunk whose stored id could not be read takes the expected id.
+    std::uint32_t add_unknown() { return assign(next_); }
+    // A chunk that stores `stored`.  Returns its id; mismatch tells whether
+    // stored differed from the expected id (then returned in expected).
+    std::uint32_t add(std::uint32_t stored, bool &mismatch, std::uint32_t &expected) {
+        expected = next_;
+        mismatch = stored != next_ || stored == kNone32;
+        return assign(stored == kNone32 ? next_ : stored);
+    }
+    // The index of the chunk with this id (the latest one, if several
+    // claimed it), or kNone32.
+    std::uint32_t index_of(std::uint32_t id) const {
+        if (!remapped_) return id < count_ ? id : kNone32;
+        auto it = map_.find(id);
+        return it == map_.end() ? kNone32 : it->second;
+    }
+    std::uint32_t id_of(std::uint32_t index) const {
+        if (!remapped_) return index;
+        return index < ids_.size() ? ids_[index] : kNone32;
+    }
+    std::uint32_t expected() const { return next_; }
+
+private:
+    std::uint32_t assign(std::uint32_t id) {
+        if (!remapped_ && id != count_) {
+            remapped_ = true;
+            ids_.reserve(static_cast<std::size_t>(count_) + 1);
+            for (std::uint32_t k = 0; k < count_; ++k) {
+                map_[k] = k;
+                ids_.push_back(k);
+            }
+        }
+        if (remapped_) {
+            map_[id] = count_;
+            ids_.push_back(id);
+        }
+        ++count_;
+        next_ = id + 1 == kNone32 ? 0 : id + 1;
+        return id;
+    }
+    std::uint32_t next_ = 0, count_ = 0;
+    bool remapped_ = false;
+    std::map<std::uint32_t, std::uint32_t> map_; // id -> index, once remapped
+    std::vector<std::uint32_t> ids_;             // index -> id, once remapped
+};
+
 class Trace {
 public:
     // Reads what the source holds now.  Throws FormatError (not a trace
@@ -100,6 +153,11 @@ public:
 
     // --- derived tables -----------------------------------------------------
     const std::vector<Copper> &copper() const { return copper_; }
+    // Index into copper() / searches() / routes() of an id as files store
+    // it (RIP lists, repeat_of, route_id), kNone32 if no chunk has it.
+    std::uint32_t copper_index(std::uint32_t id) const { return copper_ids_.index_of(id); }
+    std::uint32_t search_index(std::uint32_t id) const { return search_ids_.index_of(id); }
+    std::uint32_t route_index(std::uint32_t id) const { return route_ids_.index_of(id); }
     // Router net number to name, the latest NETS entry for each code.
     const std::map<std::int32_t, std::string> &net_names() const { return net_names_; }
     // Router net number to the chunks about that net, in file order: PAD,
@@ -228,11 +286,16 @@ private:
     std::int64_t expanded_total_ = 0, trace_entries_ = 0;
     std::uint32_t failed_pads_ = 0, drops_failed_ = 0, drops_raised_ = 0, copper_removed_ = 0;
 
+    // id sequences (4.1)
+    IdSeq search_ids_, route_ids_, copper_ids_;
+
     // state of the latest session while scanning
     std::uint32_t session_ = kNone32;
     bool snapped_ = false;
-    std::map<std::int32_t, std::vector<std::uint32_t>> since_snap_; // net -> copper ids
-    std::uint32_t open_route_ = kNone32;
+    // net -> indices into copper_ created since the session's last SNAP
+    // (since its RUN without one); 7.14
+    std::map<std::int32_t, std::vector<std::uint32_t>> since_snap_;
+    std::uint32_t open_route_ = kNone32; // index into routes_
     bool expect_snapshot_grids_ = false;
 
     // on-demand caches

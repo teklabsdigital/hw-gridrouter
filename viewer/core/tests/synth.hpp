@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -354,6 +355,78 @@ void text_polygons(const std::string &text, double x_nm, double y_nm, double hei
 
 // Writes bytes to a file; returns false on failure.
 bool write_file(const std::string &path, const std::vector<unsigned char> &bytes);
+
+// --- controlled timelines (M3) ----------------------------------------------------
+//
+// A writer that keeps the id sequences and the RIP rule of 7.14 itself, so a
+// test can describe a routing run call by call.  It also remembers which
+// copper is alive (its own replay, independent of the reader), so it can
+// write a "final" board whose tracks and vias are exactly that copper.
+
+struct Cell {
+    std::uint32_t layer = 0;
+    std::int32_t i = 0, j = 0;
+};
+
+class TimelineWriter {
+public:
+    Writer w;
+    WRun run;
+    std::uint32_t next_copper = 0, next_search = 0, next_route = 0;
+    // Per net, the copper ids since the session's last SNAP (or RUN) that no
+    // RIP listed yet: what a RIP of that net lists.
+    std::map<std::int32_t, std::vector<std::uint32_t>> since_snap;
+    // Alive copper of the current session: id -> what it draws.
+    struct Item {
+        std::int32_t net = 0;
+        std::vector<Cell> path;
+        std::vector<std::pair<std::int32_t, std::int32_t>> vias;
+        std::vector<WStub> stubs;
+        double width = 0;
+    };
+    std::map<std::uint32_t, Item> alive;
+    std::vector<WPad> pads; // of the current session
+    std::int64_t expanded_total = 0;
+
+    void nets(const std::vector<std::pair<std::int32_t, std::string>> &entries);
+    // RUN: an nx x ny grid, 8 directions, cell 0.25 mm at (100.5, 50.25).
+    void start(std::int32_t nx, std::int32_t ny);
+    std::uint32_t cell(const Cell &c) const;
+    std::uint32_t commit(std::int32_t net, const std::vector<Cell> &path, double width = 0.2,
+                         const std::vector<std::pair<std::int32_t, std::int32_t>> &vias = {},
+                         const std::vector<WStub> &stubs = {}, std::uint32_t ctx = 0, std::uint32_t route = NONE32);
+    std::uint32_t via(std::int32_t net, std::int32_t i, std::int32_t j); // added = 1
+    // RIP of a net: lists since_snap[net] (plus extra ids, then sorted).
+    void rip(std::int32_t net, std::uint32_t ctx = 0, std::uint32_t route = NONE32,
+             const std::vector<std::uint32_t> &extra = {});
+    void snap(); // SNAP and its GRDS
+    std::uint32_t rnb(std::int32_t net, const std::string &name, const std::vector<WRnbPad> &pads);
+    void rne(std::uint32_t route, std::int32_t net, const std::vector<std::string> &failed);
+    std::uint32_t srch(std::int32_t net, const std::vector<Cell> &src, const std::vector<Cell> &tgt,
+                       const std::vector<Cell> &path, std::int64_t expanded, std::uint32_t ctx = 0,
+                       std::uint32_t route = NONE32);
+    void rbld(std::uint32_t route, const std::vector<std::string> &names, const std::vector<std::int32_t> &nets);
+    void drop(std::int32_t net, std::uint32_t ok, const std::string &name, const std::string &label);
+    void mark(std::uint32_t level, const std::string &text);
+    void pad(std::int32_t net, double cx, double cy, double half);
+    void brd(const WBrd &b);
+    // ROUT of the alive copper: every same-layer step of every path as a
+    // segment, the stubs, and the vias.
+    void rout();
+    void end(const std::vector<std::pair<std::string, std::string>> &failed);
+
+    // A board for this run: F.Cu, B.Cu, Edge.Cuts (the grid extent as the
+    // outline); with routed = true, the alive copper as tracks and vias.
+    WBrd board(const std::string &label, bool routed) const;
+};
+
+// The M3 sample: a "placed" board, then two router sessions with phases,
+// route_net calls, commits, standalone vias, a SNAP, direct and rebuild
+// rip-ups (one listing another net's copper), failed pads from RNE and
+// DROP, a ROUT, and a "final" board holding the first session's routing...
+// written after the second session ends, so its routing is that of the
+// second session (see the function for the exact sequence).
+std::vector<unsigned char> build_timeline_sample();
 
 } // namespace synth
 

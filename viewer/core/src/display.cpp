@@ -18,7 +18,7 @@ namespace rv {
 const char *class_name(std::uint32_t cls) noexcept {
     static const char *const names[kClassCount] = {
         "Zones", "Tracks", "Pads", "Vias", "Holes", "Text", "Footprint graphics", "Board graphics",
-        "Rule areas", "Board outline",
+        "Rule areas", "Board outline", "Routed copper",
     };
     return cls < kClassCount ? names[cls] : "";
 }

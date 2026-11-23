@@ -1,5 +1,5 @@
 #!/bin/sh
-# golden.sh: golden-image tests for the board renderer.
+# golden.sh: golden-image tests for the board and overlay renderer.
 #
 #   sh mac/Tests/golden.sh check    render every case and compare it with mac/Tests/golden/NAME.png
 #   sh mac/Tests/golden.sh update   render every case and replace the golden PNGs
@@ -36,6 +36,8 @@ mkdir -p "$out" "$golden"
 failures=0
 cases=0
 
+"$rvsynth" --timeline "$out/timeline.grtrace" >/dev/null
+
 # golden NAME INPUT [rvrender options...]
 golden() {
     name=$1
@@ -71,6 +73,19 @@ golden stress_fcu stress --size 640x464 --layers F.Cu,Edge.Cuts --hide-classes 0
 # The synthetic sample board around (101, 51) mm: track, plated pad hole,
 # via (copper, hole wall, drill) and a 45-degree NPTH slot.
 golden sample sample --size 400x400 --window 99.6,49.6,102.8,52.8
+# The M3 routing run (rvsynth --timeline) at three events (0-based indices,
+# listed in core/tests/test_timeline.cpp, timeline_events_of_the_sample_run):
+# 16, the rebuild's rip-up: the ghost of /SIG at full strength, VCC's
+# copper and via, the route's pads in white rings, over the first board.
+golden timeline_ripup timeline --size 480x360 --event 16
+# 30, the failed drop_to_plane: two failed-pad markers (red ring and
+# cross; one from the route_net before, one from the drop), the copper of
+# three nets over the first board.
+golden timeline_failures timeline --size 480x360 --event 30
+# 40, a commit of the second router session over the "final" board: its
+# tracks drawn by the board, the new session's copper by the overlay, the
+# commit just made lightened.
+golden timeline_second timeline --size 480x360 --event 40
 
 if [ "$failures" -ne 0 ]; then
     echo "golden.sh: $failures of $cases cases FAILED"

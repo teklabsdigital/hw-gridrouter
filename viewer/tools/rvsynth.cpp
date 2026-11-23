@@ -5,6 +5,7 @@
 //   rvsynth --no-end OUT        the sample without its END chunk
 //   rvsynth --truncate N OUT    the first N bytes of the complete sample
 //   rvsynth --stress OUT        the M2 stress board ("placed" and "final" BRD)
+//   rvsynth --timeline OUT      the M3 routing run (synth_timeline.cpp)
 
 #include "synth.hpp"
 
@@ -25,6 +26,15 @@ int main(int argc, char **argv) {
         std::printf("rvsynth: wrote the stress board, %zu bytes, to %s\n", bytes.size(), argv[2]);
         return 0;
     }
+    if (argc == 3 && std::strcmp(argv[1], "--timeline") == 0) {
+        const std::vector<unsigned char> bytes = synth::build_timeline_sample();
+        if (!synth::write_file(argv[2], bytes)) {
+            std::fprintf(stderr, "rvsynth: cannot write %s\n", argv[2]);
+            return 1;
+        }
+        std::printf("rvsynth: wrote the routing run, %zu bytes, to %s\n", bytes.size(), argv[2]);
+        return 0;
+    }
     if (argc == 2) {
         out = argv[1];
     } else if (argc == 3 && std::strcmp(argv[1], "--no-end") == 0) {
@@ -37,7 +47,7 @@ int main(int argc, char **argv) {
         out = argv[3];
     }
     if (out == nullptr || truncate == -2) {
-        std::fprintf(stderr, "usage: rvsynth [--no-end | --truncate N | --stress] OUT\n");
+        std::fprintf(stderr, "usage: rvsynth [--no-end | --truncate N | --stress | --timeline] OUT\n");
         return 2;
     }
     synth::Sample s = synth::build_sample(with_end);

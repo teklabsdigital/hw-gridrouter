@@ -5,12 +5,15 @@ file (`.grtrace`): the board as KiCad draws it, the A* wavefront of each
 search, paths committing, rip-ups, retries and failures. It only watches; it
 never steers the router.
 
-Status: **milestone M2**, the static board. The core reads `.grtrace` files
-(M1) and turns a trace's `BRD` board into a display list in KiCad's default
-colours and draw order; it also owns the camera. The app opens trace files
-as read-only documents and draws the board with pan, zoom and an Appearance
-panel. `rvrender` draws the same board to a PNG without a window. Router
-copper, the wavefront and playback come in later milestones.
+Status: **milestone M3**, playback. The core reads `.grtrace` files (M1),
+turns a trace's `BRD` board into a display list in KiCad's default colours
+and draw order and owns the camera (M2), and now also cuts the run into
+events on a timeline, keeps the playback clock, and builds an overlay of the
+router's copper, rip-up ghosts, failed pads and the current event's
+highlights at any position (M3). The app opens trace files as read-only
+documents and plays them: board, caption, timeline strip, transport bar,
+Playback menu, Appearance panel. `rvrender` draws any position to a PNG
+without a window. The wavefront (M4) and net highlighting (M5) come later.
 
 ## Layout
 
@@ -20,15 +23,19 @@ viewer/
     include/rv.h        the C99 interface every client uses
     src/                implementation (api.cpp is the C boundary, trace.cpp the
                         reader, file.cpp the only platform-specific file I/O;
-                        theme, display, scene and camera are the M2 board)
+                        theme, display, scene and camera are the M2 board;
+                        timeline, routed, overlay, playback and session are M3)
     tests/              self-contained tests (no framework), a C99 smoke test,
                         synth.cpp, a test-only trace writer built from the spec,
-                        and synth_board.cpp, the synthetic stress board
+                        synth_board.cpp, the synthetic stress board, and
+                        synth_timeline.cpp, the synthetic routing run
   tools/                rvdump (trace inspector) and rvsynth (writes the synthetic traces)
   mac/                  macOS client: Swift 6 + AppKit, programmatic UI
-    Sources/RVKit/      Swift wrapper over rv.h and the Core Graphics display-list renderer
-    Sources/RouteViewer the app (TraceDocument, BoardView, AppearancePanel)
-    Sources/rvrender/   headless renderer: board to PNG, PNG comparison, timing
+    Sources/RVKit/      Swift wrapper over rv.h, the Core Graphics display-list
+                        renderer and LayeredRenderer (cached planes for playback)
+    Sources/RouteViewer the app (TraceDocument, BoardView, TimelineView, AppearancePanel)
+    Sources/rvrender/   headless renderer: any position to PNG, frames, PNG comparison,
+                        timing, playback self-test
     Tests/golden.sh     golden-image tests; Tests/golden/*.png are the expected images
     Info.plist          bundle metadata, .grtrace document type and NSDocumentClass
     bundle.sh           wraps the binary into a signed .app
@@ -49,11 +56,12 @@ From this folder, or from the repository root with `make -C viewer <target>`:
 make test       # core tests + C99 header smoke test (clang++ -std=c++17 -Werror), then make golden
 make asan       # core tests and smoke test under AddressSanitizer and UndefinedBehaviorSanitizer
 make dump       # build/rvdump and build/rvsynth
-make render     # rvrender; the stress board and the recorder sample as PNGs in build/render/
+make render     # rvrender; the stress board, 12 frames of the synthetic run, the recorder sample, in build/render/
 make golden     # render the golden cases, compare with mac/Tests/golden/*.png
 make golden-update  # replace the golden PNGs (look at them before committing)
 make app        # swift build -c release, then build/Visual Gridrouter.app (ad-hoc signed)
-make selftest   # builds the app, starts it three times (no file, the sample, the stress board), exits
+make selftest   # the app four times (no file, the sample, the stress board, the synthetic run),
+                # then rvrender --selftest on the synthetic run and the sample
 make run        # opens the app
 make clean      # removes build/ and .build/
 sh check_additive.sh   # read-only: fails if anything outside viewer/ changed beyond the allow-list
@@ -63,10 +71,22 @@ sh check_additive.sh   # read-only: fails if anything outside viewer/ changed be
 on its own (0 on success, 1 on a failed check, 2 if it does not finish in
 10 s). With a file (`RouteViewer --selftest FILE`) it opens the trace as a
 document without adding it to Open Recent, checks the window title, the
-Appearance panel and the display list, renders the board offscreen, checks
-that something besides the background was drawn, and checks that the view's
-own drawing matches that render pixel for pixel (so the image is the right
-way up).
+Appearance panel (11 object classes) and the display list, redraws every
+plane, checks that something besides the background was drawn, and checks
+that the layer tree handed to Core Animation (each plane's image at its
+frame, stacked) matches a single-pass render of every batch (so the planes
+add up and the image is the right way up). With routing events it then
+plays the run from the start through the window's own clock path (large
+frames instead of waiting), checks that the display link runs while playing
+and stops at the end, that the overlay changed, the playhead moved and the
+caption is set, compares the layers again mid-run, and steps one event.
+
+`rvrender --selftest FILE` checks playback without a window: it plays the
+run from start to end through the core clock in about 200 steps, seeks to
+twelve positions in both directions (the same position reached from either
+side must give the same picture), compares the stacked planes with a
+single-pass render at 19 positions, and checks the router vias drawn at the
+event that applies the `ROUT` chunk against `ROUT`'s via count.
 
 ## The app
 
@@ -75,15 +95,31 @@ way up).
   read-only document (`TraceDocument`); the window title is the file name.
   With no trace open, the welcome window shows the board background and an
   Open button.
-- **Board:** the latest `BRD` board of the trace by default; the board menu
-  at the top of the Appearance panel picks another.
-- **Pan:** drag, two-finger scroll, arrow keys.
+- **Board:** by default the latest `BRD` board at or before the playback
+  position ("Board at the playhead"), or before any board the router's
+  outline (grid, pads and keep-outs of the router session); the board menu
+  at the top of the Appearance panel picks a fixed one.
+- **Playback:** a trace opens at its end, paused. The transport bar under
+  the timeline: go to start, step back, play/pause, step forward, go to end,
+  what a step moves to (event, search, commit, net, rip-up, failure, phase),
+  slower/faster (0.25× to 64×) and the position ("event k of N · m:ss.s /
+  3:00.0"). The caption above the timeline says the phase, the route_net in
+  progress, what the event does, the running counts and the router's clock.
+  Keys: space plays or pauses; ← / → step by the chosen kind; ⇧← / ⇧→ step
+  by net; Home / End; ⌘[ / ⌘] slower / faster. The Playback menu has the
+  same, plus Play Backward and Step By.
+- **Timeline:** phase bands with their labels on top, one bar per search
+  (height grows with the states it expanded, log scale; red when it found
+  nothing), rip-up ticks (orange) and failure ticks (red) at the bottom, and
+  the playhead. Click or drag to scrub; playing pauses while dragging.
+- **Pan:** drag, two-finger scroll, ↑ / ↓, ⌥ with any arrow key.
 - **Zoom:** pinch; scroll with ⌘, ⌥ or ⌃; a mouse wheel (zooms about the
   cursor, as in KiCad); `+` / `-` keys and View > Zoom In / Zoom Out
   (⌘= / ⌘-); `0` or ⌘0 zooms to fit.
 - **Appearance panel:** layers in KiCad's order, each with its colour swatch
   and a visibility checkbox; object classes (zones, tracks, pads, vias, holes,
-  text, footprint graphics, board graphics, rule areas, board outline).
+  text, footprint graphics, board graphics, rule areas, board outline, routed
+  copper).
   Masks, paste and courtyards start hidden, as in KiCad.
 - **Status line:** cursor position in board millimetres and the zoom (100 % is
   zoom to fit).
@@ -112,6 +148,76 @@ graphics, text, tracks, pads, vias. KiCad itself draws the active copper
 layer above everything; here silkscreen stays above copper so that it can
 always be read.
 
+## Playback
+
+All of this is in the core (`rv.h`, section M3); the app only draws and
+forwards clicks.
+
+- **Events.** One per chunk of these kinds: `RUN`, `SNAP`, `SRCH`, `CMIT`,
+  `VIA` with added = 1, `RNB`, `RNE`, `DROP`, `MARK` with level 0 (a phase),
+  `BRD` and `END`. An `RBLD` and the `RIP` chunks with ctx = 1 right after it
+  are one rip-up event; any other `RIP` is a rip-up of its own. Every other
+  chunk (`NETS`, `PAD`, `RECT`, `DISC`, `GRDS`, `ROUT`, notes, `VIA` with
+  added = 0, corrupt or unknown chunks) takes effect with the next event;
+  chunks after the last event belong to it.
+- **Position and pacing.** The position is a time t in playback seconds.
+  The whole run lasts 180 s at 1× ("fit length"); each event gets a share
+  proportional to its weight: a search 1 + ln(1 + expanded states), a commit
+  2, a via 1, a rip-up 3, a route_net begin 0.5, an end 0.5 (2 with failed
+  pads), a drop 1, a phase 4, a snapshot 0.5, a session 1, a board 2, the
+  end 1. An event's chunks take effect at its start; time inside an event
+  only animates (the M4 wavefront). What is shown is a function of t alone,
+  so playing, stepping and seeking in either direction agree.
+- **Router copper** alive at the event: every `CMIT` / `VIA` copper item made
+  at or before it and not removed by a `RIP` at or before it, in its router
+  session; drawn above the board's tracks in the layer's colour, as the
+  commit's path (polylines through the cell centres; collinear points
+  dropped) plus pad stubs, vias and drills.
+- **Ghosts:** copper removed by a rip-up whose event started less than 1.5 s
+  of playback before t, in its layer's colour mixed half-way to white, alpha
+  0.75 × (1 − age / 1.5 s) in 16 steps, below the live copper.
+- **Failed pads** (red ring and cross): each label of an `RNE`'s failed list
+  and each `DROP` with ok = 0, from that event until the next `RNB` of the
+  same route_net name or the next `RUN`. Placed at the `RNB` pad with that
+  label; a drop at the centre of its drop_to_plane search's sources, else at
+  the latest `RNB` pad of that name.
+- **Highlights** of the current event: the commit just made (lightened), a
+  new via (white ring), the search's path (white), sources (green) and
+  targets (orange), the pads of the route_net in progress (white rings).
+- **Board underneath, no double drawing:** following the position, the
+  board drawn is the latest `BRD` at or before the event's last chunk, or
+  without one the router outline. Router copper and ghosts are hidden when
+  that board already holds the routing: it has at least one track or via,
+  and its `BRD` chunk comes after the session's last copper change.
+
+### Drawing it: planes
+
+The overlay is a second display list (`rv_get_overlay`) whose batches go
+between the board's by draw order. The core reports **slots**: ranges of the
+order axis that hold overlay batches and no board batch (each router layer's
+ghosts, copper and vias; router drills; markers on top), each with a
+generation that changes only when its batches do. `RVKit.LayeredRenderer`
+keeps one cached bitmap per **plane**: the board batches between two slots
+(a static slab, redrawn only when the board or the camera changes) and each
+slot (redrawn when its generation changes, over its batches' bounds only).
+`BoardView` gives each plane a Core Animation layer, so a playback frame
+re-rasterises one to three slot planes and swaps their contents; the board
+is never redrawn while playing. A later slot kind (the M4 wavefront, under
+the copper) is one more plane.
+
+On the dongle trace (8006 events, 1023 route_nets, 1254 rip-ups) at
+3200 × 2000 pixels on an 18-core M5 Pro, a playback frame at 8× takes 1.5 ms
+median, 2.5 ms at the 99th percentile and 6.2 ms at worst (clock, overlay
+copy and the planes that changed); a full redraw of every plane (a pan or
+zoom) 3.6 to 7.0 ms. Each redraw gets a new bitmap (the old one stays on
+screen until its layer takes the new one); bitmaps are anonymous mappings,
+and up to 96 MB of freed ones are kept for reuse (`BitmapMemory`), which
+keeps the frame times of malloc without its cache of several hundred
+megabytes. Peak memory footprint of that run: 336 MB, of which the plane
+bitmaps at the end are 102 MB.
+Measure with `.build/release/rvrender --bench-playback FILE --size 3200x2000 --speed 8`
+(under `/usr/bin/time -l` for the memory).
+
 ### Theme
 
 Colours are KiCad 10's built-in "KiCad Default" theme, read from KiCad
@@ -131,21 +237,43 @@ theme file loader yet; the theme is built into the core (`core/src/theme.cpp`).
 ```sh
 .build/release/rvrender FILE OUT.png [--size WxH] [--board N] [--layers a,b,c | --all-layers]
                                      [--hide-classes i,j] [--fit | --window x0,y0,x1,y1]
+                                     [--at FRACTION | --event N]
+.build/release/rvrender FILE OUTDIR --frames N [options as above]
 .build/release/rvrender --compare GOLDEN.png NEW.png [--tolerance T] [--max-fraction F]
 .build/release/rvrender --bench FILE [--size WxH] [--frames N]
+.build/release/rvrender --bench-playback FILE [--size WxH] [--speed S] [--frames N]
+.build/release/rvrender --selftest FILE [--size WxH]
 ```
 
-`rvrender` uses the app's renderer (`RVKit.DisplayListRenderer`) at backing
-scale 1 and writes an opaque sRGB PNG. `--board` counts from 0; `--window`
-is a board rectangle in mm; `--hide-classes` takes `rv_object_class` numbers.
+`rvrender` uses the app's renderer (`RVKit.LayeredRenderer`) at backing
+scale 1 and writes an opaque sRGB PNG of the board and the overlay. Without
+`--at` or `--event` the position is the end of the run, as after opening a
+trace in the app. `--at` is a fraction of the playback time (0 to 1),
+`--event` an event index from 0 (the caption's "event k of N" counts from
+1); it prints the position's counts and caption. `--frames N` writes
+`frame_0000.png`… at N positions evenly from start to end. `--board` counts
+from 0; `--window` is a board rectangle in mm; `--hide-classes` takes
+`rv_object_class` numbers (10 is routed copper).
 
-`make golden` renders six cases from synthetic traces only (`rvsynth` output,
-never the recorder's `small.grtrace`, which may be regenerated) and compares
-them with `mac/Tests/golden/*.png`: a pixel differs when a channel is off by
-more than 48, and at most 0.2 % may differ. To regenerate after an intended
-change: `make golden-update`, look at every PNG in `mac/Tests/golden/`, and
-commit them with the change that caused them. The cases are listed in
+`make golden` renders nine cases from synthetic traces only (`rvsynth`
+output, never the recorder's `small.grtrace`, which may be regenerated) and
+compares them with `mac/Tests/golden/*.png`: a pixel differs when a channel
+is off by more than 48, and at most 0.2 % may differ. Six are boards (M2);
+three are events of the synthetic routing run (`rvsynth --timeline`): the
+rebuild's rip-up with its ghost (event 16), the failed drop_to_plane with
+two failed-pad markers (event 30), and a commit of the second router session
+over the final board (event 40). The cases are listed in
 `mac/Tests/golden.sh`.
+
+To regenerate after an intended change to the drawing: run
+`make golden-update` (it renders every case into `build/golden/` and copies
+all of them over `mac/Tests/golden/`), open every PNG in
+`mac/Tests/golden/` and check it shows what its comment in `golden.sh`
+says, restore any that should not have changed (`git checkout --
+mac/Tests/golden/NAME.png`), and commit them with the change that caused
+them. To add a case, add a `golden NAME INPUT [options]` line, run
+`make golden` (the new case fails with "no golden image"), look at
+`build/golden/NAME.png`, and copy it to `mac/Tests/golden/`.
 
 ### Performance
 
@@ -168,7 +296,10 @@ build/rvdump --chunks FILE     # one line per chunk
 build/rvdump --search N FILE   # one search, with its first wavefront entries
 build/rvsynth OUT              # write the synthetic test trace (--no-end, --truncate N)
 build/rvsynth --stress OUT     # write the synthetic stress board ("placed" and "final" BRD)
+build/rvsynth --timeline OUT   # write the synthetic routing run (two sessions, rip-ups, failures)
 build/rvdump --board N FILE    # a board's layers and display-list batches (N or "latest")
+build/rvdump --timeline [--bench SEEKS] FILE   # events by kind, phases, the state at 7 positions,
+                                               # open time and seek timing
 ```
 
 It exits 0 for a readable trace without errors, including a file that is

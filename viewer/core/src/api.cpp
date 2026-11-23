@@ -10,6 +10,7 @@
 #include "errors.hpp"
 #include "session.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -89,6 +90,23 @@ void require_index(std::size_t index, std::size_t count, const char *what) {
                                     std::to_string(index) + " (there are " + std::to_string(count) + ")");
 }
 
+void require_finite(double v, const char *name) {
+    if (!std::isfinite(v)) throw std::invalid_argument(std::string("invalid argument: ") + name + " is not finite");
+}
+
+// A call that may move the playback position: reports what changed.
+template <class F>
+rv_status playback(rv_session *session, uint32_t *changed, F &&f) noexcept {
+    if (changed != nullptr) *changed = 0;
+    return guarded(session, [&](rv::Session &s) {
+        s.drop_borrowed();
+        const rv::Session::Mark m = s.mark();
+        f(s);
+        const uint32_t c = s.changed_since(m);
+        if (changed != nullptr) *changed = c;
+    });
+}
+
 } // namespace
 
 extern "C" {
@@ -138,9 +156,7 @@ rv_status rv_close(rv_session *session) {
 rv_status rv_refresh(rv_session *session, uint32_t *new_chunks) {
     if (new_chunks != nullptr) *new_chunks = 0;
     return guarded(session, [&](rv::Session &s) {
-        rv::Trace &t = s.trace();
-        s.drop_borrowed();
-        const uint32_t n = t.refresh();
+        const uint32_t n = s.refresh();
         if (new_chunks != nullptr) *new_chunks = n;
     });
 }
@@ -338,7 +354,7 @@ rv_status rv_search_cells(rv_session *session, uint32_t search_id, uint32_t whic
         if (which > 2) throw std::invalid_argument("invalid argument: which must be 0, 1 or 2");
         const rv::Search &x = t.searches()[search_id];
         if (!x.valid) return;
-        const uint32_t n = which == 0 ? x.nsrc : which == 1 ? x.ntgt : x.npath;
+        const uint32_t n = which == 0 ? x.nsrc_kept : which == 1 ? x.ntgt_kept : x.npath;
         *cells = n == 0 ? nullptr : which == 0 ? x.src() : which == 1 ? x.tgt() : x.path();
         *count = n;
     });
@@ -399,6 +415,7 @@ rv_status rv_board_select(rv_session *session, uint32_t index) {
     return guarded(session, [&](rv::Session &s) {
         s.drop_borrowed();
         s.scene.select(index);
+        s.sync();
     });
 }
 
@@ -534,6 +551,10 @@ rv_status rv_order_key(rv_session *session, uint32_t layer, uint32_t sub, uint32
             *key = rv::order_key(rv::kRankHoles, sub);
             return;
         }
+        if (layer == RV_OVERLAY_LAYER) {
+            *key = rv::order_key(rv::kRankOverlay, sub);
+            return;
+        }
         const rv::DisplayList &dl = s.scene.full(s.trace_or_null());
         for (const rv::LayerEntry &e : dl.layers)
             if (e.index == layer) {
@@ -613,6 +634,287 @@ rv_status rv_view_status(rv_session *session, double vx, double vy, const char *
         std::snprintf(buf, sizeof buf, "X %.4f mm   Y %.4f mm   zoom %.0f%%", bx, by, zoom);
         s.status = buf;
         *text = s.status.c_str();
+    });
+}
+
+// --- M3: timeline, playback, overlay ------------------------------------------------
+
+const char *rv_event_kind_name(uint32_t kind) {
+    return rv::event_kind_name(kind);
+}
+
+const char *rv_step_kind_name(uint32_t kind) {
+    return rv::step_kind_name(kind);
+}
+
+rv_status rv_get_timeline(rv_session *session, rv_timeline *out) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        rv_timeline tl;
+        std::memset(&tl, 0, sizeof tl);
+        tl.generation = s.timeline_generation();
+        const rv::Timeline *t = s.timeline();
+        if (t != nullptr) {
+            std::vector<rv_event> &ce = s.c_events;
+            if (s.c_events_generation != s.timeline_generation()) {
+                const double lmax = std::log1p(t->max_search_size());
+                ce.resize(t->size());
+                for (std::size_t k = 0; k < ce.size(); ++k) {
+                    const rv::Event &e = t->events()[k];
+                    rv_event &c = ce[k];
+                    std::memset(&c, 0, sizeof c);
+                    c.start = e.start;
+                    c.duration = e.duration;
+                    c.size = e.kind == rv::EvKind::Search && lmax > 0
+                                 ? static_cast<float>(std::log1p(e.size) / lmax)
+                                 : 0.0f;
+                    c.kind = static_cast<uint32_t>(e.kind);
+                    c.flags = e.flags;
+                    c.chunk = e.chunk;
+                    c.last_chunk = e.last;
+                    c.record = e.record;
+                    c.net = e.net;
+                    c.session = e.session;
+                    c.route = e.route;
+                    c.phase = e.phase;
+                    c.board = e.board;
+                }
+                s.c_events_generation = s.timeline_generation();
+            }
+            tl.events = ce.empty() ? nullptr : ce.data();
+            tl.event_count = static_cast<uint32_t>(ce.size());
+            tl.rip_ticks = t->rip_ticks().empty() ? nullptr : t->rip_ticks().data();
+            tl.rip_tick_count = static_cast<uint32_t>(t->rip_ticks().size());
+            tl.failure_ticks = t->failure_ticks().empty() ? nullptr : t->failure_ticks().data();
+            tl.failure_tick_count = static_cast<uint32_t>(t->failure_ticks().size());
+            tl.phase_count = static_cast<uint32_t>(t->phases().size());
+            tl.total = t->total();
+            const rv::Trace &tr = s.trace();
+            tl.router_seconds = tr.chunks().empty() ? 0.0 : tr.chunks().back().t;
+        }
+        *out = tl;
+    });
+}
+
+rv_status rv_phase(rv_session *session, uint32_t index, rv_phase_info *out) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        const rv::Timeline *t = s.timeline();
+        require_index(index, t == nullptr ? 0 : t->phases().size(), "phase");
+        const rv::Phase &p = t->phases()[index];
+        rv_phase_info i;
+        std::memset(&i, 0, sizeof i);
+        i.start = p.start;
+        i.end = p.end;
+        i.label = p.label.c_str();
+        i.event = p.event;
+        *out = i;
+    });
+}
+
+rv_status rv_position_get(rv_session *session, rv_position *out) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        rv_position p;
+        std::memset(&p, 0, sizeof p);
+        s.sync();
+        p.time = s.player.t;
+        p.total = s.total();
+        p.speed = s.player.speed_value();
+        p.direction = s.player.direction;
+        p.playing = s.player.playing ? 1u : 0u;
+        p.event = RV_NONE;
+        p.last_chunk = RV_NONE;
+        const rv::Timeline *t = s.timeline();
+        if (t != nullptr) {
+            p.event_count = t->size();
+            p.at_end = s.player.t >= t->total() ? 1u : 0u;
+            const uint32_t e = s.event();
+            if (e != RV_NONE) {
+                const rv::Trace &tr = s.trace();
+                p.event = e;
+                p.fraction = rv::event_fraction(*t, e, s.player.t);
+                p.last_chunk = t->events()[e].last;
+                p.router_time = tr.chunks()[p.last_chunk].t;
+                p.cells_revealed = rv::cells_revealed(tr, *t, e, s.player.t);
+                std::vector<uint32_t> alive;
+                t->alive_copper(e, alive);
+                p.copper_alive = static_cast<uint32_t>(alive.size());
+                std::vector<std::pair<uint32_t, double>> gh;
+                t->ghosts(s.player.t, gh);
+                p.ghosts = static_cast<uint32_t>(gh.size());
+                p.failures = s.failures_now();
+                p.routed_hidden = s.routed_hidden() ? 1u : 0u;
+            }
+        }
+        *out = p;
+    });
+}
+
+rv_status rv_advance(rv_session *session, double dt, uint32_t *changed) {
+    return playback(session, changed, [&](rv::Session &s) {
+        require_finite(dt, "dt");
+        if (dt < 0) throw std::invalid_argument("invalid argument: dt is negative");
+        s.advance(dt);
+    });
+}
+
+rv_status rv_play(rv_session *session, uint32_t playing, uint32_t *changed) {
+    return playback(session, changed, [&](rv::Session &s) { s.play(playing != 0); });
+}
+
+rv_status rv_set_direction(rv_session *session, int32_t direction) {
+    return guarded(session, [&](rv::Session &s) {
+        if (direction == 0) throw std::invalid_argument("invalid argument: direction must be +1 or -1");
+        s.player.direction = direction > 0 ? 1 : -1;
+    });
+}
+
+rv_status rv_set_speed(rv_session *session, double speed) {
+    return guarded(session, [&](rv::Session &s) {
+        require_finite(speed, "speed");
+        if (!(speed > 0)) throw std::invalid_argument("invalid argument: speed must be positive");
+        int best = 0;
+        for (int k = 1; k < rv::kSpeedCount; ++k)
+            if (std::fabs(std::log(rv::kSpeeds[k] / speed)) < std::fabs(std::log(rv::kSpeeds[best] / speed))) best = k;
+        s.player.speed = best;
+    });
+}
+
+rv_status rv_speed_step(rv_session *session, int32_t steps) {
+    return guarded(session, [&](rv::Session &s) {
+        long v = static_cast<long>(s.player.speed) + steps;
+        if (v < 0) v = 0;
+        if (v >= rv::kSpeedCount) v = rv::kSpeedCount - 1;
+        s.player.speed = static_cast<int>(v);
+    });
+}
+
+rv_status rv_seek_time(rv_session *session, double t, uint32_t *changed) {
+    return playback(session, changed, [&](rv::Session &s) {
+        require_finite(t, "t");
+        s.set_time(t);
+    });
+}
+
+rv_status rv_seek_fraction(rv_session *session, double fraction, uint32_t *changed) {
+    return playback(session, changed, [&](rv::Session &s) {
+        require_finite(fraction, "fraction");
+        s.set_time(fraction * s.total());
+    });
+}
+
+rv_status rv_seek_event(rv_session *session, uint32_t event, uint32_t *changed) {
+    return playback(session, changed, [&](rv::Session &s) {
+        const rv::Timeline *t = s.timeline();
+        require_index(event, t == nullptr ? 0 : t->size(), "event");
+        s.set_time(t->events()[event].start);
+    });
+}
+
+rv_status rv_jump(rv_session *session, uint32_t to_end, uint32_t *changed) {
+    return playback(session, changed, [&](rv::Session &s) { s.set_time(to_end != 0 ? s.total() : 0.0); });
+}
+
+rv_status rv_step(rv_session *session, uint32_t kind, int32_t direction, uint32_t *changed) {
+    return playback(session, changed, [&](rv::Session &s) {
+        require_index(kind, rv::kStepKindCount, "step kind");
+        if (direction == 0) throw std::invalid_argument("invalid argument: direction must be +1 or -1");
+        s.player.playing = false;
+        const rv::Timeline *t = s.timeline();
+        if (t == nullptr) return;
+        const uint32_t e = rv::step_target(*t, s.player.t, static_cast<rv::StepKind>(kind), direction);
+        if (e != RV_NONE) s.set_time(t->events()[e].start);
+    });
+}
+
+rv_status rv_text(rv_session *session, uint32_t which, const char **text) {
+    if (text != nullptr) *text = nullptr;
+    return guarded(session, [&](rv::Session &s) {
+        require_out(text, "text");
+        if (which > RV_TEXT_SPEED) throw std::invalid_argument("invalid argument: no text " + std::to_string(which));
+        const rv::Timeline *t = s.timeline();
+        if (which == RV_TEXT_SPEED) {
+            s.text_out = rv::speed_text(s.player.speed_value());
+        } else if (t == nullptr) {
+            s.text_out = "no trace open";
+        } else if (which == RV_TEXT_POSITION) {
+            s.text_out = rv::position_text(*t, s.event(), s.player.t);
+        } else {
+            s.text_out = rv::caption(s.trace(), *t, s.event(), s.failures_now());
+        }
+        *text = s.text_out.c_str();
+    });
+}
+
+rv_status rv_get_overlay(rv_session *session, rv_display_list *out, const rv_slot **slots, uint32_t *slot_count) {
+    if (slots != nullptr) *slots = nullptr;
+    if (slot_count != nullptr) *slot_count = 0;
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        require_out(slots, "slots");
+        require_out(slot_count, "slot_count");
+        const rv::Overlay &ov = s.overlay_now();
+        const rv::DisplayList &dl = ov.list();
+        const rv::DisplayList &st = s.scene.full(s.trace_or_null());
+        std::vector<rv_batch> &cb = s.c_overlay;
+        if (s.c_overlay_generation != ov.generation() || s.c_overlay_epoch != ov.key_epoch() ||
+            cb.size() != dl.batches.size()) {
+            cb.resize(dl.batches.size());
+            for (std::size_t k = 0; k < cb.size(); ++k) {
+                const rv::Batch &b = dl.batches[k];
+                rv_batch &c = cb[k];
+                c.prim = static_cast<uint32_t>(b.prim);
+                c.cls = b.cls;
+                c.layer = b.layer;
+                c.order = b.order;
+                c.rgba = b.color;
+                c.key = b.key;
+                c.width = b.width;
+                c.first = b.first;
+                c.count = b.count;
+                for (int i = 0; i < 4; ++i) c.bbox[i] = b.bbox[static_cast<std::size_t>(i)];
+            }
+            s.c_slots.resize(ov.slots().size());
+            for (std::size_t k = 0; k < s.c_slots.size(); ++k) {
+                const rv::Slot &x = ov.slots()[k];
+                rv_slot &c = s.c_slots[k];
+                std::memset(&c, 0, sizeof c);
+                c.kind = static_cast<uint32_t>(x.kind);
+                c.order_begin = x.order_begin;
+                c.order_end = x.order_end;
+                c.layer = x.layer;
+                c.first_batch = x.first_batch;
+                c.batch_count = x.batch_count;
+                c.generation = x.generation;
+                for (int i = 0; i < 4; ++i) c.bbox[i] = x.bbox[static_cast<std::size_t>(i)];
+            }
+            s.c_overlay_generation = ov.generation();
+            s.c_overlay_epoch = ov.key_epoch();
+        }
+        rv_display_list d;
+        std::memset(&d, 0, sizeof d);
+        d.batches = cb.empty() ? nullptr : cb.data();
+        d.xy = dl.xy.empty() ? nullptr : dl.xy.data();
+        d.contours = dl.contours.empty() ? nullptr : dl.contours.data();
+        d.polys = dl.polys.empty() ? nullptr : dl.polys.data();
+        d.segs = dl.segs.empty() ? nullptr : dl.segs.data();
+        d.circles = dl.circles.empty() ? nullptr : dl.circles.data();
+        d.batch_count = static_cast<uint32_t>(cb.size());
+        d.point_count = static_cast<uint32_t>(dl.xy.size() / 2);
+        d.contour_count = static_cast<uint32_t>(dl.contours.size() / 2);
+        d.poly_count = static_cast<uint32_t>(dl.polys.size() / 2);
+        d.seg_count = static_cast<uint32_t>(dl.segs.size() / 4);
+        d.circle_count = static_cast<uint32_t>(dl.circles.size() / 3);
+        d.background = s.scene.theme().background;
+        d.board = s.scene.built_board();
+        d.has_extent = st.has_extent ? 1u : 0u;
+        d.geometry_generation = ov.key_epoch();
+        d.generation = ov.generation();
+        for (int i = 0; i < 4; ++i) d.extent[i] = st.extent[static_cast<std::size_t>(i)];
+        *out = d;
+        *slots = s.c_slots.empty() ? nullptr : s.c_slots.data();
+        *slot_count = static_cast<uint32_t>(s.c_slots.size());
     });
 }
 

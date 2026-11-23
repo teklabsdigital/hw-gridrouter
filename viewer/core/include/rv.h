@@ -13,17 +13,20 @@
  *   - Pointers returned by the core are borrowed: they stay valid until the
  *     next call that changes the same session, or until rv_destroy().  The
  *     calls that change a session are rv_open, rv_close, rv_refresh,
- *     rv_board_select, rv_layer_set_visible, rv_class_set_visible, and the
- *     calls that return a borrowed buffer (rv_chunk_text, rv_wavefront,
- *     rv_view_status), each of which replaces only the buffer it returned
- *     before.  The camera calls (rv_view_*) never invalidate the display
- *     list.
+ *     rv_board_select, rv_layer_set_visible, rv_class_set_visible, the
+ *     playback calls (rv_advance, rv_play, rv_set_direction, rv_set_speed,
+ *     rv_speed_step, rv_seek_*, rv_step, rv_jump), and the calls that return
+ *     a borrowed buffer (rv_chunk_text, rv_wavefront, rv_view_status,
+ *     rv_text, rv_get_display_list, rv_get_overlay), each of which replaces
+ *     only the buffer it returned before.  The camera calls (rv_view_*)
+ *     never invalidate a display list.
  *
  * Milestone M1: the session lifecycle and the trace reader (open, close,
  * refresh and read-only facts about the file).  Milestone M2: the board
  * display list in KiCad's default colours, layer and object visibility, and
- * the camera.  Later milestones add the timeline, router copper and
- * wavefront images.
+ * the camera.  Milestone M3: the timeline, the playback clock, and the
+ * overlay of router copper, rip-up ghosts, failure markers and the current
+ * event.  Later milestones add wavefront images.
  *
  * The trace file format is docs/TRACE_FORMAT.md in the router repository.
  */
@@ -41,7 +44,7 @@ extern "C" {
  * compares this compile-time value with rv_api_version() at run time to make
  * sure it was linked against the core it was compiled for.
  */
-#define RV_API_VERSION 3u
+#define RV_API_VERSION 4u
 
 /* "No id": an absent search, route, copper or session index. */
 #define RV_NONE 0xFFFFFFFFu
@@ -292,10 +295,17 @@ rv_status rv_wavefront(rv_session *session, uint32_t search_id, const uint32_t *
 /* ==== M2: the board ========================================================
  *
  * The board drawn is a BRD chunk (TRACE_FORMAT.md 7.18): by default the
- * latest one in the file (a refresh that reads a newer BRD switches to it),
- * or one chosen with rv_board_select.  The calls below also work with no
- * trace open or a trace without a BRD chunk: there is then no board, no
- * layers and an empty display list, and the camera still works.
+ * latest one at or before the playback position (see M3 below; after
+ * rv_open the position is the end, so this is the latest BRD in the file,
+ * and a refresh while at the end switches to a newer one), or one chosen
+ * with rv_board_select.  When the position has no BRD at or before it, the
+ * display list is the router outline of the position's router session: the
+ * grid extent on "Edge.Cuts" and the session's PAD, RECT and DISC chunks as
+ * outlines on the two router layers (layer indices are then positions in
+ * that small layer table: the router layers, then Edge.Cuts).  The calls
+ * below also work with no trace open or a trace without a board or RUN:
+ * there is then no board, no layers and an empty display list, and the
+ * camera still works.
  */
 
 /* ---- boards (BRD chunks) -------------------------------------------------- */
@@ -317,9 +327,10 @@ typedef struct rv_board_info {
 rv_status rv_board_count(rv_session *session, uint32_t *count);
 rv_status rv_board(rv_session *session, uint32_t index, rv_board_info *out);
 
-/* Draw BRD number index, or the latest one with RV_NONE (the default, and
- * the state after every rv_open).  An index beyond the boards read so far
- * is accepted and shows no board until a refresh reads it. */
+/* Draw BRD number index, or with RV_NONE the latest one at or before the
+ * playback position (the default, and the state after every rv_open).  An
+ * index beyond the boards read so far is accepted and shows no board until
+ * a refresh reads it. */
 rv_status rv_board_select(rv_session *session, uint32_t index);
 
 /* The BRD index being drawn, RV_NONE if there is none. */
@@ -387,12 +398,13 @@ typedef enum rv_object_class {
     RV_OBJ_FP_GRAPHICS = 6,  /* footprint graphics (silk, fab, courtyard lines) */
     RV_OBJ_GRAPHICS = 7,     /* board graphics outside footprints */
     RV_OBJ_RULE_AREAS = 8,   /* keep-outs */
-    RV_OBJ_OUTLINE = 9       /* board outline (Edge.Cuts) */
+    RV_OBJ_OUTLINE = 9,      /* board outline (Edge.Cuts) */
+    RV_OBJ_ROUTED = 10       /* router copper and rip-up ghosts (overlay, M3) */
     /* Reserved for later milestones, not produced by this version:
-     * 10 router copper (M3), 11 wavefront (M4), 12 net highlight (M5). */
+     * 11 wavefront (M4), 12 net highlight (M5). */
 } rv_object_class;
 
-/* Number of object classes this core produces (10). */
+/* Number of object classes this core produces (11). */
 rv_status rv_class_count(rv_session *session, uint32_t *count);
 /* Name for the Appearance panel ("Zones", ...), static; and visibility. */
 rv_status rv_class(rv_session *session, uint32_t cls, const char **name, uint32_t *visible);
@@ -432,10 +444,13 @@ rv_status rv_class_set_visible(rv_session *session, uint32_t cls, uint32_t visib
  * except where another layer's batches interleave by `order`.
  *
  * Caching: geometry_generation changes only when the geometry may have
- * changed (another board or trace); within one geometry_generation a
+ * changed (another trace, or another board or router outline, chosen or
+ * reached by the playback position); within one geometry_generation a
  * batch's `key` always names the same geometry, so a client may keep
- * prepared paths keyed by `key` across visibility changes.  `generation`
- * changes whenever the list may differ.
+ * prepared paths keyed by `key` across visibility changes.  Moving back to
+ * one of the last two lists built gives back its geometry_generation.
+ * `generation` changes whenever the list may differ.  A playback position
+ * change that keeps the same board changes neither (only the overlay, M3).
  */
 typedef enum rv_prim {
     RV_FILL = 1,
@@ -455,7 +470,9 @@ typedef enum rv_prim {
 #define RV_SUB_GRAPHIC 0x20u
 #define RV_SUB_TEXT 0x28u
 #define RV_SUB_TRACK 0x30u
-#define RV_SUB_ROUTED 0x38u       /* reserved (M3): router copper, above board tracks */
+#define RV_SUB_GHOST 0x34u        /* overlay (M3): ghosts of ripped router copper */
+#define RV_SUB_ROUTED 0x38u       /* overlay (M3): router copper, above board tracks */
+#define RV_SUB_ROUTED_VIA 0x3Au   /* overlay (M3): router vias */
 #define RV_SUB_PAD 0x40u
 #define RV_SUB_VIA 0x50u
 #define RV_SUB_OUTLINE 0x60u
@@ -463,6 +480,7 @@ typedef enum rv_prim {
 #define RV_SUB_HOLE_WALL 0x10u
 #define RV_SUB_PAD_HOLE 0x20u
 #define RV_SUB_VIA_HOLE 0x28u
+#define RV_SUB_ROUTED_DRILL 0x2Cu /* overlay (M3): drills of router vias */
 #define RV_SUB_NON_PLATED 0x30u
 
 typedef struct rv_batch {
@@ -553,6 +571,261 @@ rv_status rv_board_to_view(rv_session *session, double bx, double by, double *vx
  * in mm and the zoom.  Borrowed until the next rv_view_status call or any
  * call that changes the session. */
 rv_status rv_view_status(rv_session *session, double vx, double vy, const char **text);
+
+/* ==== M3: timeline, playback and the overlay ================================
+ *
+ * The run is a sequence of events.  One event per chunk of these kinds:
+ * RUN (a router session starts), SNAP, SRCH, CMIT, VIA with added = 1,
+ * RNB, RNE, DROP, MARK with level 0 (a phase starts), BRD and END; an RBLD
+ * and the RIP chunks with ctx = 1 that immediately follow it are one rip-up
+ * event, and any other RIP is a rip-up event of its own.  All other chunks
+ * (NETS, PAD, RECT, DISC, GRDS, ROUT, MARK notes, VIA with added = 0,
+ * corrupt and unknown chunks) are applied with the next event; chunks after
+ * the last event belong to it.
+ *
+ * Position.  The playback position is a time t in [0, total] seconds of
+ * playback at 1x.  Event k occupies [start, start + duration); its chunks
+ * take effect at its start, and the fraction played inside it only animates
+ * (the wavefront cells revealed, M4).  The state shown at a position is a
+ * function of t alone: playing, stepping and seeking in either direction to
+ * the same t give the same overlay and board.  After rv_open the position
+ * is the end (t = total), paused; a refresh keeps the position (and stays at
+ * the end if it was there).
+ *
+ * Pacing ("fit length"): the whole run lasts 180 s at 1x.  Each event gets
+ * a share proportional to a weight: a search 1 + ln(1 + size) (size =
+ * expanded states, else wavefront entries), a commit 2, a via 1, a rip-up
+ * 3, route_net begins 0.5, route_net ends 0.5 (2 if pads failed), a drop 1,
+ * a phase 4, a snapshot 0.5, a session 1, a board 2, the end 1.
+ *
+ * State at an event (TRACE_FORMAT.md 8):
+ *   - router copper: every copper item created at or before the event and
+ *     not removed by a RIP at or before it, in the event's router session;
+ *   - ghosts: copper removed by a rip-up whose event started less than
+ *     1.5 s of playback before t; alpha 0.75 * (1 - age / 1.5 s), quantised
+ *     to 16 levels;
+ *   - failed pads: each label in an RNE's failed list, and each DROP with
+ *     ok = 0, from that event until the next RNB with the same route_net
+ *     name or the next RUN (TRACE_FORMAT.md 7.10).  Placed at the RNB pad
+ *     with that label; a DROP failure at the centre of the sources of the
+ *     drop_to_plane search just before it, else at the pad of the latest RNB
+ *     of that name; otherwise counted but not drawn;
+ *   - the board underneath (when following the position): the latest BRD at
+ *     or before the event's last chunk;
+ *   - routed copper and ghosts are not drawn when the board underneath
+ *     already holds the routing: it has at least one TRACK or VIA record,
+ *     and its BRD chunk is after the last chunk of the event's session that
+ *     created or removed copper and at or before the event's last chunk.
+ */
+
+/* Event kinds. */
+typedef enum rv_event_kind {
+    RV_EV_SESSION = 0,
+    RV_EV_SNAPSHOT = 1,
+    RV_EV_SEARCH = 2,
+    RV_EV_COMMIT = 3,
+    RV_EV_VIA = 4,
+    RV_EV_RIPUP = 5,
+    RV_EV_ROUTE_BEGIN = 6,
+    RV_EV_ROUTE_END = 7,
+    RV_EV_DROP = 8,
+    RV_EV_PHASE = 9,
+    RV_EV_BOARD = 10,
+    RV_EV_END = 11,
+    RV_EV_KIND_COUNT = 12
+} rv_event_kind;
+
+/* Name of an event kind ("search", ...), "" if out of range.  Static. */
+const char *rv_event_kind_name(uint32_t kind);
+
+/* rv_event.flags */
+#define RV_EVF_FOUND (1u << 0)   /* search found a path */
+#define RV_EVF_FAILED (1u << 1)  /* search not found; RNE with failed pads; DROP ok = 0 */
+#define RV_EVF_ERROR (1u << 2)   /* SRCH error; RNE status 1; DROP raised */
+#define RV_EVF_HAS_NET (1u << 3) /* net is meaningful */
+#define RV_EVF_REBUILD (1u << 4) /* a rip-up started by an RBLD */
+
+typedef struct rv_event {
+    double start;        /* playback seconds */
+    double duration;     /* > 0 */
+    float size;          /* searches: ln(1 + size) / ln(1 + largest size), 0..1; else 0 */
+    uint32_t kind;       /* rv_event_kind */
+    uint32_t flags;      /* RV_EVF_* */
+    uint32_t chunk;      /* the chunk that made the event */
+    uint32_t last_chunk; /* the last chunk applied by it */
+    uint32_t record;     /* search_id index for searches, else the index of the
+                            chunk among its kind's parsed chunks (RV_NONE for a
+                            rip-up without an RBLD) */
+    int32_t net;         /* router net, if RV_EVF_HAS_NET */
+    uint32_t session;    /* router session (RUN index), RV_NONE before any RUN */
+    uint32_t route;      /* route_net in progress (RNB index), else RV_NONE */
+    uint32_t phase;      /* phase index (rv_phase), RV_NONE before the first */
+    uint32_t board;      /* latest BRD index at or before last_chunk, else RV_NONE */
+    uint32_t reserved;   /* 0 */
+} rv_event;
+
+typedef struct rv_timeline {
+    const rv_event *events;      /* borrowed */
+    const double *rip_ticks;     /* start of each rip-up event, ascending; borrowed */
+    const double *failure_ticks; /* start of each event with failed pads; borrowed */
+    double total;                /* playback seconds of the whole run at 1x */
+    double router_seconds;       /* t of the last chunk */
+    uint32_t event_count;
+    uint32_t rip_tick_count;
+    uint32_t failure_tick_count;
+    uint32_t phase_count;
+    uint32_t generation;         /* changes when the timeline is rebuilt (open, refresh) */
+    uint32_t reserved;           /* 0 */
+} rv_timeline;
+
+/* The timeline.  With no trace open: no events.  Borrowed. */
+rv_status rv_get_timeline(rv_session *session, rv_timeline *out);
+
+typedef struct rv_phase_info {
+    double start;        /* playback seconds */
+    double end;          /* start of the next phase, or total */
+    const char *label;   /* MARK text; borrowed */
+    uint32_t event;      /* the phase event */
+    uint32_t reserved;   /* 0 */
+} rv_phase_info;
+
+rv_status rv_phase(rv_session *session, uint32_t index, rv_phase_info *out);
+
+typedef struct rv_position {
+    double time;            /* t, playback seconds */
+    double total;
+    double fraction;        /* of the current event played, 0..1 */
+    double speed;           /* playback speed factor */
+    double router_time;     /* t of the last chunk applied, seconds */
+    uint32_t event;         /* current event, RV_NONE without events */
+    uint32_t event_count;
+    uint32_t last_chunk;    /* last chunk applied, RV_NONE without events */
+    uint32_t playing;       /* 1 while playing */
+    int32_t direction;      /* +1 forward, -1 backward */
+    uint32_t at_end;        /* 1 when t = total */
+    uint32_t cells_revealed;/* searches: wavefront entries shown at this fraction */
+    uint32_t copper_alive;  /* router copper items present (drawn unless routed_hidden) */
+    uint32_t ghosts;        /* ghosts at this position (drawn unless routed_hidden) */
+    uint32_t failures;      /* failed pads at this position (placed or not) */
+    uint32_t routed_hidden; /* 1 when the board underneath holds the routing */
+    uint32_t reserved;      /* 0 */
+} rv_position;
+
+rv_status rv_position_get(rv_session *session, rv_position *out);
+
+/* Bits of the `changed` result of the playback calls. */
+#define RV_CHANGED_POSITION 1u /* t changed: redraw the playhead and the texts */
+#define RV_CHANGED_OVERLAY 2u  /* rv_get_overlay gives a different list */
+#define RV_CHANGED_BOARD 4u    /* the static display list (board or outline) changed */
+
+/*
+ * The clock.  rv_advance moves t by dt * speed * direction seconds of wall
+ * time dt while playing, and stops (pauses) at either end.  It does
+ * nothing while paused.  `changed` (may be NULL) gets RV_CHANGED_* bits.
+ */
+rv_status rv_advance(rv_session *session, double dt, uint32_t *changed);
+/* Play (1) or pause (0).  Playing forward from the end, or backward from
+ * the start, starts over from the other end. */
+rv_status rv_play(rv_session *session, uint32_t playing, uint32_t *changed);
+/* +1 forward, -1 backward. */
+rv_status rv_set_direction(rv_session *session, int32_t direction);
+/* Speeds: 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64 (default 1).  rv_set_speed
+ * snaps to the nearest; rv_speed_step moves along the list (clamped). */
+rv_status rv_set_speed(rv_session *session, double speed);
+rv_status rv_speed_step(rv_session *session, int32_t steps);
+
+/* Seeking.  The play state is kept. */
+rv_status rv_seek_time(rv_session *session, double t, uint32_t *changed);
+rv_status rv_seek_fraction(rv_session *session, double fraction, uint32_t *changed);
+/* To the start of event index. */
+rv_status rv_seek_event(rv_session *session, uint32_t event, uint32_t *changed);
+/* to_end = 0: the start; 1: the end. */
+rv_status rv_jump(rv_session *session, uint32_t to_end, uint32_t *changed);
+
+/* Step kinds. */
+typedef enum rv_step_kind {
+    RV_STEP_EVENT = 0,   /* any event */
+    RV_STEP_SEARCH = 1,
+    RV_STEP_COMMIT = 2,
+    RV_STEP_NET = 3,     /* route_net begins */
+    RV_STEP_RIPUP = 4,
+    RV_STEP_FAILURE = 5, /* RNE with failed pads, DROP ok = 0 */
+    RV_STEP_PHASE = 6,
+    RV_STEP_KIND_COUNT = 7
+} rv_step_kind;
+
+/* Name of a step kind ("event", "search", ...), "" if out of range.  Static. */
+const char *rv_step_kind_name(uint32_t kind);
+
+/* Step to the start of the next (direction > 0) or previous (< 0) event of
+ * a kind: the first one starting after t, or the last one starting before
+ * t.  Pauses.  With none in that direction the position is unchanged and
+ * *changed is 0. */
+rv_status rv_step(rv_session *session, uint32_t kind, int32_t direction, uint32_t *changed);
+
+/* Texts for the current position; borrowed until the next rv_text call or
+ * any call that changes the session. */
+#define RV_TEXT_CAPTION 0u  /* phase, route_net, what the event does, counts, router time */
+#define RV_TEXT_POSITION 1u /* "event 1234 of 9000 · 1:23.4 / 3:00.0" */
+#define RV_TEXT_SPEED 2u    /* "1×" */
+rv_status rv_text(rv_session *session, uint32_t which, const char **text);
+
+/*
+ * The overlay: what changes with the position, as a display list of the
+ * same form as the board's (rv_display_list), drawn interleaved with it by
+ * `order`:
+ *   - router copper alive at the position: tracks (RV_STROKE, the path of
+ *     each commit as polylines; RV_SEGS, pad stubs) at RV_SUB_ROUTED and
+ *     vias (RV_DISC) at RV_SUB_ROUTED_VIA of each router layer's rank, in
+ *     the layer's colour; via drills at RV_SUB_ROUTED_DRILL in the hole
+ *     slot.  Class RV_OBJ_ROUTED; hidden with that class or the layer;
+ *   - ghosts of ripped copper at RV_SUB_GHOST (class RV_OBJ_ROUTED);
+ *   - markers and highlights in the overlay rank (rv_order_key with
+ *     RV_OVERLAY_LAYER), always shown: failed pads (red ring and cross),
+ *     the commit just made (lightened), the current search's sources
+ *     (green), targets (orange) and path (white), the pads of the
+ *     route_net in progress (white rings), a new via (white ring).
+ * Board layer indices in `layer` refer to the static list's layer table
+ * (RV_NONE for content not on a board layer).
+ *
+ * Slots cut the order axis where the overlay has content.  Each slot is a
+ * range [order_begin, order_end) holding a run of overlay batches; no board
+ * batch has an order inside a slot.  Slots are sorted and never overlap; the
+ * set of slots changes only with the router session or the board.  A
+ * client can keep the board batches between two slots as one cached bitmap
+ * and redraw a slot only when its generation changes.
+ *
+ * Keys: an overlay key always names the same geometry for one value of the
+ * overlay list's geometry_generation (the key epoch; it changes on rv_open
+ * and rv_refresh), so a client may keep prepared paths across positions.
+ * Copper is grouped in blocks of 64 copper ids per (slot, primitive,
+ * width), so a commit or a rip-up changes only a few batches.  Overlay keys
+ * are >= 0x80000000 and never equal a board key.  `generation` changes
+ * whenever the overlay may differ; `board`, `background`, `has_extent` and
+ * `extent` are those of the static list.
+ */
+#define RV_OVERLAY_LAYER 0xFFFFFFFEu /* rv_order_key layer for the overlay rank */
+
+#define RV_SLOT_ROUTED 0u  /* one router layer's ghosts, copper and vias */
+#define RV_SLOT_DRILLS 1u  /* router via drills, in the hole slot */
+#define RV_SLOT_MARKERS 2u /* markers and highlights, above everything */
+
+typedef struct rv_slot {
+    uint32_t kind;         /* RV_SLOT_* */
+    uint32_t order_begin;  /* the slot holds orders in [order_begin, order_end) */
+    uint32_t order_end;
+    uint32_t layer;        /* RV_SLOT_ROUTED: board layer index, or RV_NONE */
+    uint32_t first_batch;  /* in the overlay list */
+    uint32_t batch_count;
+    uint32_t generation;   /* changes whenever this slot's batches change */
+    uint32_t reserved;     /* 0 */
+    float bbox[4];         /* union of the slot's batch bounds; 0s when empty */
+} rv_slot;
+
+/* The overlay list and its slots.  Both borrowed (see the rules at the
+ * top).  Built on first use after a change. */
+rv_status rv_get_overlay(rv_session *session, rv_display_list *out, const rv_slot **slots,
+                         uint32_t *slot_count);
 
 #ifdef __cplusplus
 } /* extern "C" */

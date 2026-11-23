@@ -71,7 +71,7 @@ int main(void) {
         if (rv_layer_count(s, &count) != RV_OK || count != 0) ++failures;
         if (rv_layer(s, 0, &layer) != RV_E_INVALID_ARGUMENT) ++failures;
         if (rv_layer_set_visible(s, "F.Cu", 1) != RV_OK) ++failures;
-        if (rv_class_count(s, &count) != RV_OK || count != 10) ++failures;
+        if (rv_class_count(s, &count) != RV_OK || count != 11) ++failures;
         if (rv_class(s, RV_OBJ_VIAS, &text, &visible) != RV_OK || strcmp(text, "Vias") != 0) ++failures;
         if (rv_class_set_visible(s, RV_OBJ_TEXT, 0) != RV_OK) ++failures;
         if (rv_get_display_list(s, &list) != RV_OK || list.batch_count != 0) ++failures;
@@ -85,6 +85,34 @@ int main(void) {
         if (rv_board_to_view(s, bx, by, &bx, &by) != RV_OK || bx != 5.0 || by != 5.0) ++failures;
         if (rv_view_status(s, 0.0, 0.0, &text) != RV_OK || text == NULL) ++failures;
         if (rv_view_zoom(s, 0.0, 0.0, 0.0) != RV_E_INVALID_ARGUMENT) ++failures;
+    }
+
+    /* M3, the timeline and playback, from C with no trace open. */
+    {
+        rv_timeline tl;
+        rv_position pos;
+        rv_phase_info phase;
+        rv_display_list list;
+        const rv_slot *slots = NULL;
+        uint32_t changed = 9;
+        if (rv_get_timeline(s, &tl) != RV_OK || tl.event_count != 0 || tl.events != NULL) ++failures;
+        if (rv_phase(s, 0, &phase) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (rv_position_get(s, &pos) != RV_OK || pos.event != RV_NONE || pos.playing != 0) ++failures;
+        if (rv_play(s, 1, &changed) != RV_OK || changed != 0) ++failures;
+        if (rv_advance(s, 0.5, &changed) != RV_OK || changed != 0) ++failures;
+        if (rv_advance(s, -1.0, &changed) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (rv_set_speed(s, 3.0) != RV_OK || rv_speed_step(s, 1) != RV_OK) ++failures;
+        if (rv_set_direction(s, -1) != RV_OK || rv_set_direction(s, 0) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (rv_seek_fraction(s, 0.5, &changed) != RV_OK) ++failures;
+        if (rv_seek_event(s, 0, &changed) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (rv_step(s, RV_STEP_COMMIT, 1, &changed) != RV_OK || changed != 0) ++failures;
+        if (rv_jump(s, 1, NULL) != RV_OK) ++failures;
+        if (rv_text(s, RV_TEXT_SPEED, &text) != RV_OK || strcmp(text, "8\xc3\x97") != 0) ++failures;
+        if (rv_text(s, RV_TEXT_CAPTION, &text) != RV_OK || text == NULL) ++failures;
+        if (rv_get_overlay(s, &list, &slots, &count) != RV_OK || list.batch_count != 0 || count != 0) ++failures;
+        if (strcmp(rv_event_kind_name(RV_EV_RIPUP), "rip-up") != 0) ++failures;
+        if (strcmp(rv_step_kind_name(RV_STEP_KIND_COUNT), "") != 0) ++failures;
+        if (rv_order_key(s, RV_OVERLAY_LAYER, 0x10, &count) != RV_OK || count != 1000u * 256u + 0x10u) ++failures;
     }
 
     if (strcmp(rv_kind_tag(RV_CHUNK_BRD), "BRD ") != 0) ++failures;

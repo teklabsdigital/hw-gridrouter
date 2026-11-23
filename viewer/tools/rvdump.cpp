@@ -4,6 +4,9 @@
 //   rvdump --chunks FILE     one line per chunk
 //   rvdump --search N FILE   one search in detail, with its first trace entries
 //   rvdump --board N FILE    board N (or "latest"): layers and display list
+//   rvdump --timeline [--bench SEEKS] FILE
+//                            the timeline, the state at a few positions, and
+//                            optionally the time of SEEKS random seeks
 //
 // Exit status: 0 for a readable trace with no errors (complete, or a valid
 // file that is still being written: "incomplete"); 1 if the file cannot be
@@ -14,6 +17,8 @@
 
 #include "rv.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -29,7 +34,8 @@ int usage() {
                  "usage: rvdump FILE\n"
                  "       rvdump --chunks FILE\n"
                  "       rvdump --search N FILE\n"
-                 "       rvdump --board N|latest FILE\n");
+                 "       rvdump --board N|latest FILE\n"
+                 "       rvdump --timeline [--bench SEEKS] FILE\n");
     return 2;
 }
 
@@ -351,10 +357,84 @@ int board(rv_session *s, uint32_t which) {
     return 0;
 }
 
+double now_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// The timeline: events by kind, phases, and the state at a few positions.
+// With seeks > 0, also times that many seeks to pseudo-random positions
+// (position, overlay and static list fetched, as a client does per frame).
+int timeline(rv_session *s, double open_ms, uint32_t seeks) {
+    rv_timeline tl;
+    if (rv_get_timeline(s, &tl) != RV_OK) {
+        std::fprintf(stderr, "rvdump: %s\n", rv_last_error(s));
+        return 1;
+    }
+    std::printf("open:      %.1f ms\n", open_ms);
+    std::printf("events:    %u over %.1f s of playback at 1x (router %.2f s)\n", tl.event_count, tl.total,
+                tl.router_seconds);
+    uint32_t by_kind[RV_EV_KIND_COUNT] = {};
+    for (uint32_t k = 0; k < tl.event_count; ++k)
+        if (tl.events[k].kind < RV_EV_KIND_COUNT) ++by_kind[tl.events[k].kind];
+    for (uint32_t k = 0; k < RV_EV_KIND_COUNT; ++k)
+        if (by_kind[k] != 0) std::printf("  %-18s %u\n", rv_event_kind_name(k), by_kind[k]);
+    std::printf("ticks:     %u rip-ups, %u failures\n", tl.rip_tick_count, tl.failure_tick_count);
+    std::printf("phases:    %u\n", tl.phase_count);
+    for (uint32_t k = 0; k < tl.phase_count; ++k) {
+        rv_phase_info p;
+        if (rv_phase(s, k, &p) == RV_OK)
+            std::printf("  %7.2f - %7.2f s  event %-6u %s\n", p.start, p.end, p.event, p.label);
+    }
+    const double at[] = {0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0};
+    for (double f : at) {
+        rv_seek_fraction(s, f, nullptr);
+        rv_position p;
+        const char *cap = "";
+        const char *pos = "";
+        rv_position_get(s, &p);
+        rv_text(s, RV_TEXT_CAPTION, &cap);
+        std::string caption = cap;
+        rv_text(s, RV_TEXT_POSITION, &pos);
+        rv_display_list ov;
+        const rv_slot *slots = nullptr;
+        uint32_t nslots = 0;
+        rv_get_overlay(s, &ov, &slots, &nslots);
+        std::printf("at %.2f: %s; copper %u, ghosts %u, failures %u%s; overlay %u batches in %u slots\n  %s\n", f, pos,
+                    p.copper_alive, p.ghosts, p.failures, p.routed_hidden ? " (routing held by the board)" : "",
+                    ov.batch_count, nslots, caption.c_str());
+    }
+    if (seeks == 0) return 0;
+    std::vector<double> times;
+    uint64_t x = 88172645463325252ull;
+    uint32_t batches = 0;
+    for (uint32_t k = 0; k < seeks; ++k) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        const double f = static_cast<double>(x % 1000001) / 1000000.0;
+        const double t0 = now_ms();
+        rv_seek_fraction(s, f, nullptr);
+        rv_position p;
+        rv_position_get(s, &p);
+        rv_display_list ov, st;
+        const rv_slot *slots = nullptr;
+        uint32_t nslots = 0;
+        rv_get_overlay(s, &ov, &slots, &nslots);
+        rv_get_display_list(s, &st);
+        times.push_back(now_ms() - t0);
+        batches += ov.batch_count;
+    }
+    std::sort(times.begin(), times.end());
+    std::printf("seek:      %u random seeks: median %.3f ms, 90%% %.3f ms, max %.3f ms (%.0f overlay batches on average)\n",
+                seeks, times[times.size() / 2], times[times.size() * 9 / 10], times.back(),
+                static_cast<double>(batches) / seeks);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
-    enum { Summary, Chunks, Search, Board } mode = Summary;
+    enum { Summary, Chunks, Search, Board, Timeline } mode = Summary;
     uint32_t search_id = 0;
     const char *path = nullptr;
     if (argc == 2 && argv[1][0] != '-') {
@@ -379,6 +459,17 @@ int main(int argc, char **argv) {
             search_id = static_cast<uint32_t>(v);
         }
         path = argv[3];
+    } else if ((argc == 3 || argc == 5) && std::strcmp(argv[1], "--timeline") == 0) {
+        mode = Timeline;
+        search_id = 0;
+        if (argc == 5) {
+            if (std::strcmp(argv[2], "--bench") != 0) return usage();
+            char *end = nullptr;
+            const unsigned long v = std::strtoul(argv[3], &end, 10);
+            if (end == argv[3] || *end != '\0' || v > 1000000ul) return usage();
+            search_id = static_cast<uint32_t>(v);
+        }
+        path = argv[argc - 1];
     } else {
         return usage();
     }
@@ -389,7 +480,10 @@ int main(int argc, char **argv) {
         return 1;
     }
     int rc = 1;
-    if (rv_open(s, path) != RV_OK) {
+    const double t_open = now_ms();
+    const rv_status opened = rv_open(s, path);
+    const double open_ms = now_ms() - t_open;
+    if (opened != RV_OK) {
         std::fprintf(stderr, "rvdump: %s\n", rv_last_error(s));
     } else {
         rv_trace_info info;
@@ -401,6 +495,8 @@ int main(int argc, char **argv) {
             rc = chunks(s, info);
         } else if (mode == Board) {
             rc = board(s, search_id);
+        } else if (mode == Timeline) {
+            rc = timeline(s, open_ms, search_id);
         } else {
             rc = search(s, search_id);
         }

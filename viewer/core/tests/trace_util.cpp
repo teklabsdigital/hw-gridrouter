@@ -64,7 +64,7 @@ std::string fingerprint(const rv::Trace &t) {
     }
     for (std::size_t k = 0; k < t.copper().size(); ++k) {
         const rv::Copper &c = t.copper()[k];
-        o << "copper " << k << " chunk " << c.chunk << " session " << c.session << " kind "
+        o << "copper " << k << " id " << c.id << " chunk " << c.chunk << " session " << c.session << " kind "
           << static_cast<int>(c.kind) << " valid " << c.valid << " net " << c.net << " record "
           << c.record << " removed_by " << c.removed_by << "\n";
     }
@@ -147,7 +147,8 @@ std::string invariant_failure(const rv::Trace &t) {
         const rv::Search &s = t.searches()[k];
         if (s.chunk >= chunks.size() || chunks[s.chunk].record != k) return "search chunk link";
         if (s.valid) {
-            if (s.cells.size() != static_cast<std::size_t>(s.nsrc) + s.ntgt + s.npath) return "search cells size";
+            if (s.cells.size() != static_cast<std::size_t>(s.nsrc_kept) + s.ntgt_kept + s.npath) return "search cells size";
+            if (s.nsrc_kept > s.nsrc || s.ntgt_kept > s.ntgt) return "search kept counts";
             if (s.trace_source != rv::kNone32) {
                 if (s.trace_source > k) return "trace_source after search";
                 if (t.searches()[s.trace_source].trace_source != s.trace_source) return "trace_source chain";

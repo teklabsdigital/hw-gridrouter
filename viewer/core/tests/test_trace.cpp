@@ -551,10 +551,198 @@ TEST(copper_id_mismatch_is_reported) {
     v2.added = 1;
     auto bytes = with_run({{"CMIT", synth::encode(c)}, {"VIA ", synth::encode(v)}, {"VIA ", synth::encode(v2)}});
     auto t = open_bytes(bytes);
-    CHECK_EQ(t->error_count(), 2u);
+    // Three errors: the CMIT stores 7 (expected 0; the reader continues
+    // from 7), the VIA with added = 0 stores 1, and the second VIA stores 1
+    // where 8 is expected after the resynchronisation (17 open point 3).
+    CHECK_EQ(t->error_count(), 3u);
     CHECK_EQ(t->copper().size(), 2u);
     CHECK_EQ(t->commits()[0].copper, 0u);
+    CHECK_EQ(t->copper()[0].id, 7u);
     CHECK_EQ(t->vias()[1].copper, 1u);
+    CHECK_EQ(t->copper()[1].id, 1u);
+    CHECK_EQ(t->copper_index(7), 0u);
+    CHECK_EQ(t->copper_index(1), 1u);
+    CHECK_EQ(t->copper_index(0), rv::kNone32);
+}
+
+// --- 17 open points: the decisions this reader follows ---------------------------------
+
+TEST(open_point_1_rip_before_the_first_snap) {
+    // Router snapshotted before the recorder attached: a RIP before any
+    // SNAP lists the net's copper of the session.  Valid, no issue; an
+    // empty list is valid too (never snapshotted).
+    synth::WCmit c0;
+    c0.copper_id = 0;
+    c0.net = 1;
+    c0.path = {1, 2};
+    synth::WCmit c1 = c0;
+    c1.copper_id = 1;
+    c1.net = 2;
+    synth::WCmit c2 = c0;
+    c2.copper_id = 2;
+    synth::WRip listed;
+    listed.net = 1;
+    listed.removed = {0, 2};
+    synth::WRip empty;
+    empty.net = 2;
+    auto t = open_bytes(with_run({{"CMIT", synth::encode(c0)},
+                                  {"CMIT", synth::encode(c1)},
+                                  {"CMIT", synth::encode(c2)},
+                                  {"RIP ", synth::encode(listed)},
+                                  {"RIP ", synth::encode(empty)}}));
+    print_issues(*t);
+    CHECK_EQ(t->issues().size(), 0u);
+    CHECK_EQ(t->copper()[0].removed_by, 4u);
+    CHECK_EQ(t->copper()[2].removed_by, 4u);
+    CHECK_EQ(t->copper()[1].removed_by, rv::kNone32);
+    CHECK(t->rips()[0].applied == std::vector<std::uint32_t>({0, 2}));
+    // A partial list before any SNAP is still a warning.
+    synth::WRip partial;
+    partial.net = 1;
+    partial.removed = {2};
+    auto t2 = open_bytes(with_run({{"CMIT", synth::encode(c0)},
+                                   {"CMIT", synth::encode(c1)},
+                                   {"CMIT", synth::encode(c2)},
+                                   {"RIP ", synth::encode(partial)}}));
+    CHECK_EQ(t2->error_count(), 0u);
+    CHECK_EQ(t2->warning_count(), 1u);
+    CHECK_EQ(t2->copper()[2].removed_by, 4u);
+    // After a SNAP an empty list is a warning when copper is expected.
+    synth::WCmit c3 = c0;
+    c3.copper_id = 1;
+    synth::WRip none;
+    none.net = 1;
+    auto t3 = open_bytes(with_run({{"CMIT", synth::encode(c0)},
+                                   {"SNAP", synth::encode_snap()},
+                                   {"GRDS", synth::encode(synth::make_grids(1, 30, "snapshot"))},
+                                   {"CMIT", synth::encode(c3)},
+                                   {"RIP ", synth::encode(none)}}));
+    CHECK_EQ(t3->error_count(), 0u);
+    CHECK_EQ(t3->warning_count(), 1u);
+}
+
+TEST(open_point_3_resynchronise_after_an_id_mismatch) {
+    // A corrupt VIA that created copper 0 takes no id; the next CMIT stores
+    // 1.  One error for the VIA, one for the mismatch, and nothing after:
+    // later chunks match again and RIP resolves the stored ids.
+    synth::Bytes bad_via;
+    bad_via.u32(0).i32(1); // far too short
+    synth::WCmit c1;
+    c1.copper_id = 1;
+    c1.net = 1;
+    c1.path = {1, 2};
+    synth::WCmit c2 = c1;
+    c2.copper_id = 2;
+    synth::WRip rip;
+    rip.net = 1;
+    rip.removed = {1, 2};
+    synth::WSrch s0;
+    s0.search_id = 5; // expected 0
+    s0.src = {1};
+    synth::WSrch s1 = s0;
+    s1.search_id = 6; // follows the stored 5
+    auto t = open_bytes(with_run({{"VIA ", bad_via},
+                                  {"CMIT", synth::encode(c1)},
+                                  {"CMIT", synth::encode(c2)},
+                                  {"RIP ", synth::encode(rip)},
+                                  {"SRCH", synth::encode(s0)},
+                                  {"SRCH", synth::encode(s1)}}));
+    print_issues(*t);
+    CHECK_EQ(t->error_count(), 3u); // corrupt VIA, CMIT copper_id 1 != 0, SRCH 5 != 0
+    CHECK_EQ(t->warning_count(), 0u);
+    CHECK_EQ(t->copper().size(), 2u);
+    CHECK_EQ(t->copper()[0].id, 1u);
+    CHECK_EQ(t->copper()[1].id, 2u);
+    CHECK_EQ(t->copper()[0].removed_by, 4u);
+    CHECK_EQ(t->copper()[1].removed_by, 4u);
+    CHECK_EQ(t->search_index(6), 1u);
+    CHECK_EQ(t->search_index(0), rv::kNone32);
+    CHECK_EQ(rvtest::invariant_failure(*t), std::string());
+}
+
+TEST(open_point_4_error_search_with_cells_outside_the_grid) {
+    synth::WSrch s;
+    s.flags = 1u << 8; // error
+    s.cost = -1;
+    s.expanded = -1;
+    s.src = {3, 0xFFFFFFFEu, 4}; // a negative cell stored as u32
+    s.tgt = {60, 7};
+    auto t = open_bytes(with_run({{"SRCH", synth::encode(s)}}));
+    print_issues(*t);
+    CHECK(!t->chunks()[1].corrupt);
+    CHECK_EQ(t->error_count(), 0u);
+    CHECK_EQ(t->warning_count(), 1u);
+    const rv::Search &x = t->searches()[0];
+    CHECK(x.valid);
+    CHECK_EQ(x.nsrc, 3u);
+    CHECK_EQ(x.ntgt, 2u);
+    CHECK_EQ(x.nsrc_kept, 2u);
+    CHECK_EQ(x.ntgt_kept, 1u);
+    CHECK(std::vector<std::uint32_t>(x.src(), x.src() + x.nsrc_kept) == std::vector<std::uint32_t>({3, 4}));
+    CHECK_EQ(x.tgt()[0], 7u);
+    // Without `error` the same cells make the chunk corrupt, and a path
+    // cell outside the grid always does.
+    s.flags = 0;
+    auto t2 = open_bytes(with_run({{"SRCH", synth::encode(s)}}));
+    CHECK(t2->chunks()[1].corrupt);
+    synth::WSrch p;
+    p.flags = 1u << 8;
+    p.src = {1};
+    p.path = {1, 60};
+    auto t3 = open_bytes(with_run({{"SRCH", synth::encode(p)}}));
+    CHECK(t3->chunks()[1].corrupt);
+}
+
+TEST(open_point_5_vias_outside_the_grid) {
+    synth::WVia v;
+    v.copper_id = 0;
+    v.net = 1;
+    v.i = 6; // 6 x 5 grid
+    v.j = 1;
+    v.added = 1;
+    synth::WCmit c;
+    c.copper_id = 1;
+    c.net = 1;
+    c.path = {1, 2};
+    c.vias = {{2, 0}, {-1, 3}};
+    auto t = open_bytes(with_run({{"VIA ", synth::encode(v)}, {"CMIT", synth::encode(c)}}));
+    print_issues(*t);
+    CHECK_EQ(t->error_count(), 0u);
+    CHECK_EQ(t->warning_count(), 2u);
+    CHECK_EQ(t->copper().size(), 2u); // the via still takes copper id 0
+    CHECK(t->vias()[0].off_grid);
+    CHECK_EQ(t->copper()[1].id, 1u);
+    CHECK(!t->commits()[0].vias[0].off_grid);
+    CHECK(t->commits()[0].vias[1].off_grid);
+}
+
+TEST(open_point_6_rip_of_another_nets_copper) {
+    synth::WCmit c0;
+    c0.copper_id = 0;
+    c0.net = 1;
+    c0.path = {1, 2};
+    synth::WCmit c1 = c0;
+    c1.copper_id = 1;
+    c1.net = 2;
+    synth::WRip rip;
+    rip.net = 1;
+    rip.removed = {0, 1}; // copper 1 is net 2's
+    synth::WRip again;
+    again.net = 2;
+    again.removed = {1}; // already removed: still an error
+    auto t = open_bytes(with_run({{"SNAP", synth::encode_snap()},
+                                  {"GRDS", synth::encode(synth::make_grids(1, 30, "snapshot"))},
+                                  {"CMIT", synth::encode(c0)},
+                                  {"CMIT", synth::encode(c1)},
+                                  {"RIP ", synth::encode(rip)},
+                                  {"RIP ", synth::encode(again)}}));
+    print_issues(*t);
+    CHECK_EQ(t->copper()[0].removed_by, 5u);
+    CHECK_EQ(t->copper()[1].removed_by, 5u); // removed, as section 8 says
+    CHECK_EQ(t->error_count(), 1u);          // the second RIP: already removed
+    // warnings: another net's copper; the first list is not exactly {0};
+    // the second list is not exactly {} (nothing of net 2 is left)
+    CHECK_EQ(t->warning_count(), 3u);
 }
 
 TEST(corrupt_cmit_still_takes_a_copper_id) {
@@ -582,11 +770,19 @@ TEST(search_and_route_id_gaps_are_errors) {
     r.route_id = 9; // expected 0
     r.name = "x";
     synth::WRne e;
-    e.route_id = 0;
+    e.route_id = 9; // after the mismatch, route ids resolve by the stored id
     auto t = open_bytes(with_run({{"SRCH", synth::encode(s)}, {"RNB ", synth::encode(r)}, {"RNE ", synth::encode(e)}}));
+    print_issues(*t);
     CHECK_EQ(t->error_count(), 2u);
+    CHECK_EQ(t->warning_count(), 0u);
     CHECK(t->searches()[0].valid);
     CHECK(t->routes()[0].valid);
+    CHECK_EQ(t->routes()[0].end, 0u);
+    CHECK_EQ(t->route_index(9), 0u);
+    // The counted id no longer names it.
+    e.route_id = 0;
+    auto t2 = open_bytes(with_run({{"SRCH", synth::encode(s)}, {"RNB ", synth::encode(r)}, {"RNE ", synth::encode(e)}}));
+    CHECK_EQ(t2->error_count(), 3u);
 }
 
 TEST(net_chunks_and_totals) {

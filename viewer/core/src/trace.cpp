@@ -543,6 +543,11 @@ void Trace::process(Chunk c) {
         issue(Issue::Error, idx, c.offset,
               "corrupt " + tag_text(c.tag) + " chunk at offset " + std::to_string(c.offset) + ": " +
                   e.what());
+        // A corrupt SRCH, RNB or CMIT still takes the next id of its
+        // sequence (4.1); its table entry was added before parsing.
+        if (c.kind == Kind::Srch) search_ids_.add_unknown();
+        else if (c.kind == Kind::Rnb) route_ids_.add_unknown();
+        else if (c.kind == Kind::Cmit) copper_.back().id = copper_ids_.add_unknown();
     }
 
     if (want_snapshot_grids &&
@@ -564,14 +569,16 @@ const Run &Trace::current_run(const char *what) const {
 }
 
 void Trace::check_route_ref(std::uint32_t route_id, std::uint32_t idx, const Chunk &c, const char *what) {
-    if (route_id != kNone32 && route_id >= routes_.size()) {
+    const std::uint32_t index = route_id == kNone32 ? kNone32 : route_ids_.index_of(route_id);
+    if (route_id != kNone32 && index == kNone32) {
         issue(Issue::Error, idx, c.offset,
               std::string(what) + " refers to route_id " + std::to_string(route_id) +
                   ", which has no RNB chunk");
-    } else if (route_id != open_route_) {
+    } else if (index != open_route_) {
         issue(Issue::Warning, idx, c.offset,
               std::string(what) + " has route_id " + id_text(route_id) +
-                  " but the route_net call in progress is " + id_text(open_route_) + " (4.2, 6 rule 6)");
+                  " but the route_net call in progress is " +
+                  id_text(open_route_ == kNone32 ? kNone32 : route_ids_.id_of(open_route_)) + " (4.2, 6 rule 6)");
     }
 }
 
@@ -753,16 +760,27 @@ void Trace::on_via(Chunk &c, std::uint32_t idx) {
     v.added = r.u32("added") != 0;
     v.ctx = r.u32("ctx");
     v.route_id = r.u32("route_id");
-    if (v.i < 0 || v.i >= run.nx || v.j < 0 || v.j >= run.ny) r.fail("i, j", "cell is outside the grid");
+    // The C core clips a via outside the grid instead of rejecting it, so
+    // the chunk is valid; it is not drawn (17 open point 5).
+    if (v.i < 0 || v.i >= run.nx || v.j < 0 || v.j >= run.ny) {
+        v.off_grid = true;
+        issue(Issue::Warning, idx, c.offset,
+              "VIA cell (" + std::to_string(v.i) + ", " + std::to_string(v.j) +
+                  ") is outside the grid; the via is not drawn (3.4)");
+    }
 
     const std::uint32_t rec = static_cast<std::uint32_t>(vias_.size());
     if (v.added) {
         v.copper = static_cast<std::uint32_t>(copper_.size());
-        if (v.copper_id_field != v.copper)
+        bool mismatch = false;
+        std::uint32_t expected = 0;
+        const std::uint32_t id = copper_ids_.add(v.copper_id_field, mismatch, expected);
+        if (mismatch)
             issue(Issue::Error, idx, c.offset,
-                  "VIA copper_id " + id_text(v.copper_id_field) + ", expected " +
-                      std::to_string(v.copper) + " (4.1)");
+                  "VIA copper_id " + id_text(v.copper_id_field) + ", expected " + std::to_string(expected) +
+                      " (4.1); continuing from " + std::to_string(id));
         Copper cu;
+        cu.id = id;
         cu.chunk = idx;
         cu.session = session_;
         cu.kind = Kind::Via;
@@ -770,7 +788,7 @@ void Trace::on_via(Chunk &c, std::uint32_t idx) {
         cu.net = v.net;
         cu.record = rec;
         copper_.push_back(cu);
-        since_snap_[v.net].push_back(v.copper);
+        since_snap_[v.net].push_back(v.copper); // an index
     } else if (v.copper_id_field != kNone32) {
         issue(Issue::Error, idx, c.offset,
               "VIA with added = 0 has copper_id " + std::to_string(v.copper_id_field) +
@@ -825,7 +843,7 @@ void Trace::on_rnb(Chunk &c, std::uint32_t idx) {
     c.record = id;
     if (open_route_ != kNone32)
         issue(Issue::Warning, idx, c.offset,
-              "RNB while route_net " + std::to_string(open_route_) + " has no RNE (6 rule 6)");
+              "RNB while route_net " + std::to_string(route_ids_.id_of(open_route_)) + " has no RNE (6 rule 6)");
     open_route_ = id;
 
     current_run("RNB");
@@ -851,10 +869,13 @@ void Trace::on_rnb(Chunk &c, std::uint32_t idx) {
     rt.name = r.str("name");
     for (RoutePad &pad : rt.pads) pad.label = r.str("pad label");
     rt.valid = true;
-    if (rt.route_id_field != id)
+    bool mismatch = false;
+    std::uint32_t expected = 0;
+    const std::uint32_t rid = route_ids_.add(rt.route_id_field, mismatch, expected);
+    if (mismatch)
         issue(Issue::Error, idx, c.offset,
-              "RNB route_id " + id_text(rt.route_id_field) + ", expected " + std::to_string(id) +
-                  " (4.1)");
+              "RNB route_id " + id_text(rt.route_id_field) + ", expected " + std::to_string(expected) +
+                  " (4.1); continuing from " + std::to_string(rid));
     const std::int32_t net = rt.net;
     routes_[id] = std::move(rt);
     add_net_chunk(net, idx);
@@ -881,15 +902,17 @@ void Trace::on_rne(Chunk &c, std::uint32_t idx) {
     for (std::uint32_t k = 0; k < nfailed; ++k) e.failed.push_back(r.str("failed label"));
 
     const std::uint32_t rec = static_cast<std::uint32_t>(route_ends_.size());
-    if (e.route_id >= routes_.size()) {
+    const std::uint32_t ri = e.route_id == kNone32 ? kNone32 : route_ids_.index_of(e.route_id);
+    if (ri == kNone32) {
         issue(Issue::Error, idx, c.offset,
               "RNE refers to route_id " + id_text(e.route_id) + ", which has no RNB chunk");
     } else {
-        if (e.route_id != open_route_)
+        if (ri != open_route_)
             issue(Issue::Warning, idx, c.offset,
                   "RNE for route_id " + std::to_string(e.route_id) +
-                      " but the route_net call in progress is " + id_text(open_route_) + " (6 rule 6)");
-        Route &rt = routes_[e.route_id];
+                      " but the route_net call in progress is " +
+                      id_text(open_route_ == kNone32 ? kNone32 : route_ids_.id_of(open_route_)) + " (6 rule 6)");
+        Route &rt = routes_[ri];
         if (rt.end != kNone32)
             issue(Issue::Warning, idx, c.offset,
                   "second RNE for route_id " + std::to_string(e.route_id));
@@ -954,18 +977,34 @@ void Trace::on_srch(Chunk &c, std::uint32_t idx) {
                            std::to_string(s.ntgt) + ", npath " + std::to_string(s.npath) +
                            ", ntrace " + std::to_string(s.ntrace) +
                            "): run past the end of the payload");
+    std::uint64_t dropped = 0;
     {
         const std::vector<unsigned char> &a = payload(c, 96, eager);
-        s.cells.resize(static_cast<std::size_t>(ncells));
+        s.cells.reserve(static_cast<std::size_t>(ncells));
         const std::uint64_t limit = run.ncells();
-        for (std::size_t k = 0; k < s.cells.size(); ++k) {
+        const std::uint64_t nends = static_cast<std::uint64_t>(s.nsrc) + s.ntgt;
+        const bool error = s.has(srch_flags::kError);
+        for (std::size_t k = 0; k < static_cast<std::size_t>(ncells); ++k) {
             const std::uint32_t cell = get_u32(a.data() + 4 * k);
-            if (cell >= limit)
+            if (cell >= limit) {
+                // A search that raised may hold the invalid sources or
+                // targets it raised about (3.4, 17 open point 4): drop them.
+                if (error && k < nends) {
+                    ++dropped;
+                    continue;
+                }
                 throw CorruptChunk("SRCH cell " + std::to_string(cell) + " is outside the grid (" +
                                    std::to_string(limit) + " cells)");
-            s.cells[k] = cell;
+            }
+            if (k < s.nsrc) ++s.nsrc_kept;
+            else if (k < nends) ++s.ntgt_kept;
+            s.cells.push_back(cell);
         }
     }
+    if (dropped > 0)
+        issue(Issue::Warning, idx, c.offset,
+              "search " + std::to_string(id) + " (error set) has " + std::to_string(dropped) +
+                  " source or target cells outside the grid; they are not shown");
     if (s.enc == 0 && s.ntrace > 0) {
         s.trace_cell_offset = c.payload_offset() + 96 + eager;
         if (has_costs) s.trace_d_offset = s.trace_cell_offset + 4ull * s.ntrace;
@@ -974,13 +1013,13 @@ void Trace::on_srch(Chunk &c, std::uint32_t idx) {
     // Which arrays hold this search's wavefront (7.11 "Repeats").
     const bool has_trace = s.has(srch_flags::kHasTrace);
     if (s.repeat_of != kNone32) {
-        const std::uint32_t t = s.repeat_of;
-        bool ok = t < id && searches_[t].valid && searches_[t].repeat_of == kNone32 &&
+        const std::uint32_t t = search_ids_.index_of(s.repeat_of);
+        bool ok = t != kNone32 && t < id && searches_[t].valid && searches_[t].repeat_of == kNone32 &&
                   searches_[t].trace_source == t && searches_[t].chunk < chunks_.size() &&
                   chunks_[searches_[t].chunk].session == session_;
         if (!ok) {
             issue(Issue::Warning, idx, c.offset,
-                  "search " + std::to_string(id) + " repeats search " + std::to_string(t) +
+                  "search " + std::to_string(id) + " repeats search " + std::to_string(s.repeat_of) +
                       ", which is not an earlier non-repeat search with a wavefront in this session;"
                       " the search has no wavefront");
         } else {
@@ -1005,9 +1044,15 @@ void Trace::on_srch(Chunk &c, std::uint32_t idx) {
         issue(Issue::Warning, idx, c.offset,
               "search " + std::to_string(id) + " stores ntrace " + std::to_string(s.ntrace) +
                   " > ntrace_total " + std::to_string(s.ntrace_total));
-    if (s.id_field != id)
-        issue(Issue::Error, idx, c.offset,
-              "SRCH search_id " + id_text(s.id_field) + ", expected " + std::to_string(id) + " (4.1)");
+    {
+        bool mismatch = false;
+        std::uint32_t expected = 0;
+        const std::uint32_t sid = search_ids_.add(s.id_field, mismatch, expected);
+        if (mismatch)
+            issue(Issue::Error, idx, c.offset,
+                  "SRCH search_id " + id_text(s.id_field) + ", expected " + std::to_string(expected) +
+                      " (4.1); continuing from " + std::to_string(sid));
+    }
     check_route_ref(s.route_id, idx, c, "SRCH");
 
     // expanded is any i64 in a corrupt file: saturate instead of overflowing.
@@ -1062,19 +1107,32 @@ void Trace::on_cmit(Chunk &c, std::uint32_t idx) {
     }
     r.need_records(nvia, 8, "vias");
     m.vias.resize(nvia);
+    std::uint32_t off_grid = 0;
     for (GridPoint &v : m.vias) {
         v.i = r.i32("via i");
         v.j = r.i32("via j");
-        if (v.i < 0 || v.i >= run.nx || v.j < 0 || v.j >= run.ny) r.fail("via", "cell is outside the grid");
+        // A path not in canonical form can make commit() add a via outside
+        // the grid; the chunk is valid, the via is not drawn (17 open point 5).
+        if (v.i < 0 || v.i >= run.nx || v.j < 0 || v.j >= run.ny) {
+            v.off_grid = true;
+            ++off_grid;
+        }
     }
     r.u32_array(m.path, npath, "path");
     const std::uint64_t limit = run.ncells();
     for (std::uint32_t cell : m.path)
         if (cell >= limit) r.fail("path", "cell is outside the grid");
 
-    if (m.copper_id_field != k)
+    if (off_grid > 0)
+        issue(Issue::Warning, idx, c.offset,
+              "CMIT has " + std::to_string(off_grid) + " vias outside the grid; they are not drawn (3.4)");
+    bool mismatch = false;
+    std::uint32_t expected = 0;
+    copper_[k].id = copper_ids_.add(m.copper_id_field, mismatch, expected);
+    if (mismatch)
         issue(Issue::Error, idx, c.offset,
-              "CMIT copper_id " + id_text(m.copper_id_field) + ", expected " + std::to_string(k) + " (4.1)");
+              "CMIT copper_id " + id_text(m.copper_id_field) + ", expected " + std::to_string(expected) +
+                  " (4.1); continuing from " + std::to_string(copper_[k].id));
     check_route_ref(m.route_id, idx, c, "CMIT");
     const std::uint32_t rec = static_cast<std::uint32_t>(commits_.size());
     copper_[k].valid = true;
@@ -1100,7 +1158,7 @@ void Trace::on_rbld(Chunk &c, std::uint32_t idx) {
     b.names.reserve(n);
     for (std::uint32_t k = 0; k < n; ++k) b.names.push_back(r.str("name"));
     check_route_ref(b.route_id, idx, c, "RBLD");
-    const std::uint32_t route = b.route_id;
+    const std::uint32_t route = b.route_id == kNone32 ? kNone32 : route_ids_.index_of(b.route_id);
     c.record = static_cast<std::uint32_t>(rebuilds_.size());
     rebuilds_.push_back(std::move(b));
     if (route < routes_.size() && routes_[route].valid) add_net_chunk(routes_[route].net, idx);
@@ -1126,44 +1184,55 @@ void Trace::on_rip(Chunk &c, std::uint32_t idx) {
         }
     check_route_ref(rp.route_id, idx, c, "RIP");
 
+    // 7.14: the ids this RIP should list are the net's copper of this
+    // session created since its last SNAP (since its RUN without one) and
+    // not removed yet.  Before the session's first SNAP an empty list is
+    // valid too: the router may never have been snapshotted (17 open
+    // point 1).  Computed before the removal is applied.
+    std::vector<std::uint32_t> expected;
+    auto it = since_snap_.find(rp.net);
+    if (it != since_snap_.end())
+        for (std::uint32_t ix : it->second)
+            if (copper_[ix].removed_by == kNone32) expected.push_back(copper_[ix].id);
+
     // Apply: each listed copper item ends here (8).
     for (std::uint32_t id : rp.removed) {
-        if (id >= copper_.size()) {
+        const std::uint32_t ix = copper_ids_.index_of(id);
+        if (ix == kNone32) {
             issue(Issue::Error, idx, c.offset,
                   "RIP removes copper id " + std::to_string(id) + ", which does not exist");
             continue;
         }
-        Copper &cu = copper_[id];
+        Copper &cu = copper_[ix];
         if (cu.session != session_) {
             issue(Issue::Error, idx, c.offset,
                   "RIP removes copper id " + std::to_string(id) + " from an earlier router session");
-        } else if (cu.valid && cu.net != rp.net) {
-            issue(Issue::Error, idx, c.offset,
-                  "RIP of net " + std::to_string(rp.net) + " removes copper id " + std::to_string(id) +
-                      " of net " + std::to_string(cu.net));
         } else if (cu.removed_by != kNone32) {
             issue(Issue::Error, idx, c.offset,
                   "RIP removes copper id " + std::to_string(id) + ", already removed by chunk " +
                       std::to_string(cu.removed_by));
         } else {
+            // Another net's copper of this session is removed too, as 8
+            // says, with a warning (17 open point 6).
+            if (cu.valid && cu.net != rp.net)
+                issue(Issue::Warning, idx, c.offset,
+                      "RIP of net " + std::to_string(rp.net) + " removes copper id " + std::to_string(id) +
+                          " of net " + std::to_string(cu.net) + " (7.14)");
             cu.removed_by = idx;
+            rp.applied.push_back(ix);
             ++copper_removed_;
         }
     }
-    // 7.14: exactly the net's copper created since the last SNAP and not
-    // ripped yet; nothing before the first SNAP of the session.
-    std::vector<std::uint32_t> expected;
-    auto it = since_snap_.find(rp.net);
-    if (snapped_ && it != since_snap_.end()) expected = it->second;
-    if (expected != rp.removed) {
+    const bool exact = rp.removed == expected || (!snapped_ && rp.removed.empty());
+    if (!exact) {
         std::string want;
         for (std::size_t k = 0; k < expected.size() && k < 8; ++k) want += (k ? "," : "") + std::to_string(expected[k]);
         if (expected.size() > 8) want += ",...";
         issue(Issue::Warning, idx, c.offset,
               "RIP of net " + std::to_string(rp.net) + " lists " + std::to_string(rp.removed.size()) +
-                  " copper ids, but the copper it should remove is {" + want + "} (7.14)");
+                  " copper ids, but the copper it should remove is {" + want + "}" +
+                  (snapped_ ? "" : " or nothing") + " (7.14)");
     }
-    if (it != since_snap_.end()) since_snap_.erase(it);
 
     const std::int32_t net = rp.net;
     c.record = static_cast<std::uint32_t>(rips_.size());
@@ -1432,8 +1501,8 @@ std::string Trace::describe(std::uint32_t idx) const {
     case Kind::Via: {
         const Via &x = vias_[k];
         o << "add_via net " << x.net << " cell (" << x.i << ", " << x.j << ") power " << x.power
-          << (x.added ? " added, copper " + std::to_string(x.copper) : std::string(" not added"))
-          << ", ctx " << x.ctx << ", route " << id_text(x.route_id);
+          << (x.added ? " added, copper " + std::to_string(copper_[x.copper].id) : std::string(" not added"))
+          << ", ctx " << x.ctx << ", route " << id_text(x.route_id) << (x.off_grid ? ", outside the grid" : "");
         break;
     }
     case Kind::Snap:
@@ -1472,7 +1541,7 @@ std::string Trace::describe(std::uint32_t idx) const {
     }
     case Kind::Cmit: {
         const Commit &x = commits_[k];
-        o << "commit, copper " << x.copper << ": net " << x.net << ", ctx " << x.ctx << ", route "
+        o << "commit, copper " << copper_[x.copper].id << ": net " << x.net << ", ctx " << x.ctx << ", route "
           << id_text(x.route_id) << ", path " << x.path.size() << ", " << x.stubs.size()
           << " stubs, " << x.vias.size() << " vias, width " << num(x.width_mm) << " mm, flags "
           << hex(x.flags);

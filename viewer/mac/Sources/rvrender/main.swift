@@ -1,14 +1,19 @@
-// rvrender: draw a trace's board to a PNG without a window, compare two
-// PNGs, or time full redraws.  Uses RVKit's DisplayListRenderer, the same
-// code the app draws with.
+// rvrender: draw a trace's board and router overlay to a PNG without a
+// window, compare two PNGs, time redraws, or check playback.  Uses RVKit's
+// LayeredRenderer, the same code the app draws with.
 //
 //   rvrender FILE OUT.png [--size WxH] [--board N] [--layers a,b,c | --all-layers]
 //                         [--hide-classes i,j] [--fit | --window x0,y0,x1,y1]
+//                         [--at FRACTION | --event N]
+//   rvrender FILE OUTDIR --frames N [same options]     N frames evenly through the run
 //   rvrender --compare GOLDEN.png NEW.png [--tolerance T] [--max-fraction F]
 //   rvrender --bench FILE [--size WxH] [--frames N] [--board N]
+//   rvrender --bench-playback FILE [--size WxH] [--speed S] [--frames N] [--bands B]
+//   rvrender --selftest FILE [--size WxH]
 //
-// Exit status 0 on success (and for --compare, images within tolerance),
-// 1 on failure, 2 for bad usage.
+// Without --at or --event the position is the end of the run (as after
+// opening a trace in the app).  Exit status 0 on success (and for
+// --compare, images within tolerance), 1 on failure, 2 for bad usage.
 
 import CoreGraphics
 import Foundation
@@ -24,14 +29,19 @@ func usage() -> Never {
     fail("""
     usage: rvrender FILE OUT.png [--size WxH] [--board N] [--layers a,b,c | --all-layers]
                                  [--hide-classes i,j] [--fit | --window x0,y0,x1,y1]
+                                 [--at FRACTION | --event N]
+           rvrender FILE OUTDIR --frames N [options as above]
            rvrender --compare GOLDEN.png NEW.png [--tolerance T] [--max-fraction F]
            rvrender --bench FILE [--size WxH] [--frames N] [--board N]
+           rvrender --bench-playback FILE [--size WxH] [--speed S] [--frames N] [--bands B]
+           rvrender --selftest FILE [--size WxH]
     """, code: 2)
 }
 
 struct Options {
     var positional: [String] = []
     var width = 1600, height = 1000
+    var sizeGiven = false
     var board: UInt32?
     var layers: [String]?
     var allLayers = false
@@ -40,7 +50,12 @@ struct Options {
     var tolerance = 48
     var maxFraction = 0.002
     var frames = 60
+    var framesGiven = false
     var profile = false
+    var at: Double?
+    var event: UInt32?
+    var speed = 8.0
+    var bands = 0
 }
 
 func parseOptions(_ args: ArraySlice<String>) -> Options {
@@ -60,6 +75,7 @@ func parseOptions(_ args: ArraySlice<String>) -> Options {
             guard v.count == 2, v[0] > 0, v[1] > 0, v[0] <= 16384, v[1] <= 16384 else { usage() }
             o.width = v[0]
             o.height = v[1]
+            o.sizeGiven = true
         case "--board":
             guard let n = UInt32(value(a)) else { usage() }
             o.board = n
@@ -81,23 +97,45 @@ func parseOptions(_ args: ArraySlice<String>) -> Options {
         case "--frames":
             guard let n = Int(value(a)), n > 0 else { usage() }
             o.frames = n
+            o.framesGiven = true
+        case "--at":
+            guard let f = Double(value(a)), f >= 0, f <= 1 else { usage() }
+            o.at = f
+        case "--event":
+            guard let n = UInt32(value(a)) else { usage() }
+            o.event = n
+        case "--speed":
+            guard let s = Double(value(a)), s > 0 else { usage() }
+            o.speed = s
+        case "--bands":
+            guard let n = Int(value(a)), n >= 0 else { usage() }
+            o.bands = n
         default:
             if a.hasPrefix("--") { usage() }
             o.positional.append(a)
         }
     }
+    if o.at != nil && o.event != nil { usage() }
     return o
 }
 
 // MARK: - Session set-up
 
 @MainActor
-func openSession(_ path: String, _ o: Options) -> Session {
+func openSession(_ path: String, _ o: Options, needBoard: Bool = true) -> Session {
     do {
         let s = try Session()
         try s.open(path: path)
         try s.selectBoard(o.board)
-        if try s.selectedBoard() == nil { fail("\(path): no board to draw") }
+        if let f = o.at { try s.seek(fraction: f) }
+        if let e = o.event {
+            let count = try s.position().eventCount
+            if e >= count { fail("\(path): no event \(e) (the run has \(count))") }
+            try s.seek(event: e)
+        }
+        if needBoard, try s.selectedBoard() == nil, try s.displayList()?.batches.isEmpty ?? true {
+            fail("\(path): nothing to draw (no board and no router outline)")
+        }
         let layers = try s.layers()
         if let wanted = o.layers {
             let names = Set(layers.map(\.name))
@@ -124,6 +162,13 @@ func openSession(_ path: String, _ o: Options) -> Session {
     } catch {
         fail("\(path): \(error)")
     }
+}
+
+/// Give the renderer the session's current lists.
+@MainActor
+func sync(_ s: Session, _ r: LayeredRenderer) throws(CoreError) {
+    if let list = try s.displayList(ifChangedSince: r.boardList?.generation) { r.update(board: list) }
+    if let o = try s.overlay(ifChangedSince: r.overlayList?.generation) { r.update(overlay: o) }
 }
 
 /// An RGBA8 sRGB bitmap context, flipped so that y goes down like a view.
@@ -192,20 +237,71 @@ func pixels(of img: CGImage) -> (width: Int, height: Int, pixels: [UInt8]) {
     return (w, h, pixels)
 }
 
+func median(_ v: [Double]) -> Double {
+    guard !v.isEmpty else { return 0 }
+    let s = v.sorted()
+    return s[s.count / 2]
+}
+
+func percentile(_ v: [Double], _ p: Double) -> Double {
+    guard !v.isEmpty else { return 0 }
+    let s = v.sorted()
+    return s[min(s.count - 1, Int(Double(s.count) * p))]
+}
+
 // MARK: - Modes
 
 @MainActor
 func render(_ o: Options) -> Int32 {
     guard o.positional.count == 2 else { usage() }
+    if o.framesGiven { return frames(o) }
     let s = openSession(o.positional[0], o)
-    let renderer = DisplayListRenderer()
+    let r = LayeredRenderer()
     do {
-        guard let list = try s.displayList() else { fail("no display list") }
-        renderer.update(list)
-        // The app's path: parallel bands into one bitmap.
-        guard let image = renderer.renderImage(view: try s.view()) else { fail("cannot make the image") }
+        try sync(s, r)
+        guard let image = r.composite(view: try s.view()) else { fail("cannot make the image") }
         writePNG(image, to: o.positional[1])
-        print("rvrender: \(o.positional[1]): \(o.width) x \(o.height), \(renderer.batchCount) batches")
+        let p = try s.position()
+        let at = p.event.map { "event index \($0) of \(p.eventCount) events" } ?? "no events"
+        print("rvrender: \(o.positional[1]): \(o.width) x \(o.height), \(r.boardBatchCount) board + "
+              + "\(r.overlayBatchCount) overlay batches, \(at)")
+        if p.event != nil {
+            print("  copper \(p.copperAlive), ghosts \(p.ghosts), failed pads \(p.failures)"
+                  + (p.routedHidden ? " (router copper hidden: the board holds it)" : "") + "; "
+                  + (try s.text(.caption)))
+        }
+        return 0
+    } catch {
+        fail("\(error)")
+    }
+}
+
+/// N frames evenly spaced from the start to the end of the run.
+@MainActor
+func frames(_ o: Options) -> Int32 {
+    let dir = o.positional[1]
+    do {
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    } catch {
+        fail("cannot create \(dir): \(error)")
+    }
+    var o2 = o
+    o2.at = 0
+    o2.event = nil
+    let s = openSession(o.positional[0], o2, needBoard: false)
+    let r = LayeredRenderer()
+    do {
+        let n = o.frames
+        for k in 0..<n {
+            let f = n == 1 ? 1.0 : Double(k) / Double(n - 1)
+            let changed = try s.seek(fraction: f)
+            if changed.contains(.board), o.window == nil { try s.zoomToFit() }
+            try sync(s, r)
+            guard let image = r.composite(view: try s.view()) else { fail("cannot make the image") }
+            let path = (dir as NSString).appendingPathComponent(String(format: "frame_%04d.png", k))
+            writePNG(image, to: path)
+            print(String(format: "%@  %.3f  %@", (path as NSString).lastPathComponent, f, try s.text(.caption)))
+        }
         return 0
     } catch {
         fail("\(error)")
@@ -354,10 +450,334 @@ func bench(_ o: Options) -> Int32 {
     }
 }
 
+/// Playback from the start through the core clock at 60 frames a second
+/// of wall time (simulated, not waited for), as the app's display link
+/// drives it.  A frame's cost: the clock, the overlay copy and the
+/// re-rasterising of the planes that changed (the static slabs are cached).
+@MainActor
+func benchPlayback(_ o: Options) -> Int32 {
+    guard o.positional.count == 1 else { usage() }
+    var o2 = o
+    o2.at = 0
+    let s = openSession(o.positional[0], o2, needBoard: false)
+    let r = LayeredRenderer()
+    r.bands = o.bands
+    do {
+        try s.setSpeed(o.speed)
+        let p0 = try s.position()
+        let view = try s.view()
+        try sync(s, r)
+        r.render(view: view)
+        // A camera change redraws every plane: time that at the start and,
+        // below, at the end of the run.
+        func fullRedraw() -> [Double] {
+            (0..<10).map { _ in
+                r.invalidate()
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                r.render(view: view)
+                return Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+            }
+        }
+        let fullStart = fullRedraw()
+        try s.setPlaying(true)
+        let dt = 1.0 / 60
+        let limit = o.framesGiven ? o.frames : Int.max
+        var all: [Double] = [], dynamic: [Double] = [], core: [Double] = [], raster: [Double] = []
+        var pixels: [Double] = []
+        var planesRendered = 0, boardFrames = 0, frames = 0
+        var playing = true
+        while frames < limit && playing {
+            // As the app's run loop does each frame: release what Core
+            // Graphics autoreleased.
+            try autoreleasepool { () throws -> Void in
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                let changed = try s.advance(by: dt)
+                try sync(s, r)
+                let t1 = DispatchTime.now().uptimeNanoseconds
+                let n = r.render(view: view)
+                let t2 = DispatchTime.now().uptimeNanoseconds
+                frames += 1
+                let ms = Double(t2 - t0) / 1e6
+                all.append(ms)
+                core.append(Double(t1 - t0) / 1e6)
+                if changed.contains(.board) {
+                    boardFrames += 1
+                } else if n > 0 {
+                    dynamic.append(ms)
+                    raster.append(Double(t2 - t1) / 1e6)
+                    pixels.append(Double(r.lastRenderedPixels))
+                }
+                planesRendered += n
+                playing = try s.position().playing
+            }
+        }
+        let p = try s.position()
+        print(String(format: "rvrender: playback bench %@ at %d x %d px, speed %gx, %d events, run %.1f s",
+                     o.positional[0], o.width, o.height, try s.position().speed, p0.eventCount, p0.total))
+        print(String(format: "  %d frames (%.1f s at 60 fps), %d redrew planes (%d planes), %d with a new board, end reached: %@",
+                     frames, Double(frames) / 60, dynamic.count, planesRendered, boardFrames, p.atEnd ? "yes" : "no"))
+        func row(_ label: String, _ v: [Double]) {
+            print("  " + label.padding(toLength: 40, withPad: " ", startingAt: 0)
+                  + String(format: " median %6.2f ms   p90 %6.2f ms   p99 %6.2f ms   worst %6.2f ms",
+                           median(v), percentile(v, 0.9), percentile(v, 0.99), v.max() ?? 0))
+        }
+        row("every frame", all)
+        row("dynamic-only frames (planes redrawn)", dynamic)
+        row("  of which rasterising + images", raster)
+        row("  core: clock + overlay copy, all frames", core)
+        print(String(format: "  pixels rasterised per dynamic frame: median %.0f (view %d)", median(pixels),
+                     o.width * o.height))
+        let fullEnd = fullRedraw()
+        let nonEmpty = r.planes.filter { $0.image != nil }.count
+        row("full redraw (pan/zoom), start of run", fullStart)
+        row("full redraw (pan/zoom), end of run", fullEnd)
+        let bytes = r.planes.reduce(0) { $0 + Int($1.pixelRect.width * $1.pixelRect.height) * 4 }
+        print("  planes at the end: \(r.planes.count), \(nonEmpty) with content, "
+              + String(format: "%.1f MB of bitmaps", Double(bytes) / 1e6))
+        return 0
+    } catch {
+        fail("\(error)")
+    }
+}
+
+// MARK: - Self-test
+
+/// Plays the run from start to end through the core clock (accelerated:
+/// large time steps), seeks to positions in both directions, renders at
+/// each, compares the layered picture with a single-pass render, checks
+/// that seeking to the same position from either side gives the same
+/// picture, and checks the router copper against the ROUT chunk.
+@MainActor
+func selfTest(_ o: Options) -> Int32 {
+    guard o.positional.count == 1 else { usage() }
+    var o2 = o
+    if !o.sizeGiven {
+        o2.width = 800
+        o2.height = 500
+    }
+    let file = o.positional[0]
+    let s = openSession(file, o2, needBoard: false)
+    // r: as the app draws (cropped slot planes, parallel bands); strict:
+    // whole-view planes in one band, which must match a single-pass render
+    // exactly.  Both are updated incrementally all the way.
+    let r = LayeredRenderer()
+    let strict = LayeredRenderer()
+    strict.cropsSlots = false
+    strict.bands = 1
+    var failures: [String] = []
+    func check(_ ok: Bool, _ what: @autoclosure () -> String) {
+        if !ok { failures.append(what()) }
+    }
+    do {
+        let tl = try s.timeline()
+        let view0 = try s.view()
+        func picture() throws(CoreError) -> CGImage {
+            try sync(s, r)
+            guard let image = r.composite(view: try s.view()) else { fail("cannot make the image") }
+            return image
+        }
+        var compared = 0, worstLoose = 0
+        func compareSinglePass(_ label: String) throws(CoreError) {
+            compared += 1
+            let view = try s.view()
+            try sync(s, strict)
+            guard let exact = strict.composite(view: view), let exactSingle = strict.renderSinglePass(view: view)
+            else { fail("cannot make the image") }
+            let (n0, worst0) = differingPixels(exact, exactSingle, tolerance: 3)
+            check(n0 == 0, "\(label): whole-view planes and the single-pass picture differ in \(n0) pixels "
+                  + "(largest \(worst0))")
+            dumpMismatch(n0, exact, exactSingle, "strict_\(compared)")
+            // The app's configuration: edge pixels of thin strokes may differ
+            // (see LayeredRenderer.cropsSlots); nothing more.
+            let layered = try picture()
+            guard let single = r.renderSinglePass(view: view) else { fail("cannot make the image") }
+            let (n, worst) = differingPixels(layered, single, tolerance: 48)
+            let limit = layered.width * layered.height / 2000
+            worstLoose = max(worstLoose, n)
+            check(n <= limit, "\(label): layered and single-pass pictures differ by more than 48 in \(n) pixels "
+                  + "(limit \(limit), largest \(worst))")
+            dumpMismatch(n > limit ? n : 0, layered, single, "app_\(compared)")
+        }
+        // RVRENDER_SELFTEST_DUMP=DIR keeps both pictures of a mismatch and a
+        // picture of the differing pixels.
+        func dumpMismatch(_ n: Int, _ layered: CGImage, _ single: CGImage, _ name: String) {
+            if n != 0, let dir = ProcessInfo.processInfo.environment["RVRENDER_SELFTEST_DUMP"] {
+                let stem = (dir as NSString).appendingPathComponent("mismatch_\(name)")
+                writePNG(layered, to: stem + "_layered.png")
+                writePNG(single, to: stem + "_single.png")
+                let pa = pixels(of: layered), pb = pixels(of: single)
+                var x0 = Int.max, y0 = Int.max, x1 = -1, y1 = -1
+                var diff = [UInt8](repeating: 0, count: pa.pixels.count)
+                for i in stride(from: 0, to: pa.pixels.count, by: 4) {
+                    var d = 0
+                    for c in 0..<4 { d = max(d, abs(Int(pa.pixels[i + c]) - Int(pb.pixels[i + c]))) }
+                    diff[i + 3] = 255
+                    for c in 0..<3 { diff[i + c] = pa.pixels[i + c] / 4 }
+                    if d > 3 {
+                        let x = (i / 4) % pa.width, y = (i / 4) / pa.width
+                        x0 = min(x0, x)
+                        y0 = min(y0, y)
+                        x1 = max(x1, x)
+                        y1 = max(y1, y)
+                        diff[i] = 255
+                        diff[i + 1] = 255
+                        diff[i + 2] = 255
+                    }
+                }
+                diff.withUnsafeMutableBytes { raw in
+                    if let ctx = CGContext(data: raw.baseAddress, width: pa.width, height: pa.height,
+                                           bitsPerComponent: 8, bytesPerRow: pa.width * 4,
+                                           space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                           bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       let img = ctx.makeImage() {
+                        writePNG(img, to: stem + "_diff.png")
+                    }
+                }
+                print("selftest: mismatch \(name) differs within x \(x0)...\(x1), y \(y0)...\(y1)")
+            }
+        }
+        print("selftest: \(file): \(tl.events.count) events, run \(String(format: "%.1f", tl.total)) s, "
+              + "\(tl.phases.count) phases, \(tl.ripTicks.count) rip-ups, \(tl.failureTicks.count) failure ticks")
+
+        // 1. Play from the start to the end in about 200 accelerated steps.
+        try s.jump(toEnd: false)
+        try s.setSpeed(64)
+        let speed = try s.position().speed
+        try s.setPlaying(true)
+        let dt = max(tl.total / speed / 200, 1e-3)
+        var last = -1.0, steps = 0, overlayChanges = 0, boardChanges = 0, maxGhosts: UInt32 = 0
+        var maxCopper: UInt32 = 0, renders = 0
+        while try s.position().playing, steps < 100_000 {
+            let changed = try s.advance(by: dt)
+            let p = try s.position()
+            check(p.time >= last, "playing went backwards: \(p.time) after \(last)")
+            last = p.time
+            if changed.contains(.overlay) { overlayChanges += 1 }
+            if changed.contains(.board) { boardChanges += 1 }
+            maxGhosts = max(maxGhosts, p.ghosts)
+            maxCopper = max(maxCopper, p.copperAlive)
+            try sync(s, r)
+            renders += r.render(view: view0)
+            try sync(s, strict)
+            strict.render(view: view0)
+            if steps % 40 == 20 { try compareSinglePass(String(format: "playing, t = %.2f s", p.time)) }
+            steps += 1
+        }
+        let pend = try s.position()
+        check(tl.events.isEmpty || pend.atEnd, "playing stopped before the end (t = \(pend.time) of \(pend.total))")
+        check(!pend.playing, "still playing at the end")
+        if !tl.events.isEmpty {
+            check(overlayChanges > 0 || maxCopper == 0, "the overlay never changed while playing")
+        }
+        if !tl.ripTicks.isEmpty && steps >= 100 {
+            check(maxGhosts > 0, "no ghost seen while playing through \(tl.ripTicks.count) rip-ups")
+        }
+        print("selftest: played \(steps) steps: \(overlayChanges) overlay changes, \(boardChanges) board changes, "
+              + "\(renders) planes redrawn, most copper \(maxCopper), most ghosts \(maxGhosts)")
+
+        // 2. Seek in both directions; the same position from either side
+        // gives the same picture.
+        if !tl.events.isEmpty {
+            var seen: [Double: CGImage] = [:]
+            let fractions = [0.9, 0.5, 0.1, 0.5, 0.25, 0.75, 0.25, 1.0, 0.0, 0.75, 0.6, 0.4]
+            var matches = 0
+            for f in fractions {
+                try s.seek(fraction: f)
+                // The strict renderer: one band, so the pictures are reproducible.
+                try sync(s, strict)
+                guard let image = strict.composite(view: try s.view()) else { fail("cannot make the image") }
+                if let before = seen[f] {
+                    let (n, worst) = differingPixels(before, image, tolerance: 0)
+                    check(n == 0, "seek to \(f) from the other side: \(n) pixels differ (largest \(worst))")
+                    matches += 1
+                } else {
+                    seen[f] = image
+                }
+                try compareSinglePass("seek \(f)")
+            }
+            // Stepping lands on event starts and pauses.
+            try s.jump(toEnd: false)
+            let c1 = try s.step(.commit, direction: 1)
+            if !c1.isEmpty {
+                let p = try s.position()
+                check(p.fraction == 0 && !p.playing, "step to a commit: fraction \(p.fraction), playing \(p.playing)")
+            }
+            print("selftest: \(fractions.count) seeks, \(matches) revisited from the other side")
+        }
+
+        // 3. The router copper against the ROUT chunk: at the event that
+        // applies the last ROUT, the router vias drawn are ROUT's vias.
+        let facts = try s.facts()
+        var rout: UInt32?
+        for i in 0..<facts.chunkCount {
+            if try s.chunkTag(i) == "ROUT" { rout = i }
+        }
+        if let rout, !tl.events.isEmpty {
+            let text = try s.chunkText(rout)
+            let numbers = text.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+            // "routes(): N segments, M vias"
+            let routSegs = numbers.count >= 2 ? numbers[numbers.count - 2] : -1
+            let routVias = numbers.last ?? -1
+            guard var e = tl.events.firstIndex(where: { $0.lastChunk >= rout }) else { fail("no event applies ROUT") }
+            try s.seek(event: UInt32(e))
+            var p = try s.position()
+            // When that event brings a board that holds the routing (it
+            // hides the router copper), compare at the event before it: an
+            // event that changes no copper shows the same router copper.
+            let copperKinds: [TimelineEvent.Kind] = [.commit, .via, .ripUp, .session]
+            if p.routedHidden, e > 0, !copperKinds.contains(tl.events[e].kind) {
+                e -= 1
+                try s.seek(event: UInt32(e))
+                p = try s.position()
+            }
+            try sync(s, r)
+            guard let overlay = r.overlayList else { fail("no overlay") }
+            var vias = Set<String>(), routedBatches = 0
+            for b in overlay.batches where b.objectClass == DisplayBatch.routedClass {
+                let sub = b.order & 0xFF
+                if sub == 0x38 { routedBatches += 1 }
+                if sub == 0x3A && b.primitive == .disc {
+                    for k in b.first..<(b.first + b.count) {
+                        vias.insert(String(format: "%.3f,%.3f", overlay.circles[3 * k], overlay.circles[3 * k + 1]))
+                    }
+                }
+            }
+            if p.routedHidden {
+                print("selftest: ROUT at event \(e): router copper hidden by the board there; not compared")
+            } else {
+                check(vias.count == routVias, "ROUT has \(routVias) vias, the overlay draws \(vias.count) at event \(e)")
+                check(routSegs <= 0 || routedBatches > 0, "ROUT has \(routSegs) segments, the overlay draws no copper")
+                print("selftest: ROUT (\(text)) at event \(e): \(p.copperAlive) copper items alive, "
+                      + "\(vias.count) router vias drawn, \(routedBatches) copper batches")
+            }
+            try compareSinglePass("ROUT event \(e)")
+        }
+
+        // 4. The end: the default position after opening.
+        try s.jump(toEnd: true)
+        let pe = try s.position()
+        try compareSinglePass("end")
+        print("selftest: end: copper \(pe.copperAlive), hidden by the board: \(pe.routedHidden ? "yes" : "no"), "
+              + "failed pads \(pe.failures)")
+        print("selftest: \(compared) positions compared with single-pass renders; cropped planes: at most "
+              + "\(worstLoose) pixels off by more than 48")
+    } catch {
+        failures.append("\(error)")
+    }
+    if failures.isEmpty {
+        print("selftest ok")
+        return 0
+    }
+    for f in failures { FileHandle.standardError.write(Data("selftest FAILED: \(f)\n".utf8)) }
+    return 1
+}
+
 let args = CommandLine.arguments.dropFirst()
 guard let first = args.first else { usage() }
 switch first {
 case "--compare": exit(compare(parseOptions(args.dropFirst())))
 case "--bench": exit(bench(parseOptions(args.dropFirst())))
+case "--bench-playback": exit(benchPlayback(parseOptions(args.dropFirst())))
+case "--selftest": exit(selfTest(parseOptions(args.dropFirst())))
 default: exit(render(parseOptions(args)))
 }

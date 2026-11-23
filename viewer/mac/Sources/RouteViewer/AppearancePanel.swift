@@ -100,16 +100,17 @@ final class AppearancePanel: NSView {
         boardPopup.removeAllItems()
         let boards = (try? session.boards()) ?? []
         let selected = try? session.selectedBoard()
-        let latest = boards.last.map { " (\($0.label.isEmpty ? "#\($0.index + 1)" : $0.label))" } ?? ""
-        boardPopup.addItem(withTitle: "Latest board\(latest)")
+        // The default: the latest board at or before the playback position.
+        boardPopup.addItem(withTitle: "Board at the playhead")
         boardPopup.lastItem?.tag = -1
+        boardPopup.lastItem?.toolTip = "The latest board recorded at or before the playback position"
         for b in boards {
             boardPopup.addItem(withTitle: "\(b.index + 1): \(b.label.isEmpty ? "board" : b.label)")
             boardPopup.lastItem?.tag = Int(b.index)
             boardPopup.lastItem?.toolTip = "\(b.layerCount) layers, \(b.footprintCount) footprints, \(b.recordCount) records"
         }
         boardPopup.isEnabled = !boards.isEmpty
-        // "Latest" stays chosen while the session follows the latest board.
+        // "At the playhead" stays chosen while the session follows the position.
         if followsLatest || selected == nil {
             boardPopup.selectItem(withTag: -1)
         } else if let selected {
