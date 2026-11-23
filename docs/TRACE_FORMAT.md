@@ -8,7 +8,8 @@ between the Python recorder (writer, `gridrouter/recorder.py` and
 reader (`viewer/core`). Each side is implemented from this document alone.
 
 - Name: "gridrouter trace". File extension `.grtrace`.
-- Version: major 1, minor 0.
+- Version: major 1, minor 0. Clarified 2026-11-23 without a version change
+  (see [16](#16-clarifications)).
 - The words MUST, MUST NOT, SHOULD and MAY are normative.
 
 Contents:
@@ -28,6 +29,8 @@ Contents:
 13. [Worked example](#13-worked-example)
 14. [What the format does not capture](#14-what-the-format-does-not-capture)
 15. [Decisions and rationale](#15-decisions-and-rationale)
+16. [Clarifications](#16-clarifications)
+17. [Open points](#17-open-points)
 
 ---
 
@@ -75,6 +78,11 @@ Contents:
   An empty string is the 4 bytes `00 00 00 00`. Writers encode Python `str`
   with UTF-8 (`errors="replace"`); readers treat the bytes as opaque UTF-8 and
   MUST NOT assume a terminator or valid UTF-8.
+  The padding is part of the `str` and is required, also when the `str` is the
+  last field of a payload or record: a `str` whose `4 + ((n + 3) & ~3)` bytes
+  run past the end of the payload (or record body) makes the chunk corrupt
+  ([3.3](#33-general-chunk-rules)). Writers write the padding bytes as zero;
+  readers do not check their contents.
 - **`cell`**: a `u32` holding `layer * nc + idx`, where `nc = nx * ny` and
   `idx = j * nx + i` for grid column `i` and row `j`. `layer` is 0 (F.Cu) or 1
   (B.Cu). This is the router's own encoding (`Router.encode`). A valid cell is
@@ -142,6 +150,8 @@ chunk starts at `chunk_offset + 16 + len + pad`.
 - `t` is non-decreasing in file order. Because a chunk is written when its
   event has finished, `t` marks the end of the event. `SRCH` additionally
   carries `duration_s`, so a search ran from `t - duration_s` to `t`.
+- The writer enforces the order: if the clock gives a value smaller than the
+  previous chunk's `t`, it writes the previous chunk's `t` instead.
 - `len` is a `u32`, so one chunk holds at most 4 GiB - 1 of payload.
 
 ### 3.2 Tags in version 1.0
@@ -189,6 +199,54 @@ chunk starts at `chunk_offset + 16 + len + pad`.
 - **Tag characters**: every tag byte is printable ASCII (0x20 to 0x7E). A
   complete chunk header with any other tag byte means the file is corrupt from
   that offset on; the reader stops there and reports it.
+- **Limits of framing.** The format has no checksum and no sync marker, so a
+  reader cannot tell every corruption of a chunk header from a valid one:
+  - a corrupt `len` that runs past the end of the file looks exactly like a
+    chunk that is not written yet. Readers treat it as "not written yet"
+    (above); the file then simply ends there, without `END `;
+  - a corrupt `len` that is too small (or too large, but still inside the
+    file) makes the reader take the wrong bytes as the next chunk header. The
+    tag check above usually catches this at the next header, because payload
+    bytes are rarely four printable ASCII bytes; it is not guaranteed to;
+  - a corrupt byte inside a payload is found only if it breaks a count, a
+    bound ([3.4](#34-value-bounds)) or a consistency rule
+    ([10](#10-reader-algorithm)).
+
+### 3.4 Value bounds
+
+Every file a writer produces satisfies the bounds below. They are writer
+guarantees. A reader MAY treat a chunk that violates one of them as a
+**corrupt** chunk (report it and skip it, as for a too-short payload); a
+reader is not required to check any of them. Exceptions the current writer
+does not meet are listed under [Open points](#17-open-points).
+
+| Chunk | Bound |
+|---|---|
+| `RUN ` | `nx > 0`, `ny > 0`, and `2 * nx * ny <= 2^32`, so that every cell `< 2 * nc` fits in a `u32` |
+| `RUN ` | `0 <= nd <= 16` |
+| `RUN ` | `cell` finite and `> 0`; `origin_x`, `origin_y` finite |
+| `SRCH` | every `path` and `trace_cell` entry `< 2 * nc`; `ntrace_total <= 2 * nc`; `ntrace <= ntrace_total` |
+| `SRCH` | every `src` and `tgt` entry `< 2 * nc` when `error` is clear (the C core rejects a search with an invalid cell, so such a search always has `error` set) |
+| `CMIT` | every `path` entry `< 2 * nc`; every stub `layer <= 1`; every via `0 <= i < nx`, `0 <= j < ny` |
+| `VIA ` | `0 <= i < nx`, `0 <= j < ny` |
+| `DISC` | `layer` is 0 or 1 (the C core rejects other layers). `i`, `j` may lie outside the grid: the disc is clipped to it |
+| `RECT` | `op <= 2` |
+| `DROP` | `ok <= 2` |
+| `GRDS` | `which <= 1`; `nc` equals the session's `nx * ny` ([7.8](#78-grds-occupancy-grids)) |
+| `ROUT` | every segment `layer <= 1` |
+| `BRD ` | see [7.18](#718-brd--kicad-board) |
+
+Bounds that refer to `nx`, `ny` or `nc` use the `RUN ` of the chunk's session
+([6](#6-order-guarantees) rule 3).
+
+The format sets no maximum grid size other than the `u32` cell bound above.
+The router itself (informative) supports at most 8192 cells per side, 16
+directions and disc radius 255.
+
+Which bounds the existing readers check differs; neither checks every one.
+For example, `DISC` `i`, `j`, `RECT` `op`, `DROP` `ok` and `GRDS` `which` are
+not checked by either reader; an out-of-range value there is shown as
+unknown.
 
 ---
 
@@ -212,6 +270,25 @@ either a `CMIT` or a `VIA ` with `added = 1` has `copper_id = k`. A `VIA ` with
 advance the counter.
 
 Readers SHOULD check these sequences and report a gap as corruption.
+
+Checking the sequences:
+
+- The expected id of a chunk is the one this section assigns it from its
+  position in the file. A stored id (`search_id` in `SRCH`, `route_id` in
+  `RNB `, `copper_id` in `CMIT` and in `VIA ` with `added = 1`) that differs
+  from the expected id is an error, which the reader reports.
+- A `VIA ` with `added = 0` and a `copper_id` other than `NONE32` is an error.
+- A corrupt `SRCH`, `RNB ` or `CMIT` (one whose payload cannot be read,
+  [3.3](#33-general-chunk-rules)) is still identified by its tag, so its
+  position in the sequence is known. A reader MAY count it, so that it takes
+  the next id and the following chunks keep their expected ids.
+- A corrupt `VIA ` takes no copper id, because whether it has `added = 1` is
+  unknown. If it did create copper, the next copper id in the file is one
+  higher than the reader expects, and the reader reports that mismatch.
+
+How a reader continues after a reported mismatch (keep counting, or continue
+from the stored id) differs between the existing readers; see
+[Open points](#17-open-points).
 
 ### 4.2 `ctx`: where a call happened
 
@@ -285,7 +362,13 @@ the call stack. Checked against `gridrouter/__init__.py`:
 
 **Exceptions.** `SRCH` is written with flag `error` set; `RNE ` with
 `status = 1`; `DROP` with `ok = 2`. For every other method, a call that raises
-writes no chunk (see [14](#14-what-the-format-does-not-capture)).
+writes no chunk (see [14](#14-what-the-format-does-not-capture)), with one
+exception: `RBLD` is written at entry, before `rebuild` does anything, so a
+`rebuild` that raises leaves its `RBLD` in the file, followed by the `RIP `
+chunks of the `rip` calls that returned before the exception (possibly fewer
+than [6](#6-order-guarantees) rule 7 describes). An `RNE ` with `status = 1`
+always has `nripped = 0` (the call returned no list); its `failed` list is
+still filled ([7.10](#710-rne--route_net-ends)).
 
 **Not router calls.** `NETS`, `GRDS` with `which = 0`, `MARK`, `ROUT`, `BRD `
 and `END ` are written when the user of the recorder asks for them
@@ -303,7 +386,11 @@ A writer MUST produce, and a reader MAY rely on, the following.
 2. `RUN ` precedes every chunk that refers to a router: `PAD `, `RECT`,
    `DISC`, `VIA `, `SNAP`, `GRDS`, `RNB `, `RNE `, `SRCH`, `CMIT`, `RBLD`,
    `RIP `, `DROP`, `ROUT`. `NETS`, `MARK` and `BRD ` may appear before the
-   first `RUN `.
+   first `RUN `. A reader reports a router chunk before the first `RUN ` as
+   an error and MAY treat it as a corrupt chunk; it belongs to no session.
+   A router chunk after a corrupt `RUN ` (one the reader could not parse)
+   cannot be checked against that session's grid; how readers handle it
+   differs (see [Open points](#17-open-points)).
 3. A file may contain more than one `RUN `. Each `RUN ` starts a new router
    session (a new `Router` object was attached): all router state from the
    previous session (copper, grids, snapshot) is gone, and every later chunk
@@ -312,21 +399,28 @@ A writer MUST produce, and a reader MAY rely on, the following.
 4. The recorder SHOULD write a `GRDS` with `which = 0` and label `"attach"`
    right after each `RUN `, so that the viewer knows the grids at the moment
    of attaching (pads and keep-outs claimed before attaching, direct grid
-   writes, the edge margin).
+   writes, the edge margin). The recorder writes, for each `attach`: `RUN `,
+   then `GRDS "attach"`, then a `NETS` if `attach` was given net names. No
+   other chunk comes between them.
 5. `SNAP` is immediately followed by `GRDS` with `which = 1`.
 6. Between an `RNB ` and its `RNE ` (same `route_id`) there are only `SRCH`,
    `RBLD`, `RIP ` and `CMIT` chunks of that call (their `route_id` equals the
    `RNB `'s). `route_net` calls do not nest or overlap. For each pad the
    sequence is: 1 to 4 `SRCH` attempts in the order (`wide` argument, not
    relaxed), (thin, not relaxed), (`wide` argument, relaxed), (thin, relaxed),
-   the relaxed ones only after a `SNAP` and while `rips < MAX_RIPS`; after
+   the relaxed ones only if the router has been snapshotted and while
+   `Router.rips < MAX_RIPS`. "Snapshotted" means a `SNAP` earlier in the
+   session, or a `snapshot()` made before the recorder attached, which the
+   file does not show; so relaxed searches can occur in a session that has no
+   `SNAP` chunk. After
    each relaxed `SRCH` that found a
    path, one `RBLD` followed by its `RIP ` chunks; then either the next `SRCH`
    attempt or one `CMIT` for that pad. A pad with no `CMIT` failed and is
    listed in the `RNE `.
 7. The `RIP ` chunks caused by a `RBLD` follow it immediately, one per name in
    the `RBLD` whose `nets[k] != -1`, in the `RBLD`'s order, all with
-   `ctx = 1` and the `RBLD`'s `route_id`.
+   `ctx = 1` and the `RBLD`'s `route_id`. If `rebuild` raised, fewer `RIP `
+   chunks follow ([5](#5-what-the-recorder-emits-and-when), Exceptions).
 8. A `DROP` chunk is written when `drop_to_plane` returns. It is immediately
    preceded by the chunks that call emitted: its 1 or 2 `SRCH` (`ctx = 2`),
    and, on success, one `CMIT` (`ctx = 2`). These are contiguous: no other
@@ -399,6 +493,8 @@ set, for level `k` (0 = T, 1 = W) with `m = int(edge_margin[k] / cell + 0.999)`,
 the cells in a frame `m` cells wide along all four grid borders are set to
 `BLOCK` on both layers. These claims are part of the state before attaching;
 the `GRDS "attach"` chunk shows them.
+
+Bounds on `nx`, `ny`, `nd`, `cell` and the origin: [3.4](#34-value-bounds).
 
 ### 7.2 `NETS` router net names
 
@@ -505,6 +601,10 @@ number (only that net may use the cell), or `BLOCK`. Total payload
 `A + 17 * nc`. `novia` values other than 0 and 1 can occur (direct writes by
 user code); treat any non-zero value as "forbidden".
 
+"Readers MUST check `nc`" means: a `GRDS` whose `nc` differs from `nx * ny`
+of its session's `RUN ` is a **corrupt** chunk. The reader reports it and
+skips it ([3.3](#33-general-chunk-rules)); its grids are not used.
+
 ### 7.9 `RNB ` route_net begins
 
 `route_net(net, name, pads, wide, power)` with
@@ -525,6 +625,13 @@ user code); treat any non-zero value as "forbidden".
 Pads are in argument order; `pads[0]` is the root of the tree. `struct` of
 the fixed part `"<IiIiII"`, of each pad `"<ddII"`.
 
+The record is written before `route_net` runs, so it cannot assume the pads
+are well formed. If `len(pad[3])` fails (the cell collection has no length),
+`ncells` is `NONE32` (0xFFFFFFFF, "unknown"). Likewise `cx`, `cy` are 0 if
+they do not convert to numbers, `layers` is 0 if `pad[2]` is not a list of
+layers, a label is the empty string if `str(pad[4])` fails, and `power` is 0
+if `int(power)` fails.
+
 ### 7.10 `RNE ` route_net ends
 
 Written when `route_net` returns or raises. Size of the fixed part 24 bytes.
@@ -540,6 +647,13 @@ Written when `route_net` returns or raises. Size of the fixed part 24 bytes.
 | 20 | `u32` | status | 0 returned normally; 1 raised an exception (the lists then hold what was known) |
 | 24 | `nripped × str` | ripped | the returned names, in order (may repeat a name) |
 | … | `nfailed × str` | failed | labels of the failed pads (`Router.failed` entries with this `name` added by this call), in order |
+
+`route_net` first removes every `Router.failed` entry with its `name` (also
+one left by an earlier `drop_to_plane` with that name), then adds one per pad
+it fails. The recorder writes the labels of all `Router.failed` entries with
+this `name` when the call ends, which are exactly those this call added. With
+`status = 1`, `nripped` is 0 and `failed` holds the pads that failed before
+the exception.
 
 ### 7.11 `SRCH` one search
 
@@ -561,7 +675,7 @@ Fixed part: 96 bytes. `struct`: `"<IIIiIiiiqqqdIIIIIIII"`.
 | 32 | `i64` | max_cost | `int(max_cost // 1)` as passed to the C core; `-1` if `has_max` is clear |
 | 40 | `i64` | cost | path cost (`last_cost`); `-1` if not found |
 | 48 | `i64` | expanded | expanded-state count (`last_expanded`); `-1` if unknown (error) |
-| 56 | `f64` | duration_s | wall time of the `search` call |
+| 56 | `f64` | duration_s | wall time of the `search` call, including the recorder's conversion of `sources` / `targets` to cells |
 | 64 | `u32` | nsrc | number of source cells |
 | 68 | `u32` | ntgt | number of target cells |
 | 72 | `u32` | npath | path length in cells (0 if not found) |
@@ -583,9 +697,30 @@ Fixed part: 96 bytes. `struct`: `"<IIIiIiiiqqqdIIIIIIII"`.
 | 5 | found | a path was returned |
 | 6 | new_via | the returned `new_via` (only with `via_goal`) |
 | 7 | has_costs | the `trace_d` array is present |
-| 8 | error | the call raised `RouterError` (bad cell, cost overflow, relax before snapshot); `found` is clear, `cost = -1`, `expanded = -1`; any trace present is the partial trace up to the error |
+| 8 | error | the call raised: `RouterError` from the C core (bad cell, cost overflow, relax before snapshot), or any other exception (see below); `found` is clear, `cost = -1`, `expanded = -1`; any trace present is the partial trace up to the error |
 | 9 | has_trace | the wavefront was recorded. If clear, `ntrace = ntrace_total = 0` and the search has no wavefront (tracing was off), even if `expanded > 0` |
 | 10-31 | | 0 |
+
+How the recorder fills a `SRCH` when the arguments are unusual or the call
+raises:
+
+- `error` is set for **any** exception from `search`, not only
+  `RouterError`: also `TypeError`, `ValueError`, `OverflowError` (or any
+  other) raised while converting the arguments, before the C core runs.
+- `has_trace` is set only if tracing was on and the C search actually ran:
+  the call returned, or raised `RouterError` (which only the C core raises
+  there). A search that raised `RouterError` because of an invalid argument
+  has `has_trace` set and `ntrace = ntrace_total = 0`. A search that raised
+  any other exception has `has_trace` clear.
+- `has_costs` is set exactly when `has_trace` is set: the recorder always
+  stores `trace_d`.
+- `has_goal` is set only if `goal` is truthy and both `goal[0]`, `goal[1]`
+  convert to integers; otherwise `gi = gj = 0`.
+- `has_max` is set only if `max_cost` is not `None` and
+  `int(max_cost // 1)` succeeds; otherwise `max_cost = -1`.
+- If `sources` could not be converted to cells, `nsrc = 0`; if `targets`
+  could not (or `sources` failed first), `ntgt = 0`. Such a search always has
+  `error` set.
 
 Variable part, starting at offset 96, in this order:
 
@@ -629,11 +764,39 @@ Payload size with `enc = 0`:
   `route_net` called with `wide = False`: its first two attempts (thin, not
   relaxed) are identical, so a failed first attempt is repeated exactly.
 
+**Consistency of the trace fields.** A writer MUST guarantee:
+
+- if `has_trace` is clear: `ntrace = ntrace_total = 0`, `has_costs` clear,
+  `repeat_of = NONE32`, and no trace arrays are stored;
+- if `repeat_of != NONE32`: `ntrace = 0`; `has_trace`, `has_costs` and
+  `ntrace_total` equal those of search `repeat_of`; and search `repeat_of` is
+  an earlier `SRCH` of the same session, is not itself a repeat, has
+  `has_trace` set, `enc = 0` and `ntrace > 0`.
+
+A reader MAY report a violation as a warning; it is not a corrupt chunk (the
+payload is still read with the sizes the counts give). A reader that shows
+wavefronts then:
+
+- ignores trace arrays stored without `has_trace` (no wavefront);
+- shows no wavefront for a search whose `repeat_of` names a search that is
+  not a valid target (a later search, itself a repeat, another session, or a
+  search without a wavefront);
+- uses the target's wavefront when the target is valid but the repeat's
+  `ntrace`, `ntrace_total`, `has_trace` or `has_costs` differ.
+
 **`enc != 0`** (reserved for later minor versions): only the trace arrays are
 encoded. `src`, `tgt` and `path` stay raw and come first; the encoded trace
 data runs from the end of `path` to the end of the payload. A reader that does
 not know the `enc` value MUST still read the rest of the chunk and treat the
 search as having no wavefront.
+
+Every 1.x file written today has `enc = 0`; no other value is defined. A
+reader bounds a `SRCH` with `enc != 0` by `len` like any chunk: it reads the
+fixed part, `src`, `tgt` and `path`, and does not interpret the bytes after
+`path`. Because the encoded data runs to the end of the payload, a `SRCH`
+with `enc != 0` cannot also carry fields appended by a later minor version
+([3.3](#33-general-chunk-rules)) that a reader could find; see
+[Open points](#17-open-points).
 
 ### 7.12 `CMIT` one commit
 
@@ -664,6 +827,12 @@ Variable part, starting at offset 48:
 | path | `cell[npath]` | the committed path |
 
 `struct` of a stub: `"<II5d"`; of a via: `"<ii"`.
+
+A stub's `w` is the width the router's bookkeeping holds for that stub at
+commit time (`Router._sw`, set by this `commit` to the track width). With the
+current `Router` it therefore always equals `width_mm`. A later `rip` does not
+restore `_sw` (see [14](#14-what-the-format-does-not-capture) item 8), so `w`
+can differ from what `routes()` reports later.
 
 How the viewer draws a `CMIT` (all of it belongs to `copper_id`):
 
@@ -702,16 +871,37 @@ Inside `route_net`, every `RBLD` also marks one increment of `Router.rips`
 | 12 | `u32` | nremoved | |
 | 16 | `u32[nremoved]` | removed | copper ids removed, ascending |
 
-**Semantics.** `Router.rip(net)` resets the net to its state at the last
-`snapshot()`: copper the net committed before that snapshot survives. So
-`removed` lists **exactly** the copper ids (`CMIT`, and `VIA ` with
-`added = 1`) of that net that were created after the last `SNAP` of the current
-session and are not listed in an earlier `RIP `. Before any `SNAP` in the
-session, `rip` changes nothing and `nremoved = 0`.
+**Semantics.** `Router.rip(net)` resets the net to its state at the router's
+last `snapshot()`: copper the net committed before that snapshot survives.
+That snapshot may have been taken before the recorder attached; the file then
+has no `SNAP` for it. So:
+
+- If the router has been snapshotted (a `SNAP` earlier in the session, or a
+  `snapshot()` before attaching), `removed` lists **exactly** the copper ids
+  (`CMIT`, and `VIA ` with `added = 1`) of that net that were created in the
+  current session after its last `SNAP` (after its `RUN ` if it has no
+  `SNAP`) and are not listed in an earlier `RIP `. Copper the net committed
+  between a snapshot before attaching and the attach is removed too, but it
+  has no copper id and is not listed
+  ([14](#14-what-the-format-does-not-capture) item 2).
+- If the router has never been snapshotted, `rip` changes nothing and
+  `nremoved = 0`.
+
+A reader cannot tell the two cases apart before the first `SNAP` of a
+session: there, `removed` is either empty or exactly the net's copper of the
+session not yet ripped. After a `SNAP` in the session, only the first case is
+possible.
 
 The recorder computes this by keeping, per net, the copper ids created since
 the last `SNAP`; `SNAP` and `RUN ` clear all those lists, `RIP ` empties the
-net's list.
+net's list. It writes the list if the router has a snapshot (`Router._snap`
+is set) and an empty list otherwise.
+
+A `RIP ` that lists a copper id that does not exist (no earlier creating
+chunk), that belongs to an earlier session, or that an earlier `RIP ` already
+removed, is an error, which the reader reports; such an id removes nothing.
+A `removed` list that is not ascending, or that is not exactly the list
+described above, is a warning ([10](#10-reader-algorithm)).
 
 ### 7.15 `DROP` drop_to_plane
 
@@ -808,6 +998,19 @@ Then these sections, in this order:
 - A reader skips unknown `kind` values using `nbytes`, and ignores bytes in a
   known body after the fields it knows.
 
+**Validity.** Corruption in a `BRD ` is per chunk: if any table entry or any
+record cannot be read (a count or `nbytes` that runs past the payload, a
+known record whose body is shorter than its fields) or breaks a bound below,
+the whole `BRD ` chunk is corrupt and is skipped; the previous `BRD ` (if
+any) stays current. Writers guarantee, and readers MAY check:
+
+- `nbytes` is a multiple of 8;
+- every `layer_index` (POLYSET, TRACK, TEXT, and VIA `top_layer_index`,
+  `bottom_layer_index`) is `0 <= layer_index < n`, `n` being the number of
+  entries in the layer table;
+- every `fp` is `-1` or `0 <= fp < nfp`, `nfp` being the number of entries in
+  the footprint table; PADINFO `fp` is never `-1` (see PADINFO below).
+
 Record kinds (body layouts; offsets relative to the body start):
 
 **1 POLYSET** (filled or stroked polygons):
@@ -851,7 +1054,7 @@ Record kinds (body layouts; offsets relative to the body start):
 
 | Offset | Type | Field | Meaning |
 |---|---|---|---|
-| 0 | `i32` | fp | footprint index |
+| 0 | `i32` | fp | footprint index, `0 <= fp < nfp`; never `-1` (every KiCad pad belongs to a footprint). Readers MAY accept `-1` as "no footprint" |
 | 4 | `i32` | net | KiCad net code or `-1` |
 | 8 | `i32` | x | pad position |
 | 12 | `i32` | y | |
@@ -880,12 +1083,30 @@ Marks a complete file. Fixed part 40 bytes, `struct` `"<IIIiqqd"`.
 |---|---|---|---|
 | 0 | `u32` | searches | number of `SRCH` chunks in the file |
 | 4 | `u32` | routes | number of `RNB ` chunks |
-| 8 | `u32` | nfailed | `len(Router.failed)` at close (0 if no router attached) |
+| 8 | `u32` | nfailed | `len(Router.failed)` at close (0 if no router attached); see below |
 | 12 | `i32` | rips | `Router.rips` at close (0 if no router) |
 | 16 | `i64` | expanded_total | sum of `expanded` over all `SRCH` with `expanded >= 0` |
 | 24 | `i64` | trace_entries | sum of `ntrace` over all `SRCH` (entries actually stored) |
 | 32 | `f64` | wall_s | seconds from open to close |
 | 40 | `nfailed × (str name, str label)` | failed | `Router.failed` at close, in order |
+
+`failed` is the attached router's `Router.failed` list at close, as it is; it
+is not computed from the chunks. It holds:
+
+- for each `route_net` name, the pads that failed in the **latest**
+  `route_net` call with that name, as `(name, pad label)`; these are the
+  `RNE ` `failed` labels of that call;
+- one `(name, pad label)` for each `drop_to_plane` call that returned False
+  (`DROP` with `ok = 0`), unless a later `route_net` with the same `name`
+  removed it. A `drop_to_plane` that raised (`ok = 2`) adds nothing;
+- entries made before the recorder attached, and any edits by user code
+  ([14](#14-what-the-format-does-not-capture) items 2 and 4).
+
+So `nfailed` counts plane-drop failures as well as `route_net` pad failures,
+and it need not equal the sum of the `RNE ` `nfailed` values, nor that sum
+plus the number of `DROP` chunks with `ok = 0`. Only the router attached at
+close (the latest session's) contributes. Readers do not check `nfailed`
+against the chunks.
 
 ---
 
@@ -931,9 +1152,9 @@ from `routes()` (spur pruning, merging, see [14](#14-what-the-format-does-not-ca
 
 ```
 open file
-read 24 bytes; fewer than 24 → "not written yet" (retry later)
-check magic == "GRTRACE\0"            else: not a trace file
-check major == 1                      else: unsupported version
+read 24 bytes; fewer than 24 → "not written yet" (retry later; see below)
+check magic == "GRTRACE\0"            else: not a trace file (reject)
+check major == 1                      else: unsupported version (reject)
 (minor may be anything; flags ignored)
 
 off = 24
@@ -955,14 +1176,67 @@ for each indexed chunk, in order:
     (SRCH trace arrays may be left unread and loaded on demand by offset)
 ```
 
+"Reject" and "stop" in the algorithm: a reader MAY either stop reading and
+report the problem, or fail the open / refresh call (raise an exception,
+return an error status). Both are conforming.
+
+**Header.** A file shorter than 24 bytes, including an empty file, whose
+bytes do not contradict the header (the bytes present equal the start of the
+magic, and the major version, once both its bytes are present, is 1) is a
+header **not written yet**: not an error. A reader MUST NOT reject such a
+file; it retries later. A reader MAY reject a shorter file as soon as the
+bytes present contradict the magic, or as soon as both bytes of an
+unsupported major version are present; it MAY also wait until 24 bytes are
+present before checking.
+
 Following a live file: keep `off` and the index; when the file grows, resume
 the loop at `off`. A chunk is only indexed once complete, so a reader never
 sees half a chunk. Without an `END `, the file is an incomplete run (still
 being written, or the writer crashed); everything indexed is valid.
 
+**Files replaced or rewritten while being followed.** The writer only
+appends ([3.3](#33-general-chunk-rules)). Writers SHOULD never rewrite or
+truncate a trace file, or replace it under the same name, while a reader may
+be following it; to start again, write a new file under a new name. (The
+Python writer opens its path for writing, so recording again to an existing
+path truncates that file in place.) If it happens anyway:
+
+- replacement by rename (a new file moved onto the old name) is not
+  detectable by a reader that keeps the old file open: it goes on seeing the
+  old file, which no longer grows. A reader that reopens the file by name on
+  each refresh reads the new file from its old offset instead;
+- an in-place rewrite or truncation MAY be detected by a reader on refresh:
+  the file is smaller than before, the 24-byte header differs from the one
+  read first, or the 16-byte header of the last indexed chunk differs. A
+  reader that detects it stops following the file and reports it.
+
 Readers SHOULD also check: `search_id` / `route_id` / `copper_id` sequences
 ([4.1](#41-ids)); `GRDS`.`nc` equals the current `RUN ` `nx * ny`; every
 `cell < 2 * nc`.
+
+**Errors and warnings.** Corrupt chunks ([3.3](#33-general-chunk-rules),
+[3.4](#34-value-bounds)), id mismatches ([4.1](#41-ids)), router chunks
+before the first `RUN ` ([6](#6-order-guarantees) rule 2), a `route_id` that
+names no earlier `RNB `, and a `RIP ` that names a missing, earlier-session
+or already-removed copper id ([7.14](#714-rip--one-rip)) are errors. The
+following are inconsistencies a reader MAY report as **warnings**. None of
+them makes a chunk corrupt; a reader does not skip or reject a chunk because
+of them:
+
+- `t` smaller than the previous chunk's `t`, or `t` NaN
+  ([6](#6-order-guarantees) rule 10);
+- bytes after `END ` (rule 1; the reader ignores them);
+- a `SNAP` not immediately followed by a `GRDS` with `which = 1` (rule 5);
+- `RNB ` / `RNE ` pairing (an `RNB ` while another `route_net` has no
+  `RNE `, an `RNE ` whose `route_id` is not the open `route_net`'s, a second
+  `RNE ` for a `route_id`, an `RNE ` `net` that differs from its `RNB `'s),
+  and a `SRCH`, `CMIT`, `VIA `, `RBLD` or `RIP ` whose `route_id` names an
+  existing `RNB ` other than the open one (rule 6);
+- `END ` counts or totals (`searches`, `routes`, `expanded_total`,
+  `trace_entries`) that differ from the chunks;
+- a `RIP ` `removed` list that is not ascending, or not exactly the copper
+  [7.14](#714-rip--one-rip) describes;
+- the `SRCH` trace-field inconsistencies of [7.11](#711-srch-one-search).
 
 ---
 
@@ -995,7 +1269,10 @@ Readers SHOULD also check: `search_id` / `route_id` / `copper_id` sequences
   501 x 361.
 - Measured or estimated totals:
   - `tests/bench.py` board (501 x 361, 76 nets): about 12 MB of `SRCH`
-    arrays, after repeats are shared (repeats save about 35%).
+    arrays, after repeats are shared (repeats save about 35%). Few searches
+    are repeats, but they are the large ones: a failed search explores
+    everything it can reach before giving up. On this board 4 of 184
+    searches are repeats, and they account for 34.8 % of all trace entries.
   - The real 501 x 361 dongle board, with its fan-out, CAN bus, plane stubs,
     main queue, rip-ups and polishing passes: about 80 to 240 MB.
   - A `BRD ` chunk is dominated by text glyph polygons and zone fills: a few
@@ -1051,7 +1328,9 @@ Known gaps, by design or because the recorder cannot see them:
    `Recorder.attach`, including the constructor's edge margin, appear only in
    the `GRDS "attach"` grids (and the edge-margin parameters in `RUN `), not as
    chunks or copper ids. Copper committed before attaching is not drawn as
-   router copper.
+   router copper. A `snapshot()` made before attaching is not recorded
+   either; its effects are ([6](#6-order-guarantees) rule 6,
+   [7.14](#714-rip--one-rip)).
 3. **Attribute changes after attaching.** `RUN ` holds the values at attach
    time. Later changes to `MAX_RIPS`, `TRACK`, `pad_clear`, `pad_novia`,
    `skip_joined_stubs` and similar are not recorded as such; their effects are
@@ -1133,8 +1412,12 @@ Changes made to the layout given in the brief, and choices it left open.
     (which still counts as a rip inside `route_net`) and direct calls
     (`route_id = NONE32`). `nets[k] = -1` for a name not in `log`. Its `RIP `
     chunks follow immediately.
-17. **`RIP ` before any `SNAP`** has `nremoved = 0` (the C core has no
-    ownership records before the snapshot, and the Python side returns early).
+17. **`RIP ` before any `SNAP`** has `nremoved = 0` if the router has never
+    been snapshotted (the C core has no ownership records before the
+    snapshot, and the Python side returns early). If the router was
+    snapshotted before the recorder attached, `rip` does remove copper, and
+    `RIP ` lists the net's copper ids of the session
+    ([7.14](#714-rip--one-rip); clarified 2026-11-23).
 18. **Chunk time `t` is the time of writing** (end of the event), so `t` is
     non-decreasing in file order; `SRCH` start is `t - duration_s`.
 19. **`DROP` is written at exit** (its result is not known earlier), and its
@@ -1160,4 +1443,124 @@ Changes made to the layout given in the brief, and choices it left open.
     largest `SRCH` on the maximum 8192 x 8192 grid is about 1.1 GB, so this
     is enough.
 26. **Tag validation.** Tag bytes must be printable ASCII, so a reader can
-    tell a corrupt file from a truncated one.
+    usually tell a corrupt file from a truncated one (not always: see "Limits
+    of framing" in [3.3](#33-general-chunk-rules)).
+
+---
+
+## 16. Clarifications
+
+**2026-11-23.** Clarifications of version 1.0 after the first two
+implementations (Python writer and reader, C++ reader). No byte layout,
+field, size or number changed; files valid before are valid now.
+
+- [1.3](#13-composite-notations): `str` padding is part of the `str` and
+  required; writers write zeros, readers do not check them.
+- [3.1](#31-chunk-header-16-bytes): the writer clamps `t` to be
+  non-decreasing.
+- [3.3](#33-general-chunk-rules): limits of framing (no checksum or sync
+  marker; a `len` past end of file reads as "not written yet"; a wrong `len`
+  inside the file is usually caught by the tag check).
+- [3.4](#34-value-bounds) (new): value bounds as writer guarantees, which
+  readers MAY treat as corruption; no maximum grid size beyond the `u32`
+  cell bound.
+- [4.1](#41-ids): id checking when a chunk is corrupt or an id mismatches.
+- [5](#5-what-the-recorder-emits-and-when): `RBLD` is written even when
+  `rebuild` raises; `RNE ` with `status = 1` has an empty `ripped` list.
+- [6](#6-order-guarantees): rule 2 (router chunks before any `RUN `), rule 4
+  (`RUN `, `GRDS "attach"`, `NETS` order), rule 6 (relaxed searches after a
+  snapshot made before attaching), rule 7 (a `rebuild` that raised).
+- [7.8](#78-grds-occupancy-grids): a `GRDS` whose `nc` differs from its
+  session's grid is a corrupt chunk.
+- [7.9](#79-rnb--route_net-begins): `ncells = NONE32` when a pad's cell
+  collection has no length, and the other fallbacks.
+- [7.10](#710-rne--route_net-ends): what the `failed` list holds.
+- [7.11](#711-srch-one-search): `duration_s` includes the cell conversion;
+  `error`, `has_trace`, `has_costs`, `has_goal`, `has_max` and `nsrc` /
+  `ntgt` when the call raises or the arguments do not convert; trace-field
+  consistency (writer guarantees, reader handling); `enc = 0` in every file
+  written today, and how a reader bounds a `SRCH` with `enc != 0`.
+- [7.12](#712-cmit-one-commit): a stub's `w`.
+- [7.14](#714-rip--one-rip) and [15](#15-decisions-and-rationale) item 17:
+  `rip` before the session's first `SNAP` removes copper when the router was
+  snapshotted before attaching; errors in `removed`.
+- [7.18](#718-brd--kicad-board): corruption is per `BRD ` chunk;
+  `layer_index` and `fp` ranges; PADINFO `fp` is never `-1`; `nbytes` is a
+  multiple of 8.
+- [7.19](#719-end--end-of-file): `END ` `failed` is `Router.failed` at
+  close, which includes `drop_to_plane` failures.
+- [10](#10-reader-algorithm): short and empty headers; "reject" may raise;
+  files replaced or rewritten while followed; errors and warnings.
+- [12](#12-sizes): few searches are repeats, but they are large ones.
+- [14](#14-what-the-format-does-not-capture) item 2: a snapshot made before
+  attaching.
+
+---
+
+## 17. Open points
+
+Points the clarification could not settle without changing an
+implementation, or that need a later version. Until settled, a file that
+triggers one of them may be read differently by the two existing readers.
+
+1. **`RIP ` before the session's first `SNAP`, router snapshotted before
+   attaching** ([7.14](#714-rip--one-rip)). The writer lists the net's copper
+   ids of the session, as 7.14 now says. The C++ reader expects an empty
+   list until a `SNAP` chunk of the session has been read (`Trace::on_rip`
+   in `viewer/core/src/trace.cpp`: `expected` is filled only
+   `if (snapped_ && …)`, and `snapped_` is set only by `on_snap` and cleared
+   by `on_run`), so it reports a warning for such a `RIP `. It still applies
+   the removal, so the copper state is right. The Python `check` accepts
+   both cases.
+2. **Router chunks after a corrupt `RUN `** ([6](#6-order-guarantees) rule
+   2). The C++ reader starts a new session at a corrupt `RUN ` and treats
+   every router chunk of that session as corrupt (no valid grid). The Python
+   reader ignores the corrupt `RUN `: later chunks are checked and replayed
+   against the previous session (or reported as "before any `RUN `" if there
+   is none), and the previous session's copper stays alive.
+3. **Continuing after an id mismatch** ([4.1](#41-ids)). The C++ reader
+   assigns ids by counting chunks of each tag (a corrupt `SRCH`, `RNB ` or
+   `CMIT` counts, a corrupt `VIA ` does not) and keeps the counted ids: after
+   one corrupt `VIA ` that created copper, every later copper chunk is
+   reported as a mismatch, and `RIP ` ids are resolved by the counted ids.
+   The Python reader does not count corrupt chunks, reports one mismatch,
+   then continues from the stored id, and `replay` keys copper by the stored
+   `copper_id`.
+4. **Invalid cells in a `SRCH` with `error` set**
+   ([3.4](#34-value-bounds)). A search whose sources or targets hold a cell
+   outside `0 .. 2 * nc - 1` raises `RouterError`, and the writer stores
+   `src` / `tgt` as passed (a negative cell becomes a large `u32`). The
+   Python `check` exempts `src` / `tgt` from the cell bound. The C++ reader
+   (`Trace::on_srch`) treats any `src`, `tgt` or `path` cell `>= 2 * nc` as
+   corrupt, so it skips such a search (it still takes its `search_id`).
+   Either the bound is relaxed for `src` / `tgt` of an `error` search, or the
+   writer changes.
+5. **`VIA ` outside the grid** ([3.4](#34-value-bounds)). The C core does not
+   reject an `add_via` whose `(i, j)` lies outside the grid: it clips the
+   discs. A direct `add_via` call with such a cell therefore produces a
+   `VIA ` with `added = 1` and an out-of-range `(i, j)`. The C++ reader
+   (`Trace::on_via`) treats it as corrupt, which also costs it that copper
+   id (open point 3). The same can happen in a `CMIT` via if user code
+   passes `commit` a path whose `(layer, idx)` pairs are not in canonical
+   form (`idx` outside `0 .. nc - 1`) although the encoded cells are valid.
+   The Python reader does not check via cells.
+6. **`RIP ` listing another net's copper** ([7.14](#714-rip--one-rip),
+   [8](#8-copper-state-at-any-point-normative)). Section 8 removes every
+   copper id a `RIP ` lists. The Python `replay` does so; its `check`
+   reports the list as not exact. The C++ reader reports an error and does
+   **not** remove a copper id of another net (`Trace::on_rip`), so the two
+   readers show different copper after such a `RIP `. The writer never
+   produces one.
+7. **`enc != 0` and appended fields** ([7.11](#711-srch-one-search),
+   [11](#11-versioning)). The encoded trace data runs to the end of the
+   payload, so a minor version that defines an `enc` value and also appends
+   fields to `SRCH` must first say how the end of the encoded data is found
+   (for example, a length inside the encoding). The Python reader keeps all
+   bytes after `path` as the encoded data; the C++ reader ignores them.
+   Nothing written today is affected (`enc = 0`).
+8. **PADINFO `fp`** ([7.18](#718-brd--kicad-board)). Settled as "never
+   `-1`" from KiCad's model (every pad has a parent footprint) and from the
+   existing writers (`BoardWriter.padinfo` passes `fp` through; the tests
+   write valid indexes). `gridrouter/kicad_trace.py`, the KiCad board
+   writer, did not exist when this was written; it MUST follow this rule.
+   The C++ reader also accepts `-1`, which is allowed.
