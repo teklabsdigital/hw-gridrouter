@@ -65,6 +65,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if !session.lastError.isEmpty {
                     failures.append("fresh session reports an error: \(session.lastError)")
                 }
+                // The trace reader is reachable through RVKit: a missing file
+                // is an I/O error with a message, and the session stays usable.
+                do throws(CoreError) {
+                    try session.open(path: "/nonexistent/visual-gridrouter-selftest.grtrace")
+                    failures.append("opening a missing trace succeeded")
+                } catch {
+                    if error.status != CoreError.io || error.message.isEmpty {
+                        failures.append("unexpected open failure: \(error)")
+                    }
+                }
+                session.close()
             } else {
                 failures.append("no core session")
             }

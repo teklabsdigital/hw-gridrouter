@@ -5,6 +5,7 @@
 #
 #   make test      build and run the core tests, and the C99 header smoke test
 #   make asan      the same under AddressSanitizer + UndefinedBehaviorSanitizer
+#   make dump      build/rvdump (trace inspector) and build/rvsynth (synthetic test trace writer)
 #   make app       swift build -c release, then wrap it into build/Visual Gridrouter.app
 #   make selftest  build the app and run its binary with --selftest (exits by itself)
 #   make run       open the app bundle
@@ -37,7 +38,7 @@ APP      := $(BUILD)/$(APP_NAME).app
 EXE      := RouteViewer
 SWIFT_BUILD := $(SWIFT) build -c release -Xswiftc -warnings-as-errors
 
-.PHONY: test asan app selftest run clean
+.PHONY: test asan dump app selftest run clean
 
 # --- core tests --------------------------------------------------------------
 
@@ -66,6 +67,20 @@ $(BUILD)/asan/c_abi_smoke: $(SMOKE) $(CORE_SRC) $(CORE_HDR)
 asan: $(BUILD)/asan/rv_tests $(BUILD)/asan/c_abi_smoke
 	./$(BUILD)/asan/rv_tests
 	./$(BUILD)/asan/c_abi_smoke
+
+# --- command-line tools ---------------------------------------------------------
+
+# rvdump uses only rv.h, like a client.  rvsynth writes the synthetic test
+# trace of core/tests/synth.cpp, for trying rvdump without the recorder.
+$(BUILD)/rvdump: tools/rvdump.cpp $(CORE_SRC) $(CORE_HDR)
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS_RV) -o $@ tools/rvdump.cpp $(CORE_SRC)
+
+$(BUILD)/rvsynth: tools/rvsynth.cpp core/tests/synth.cpp core/tests/synth.hpp
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS_RV) -I core/tests -o $@ tools/rvsynth.cpp core/tests/synth.cpp
+
+dump: $(BUILD)/rvdump $(BUILD)/rvsynth
 
 # --- macOS app ---------------------------------------------------------------
 

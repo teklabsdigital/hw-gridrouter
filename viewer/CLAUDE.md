@@ -18,7 +18,8 @@ contract between recorder and viewer).
      widgets; nothing more.
 3. **The core is portable C++17**, standard library only. No platform
    headers. The whole core may contain exactly one `#ifdef _WIN32`, for file
-   I/O (it does not exist yet). The interface is the plain C99 header
+   I/O (`core/src/file.cpp`; its Windows branch is not yet compiled or
+   tested). The interface is the plain C99 header
    `core/include/rv.h`; it must compile as C99 (`make test` checks with
    `-std=c99 -Wpedantic -Werror`) and as C++17.
 4. **The C boundary never throws or aborts.** Every entry point in
