@@ -95,6 +95,14 @@ public final class LayeredRenderer {
     public var cropsSlots = true
     /// Bands for parallel rasterising; 0 picks one per active core.
     public var bands = 0
+    /// M6 (carry-over from M5): when > 0, a slot plane's crop is widened to
+    /// multiples of this many view pixels and drawn in one bitmap context
+    /// (not in bands), so that its context sits at a view-anchored place
+    /// whatever the crop: the same batches then give the same pixels when
+    /// the crop changes.  Slabs (redrawn only when the board or the camera
+    /// changes) keep their bands.  0 (the default): M5's crops and bands.
+    /// See README "Bands" for the measurements.
+    public var cropGrid = 0
 
     public init() {}
 
@@ -310,7 +318,7 @@ public final class LayeredRenderer {
                 let y0 = Int(((b.minY * s + view.ty * view.backing)).rounded(.down)) - 2
                 let x1 = Int(((b.maxX * s + view.tx * view.backing)).rounded(.up)) + 2
                 let y1 = Int(((b.maxY * s + view.ty * view.backing)).rounded(.up)) + 2
-                let r = (max(0, x0), max(0, y0), min(w, x1), min(h, y1))
+                let r = LayeredRenderer.snap((x0, y0, x1, y1), grid: plane.isSlot ? cropGrid : 0, width: w, height: h)
                 if r.2 > r.0 && r.3 > r.1 { rect = r }
             } else {
                 rect = (0, 0, w, h)
@@ -329,13 +337,96 @@ public final class LayeredRenderer {
         // its own memory, and a plane holds one bitmap, not two.
         let buffer = PixelBuffer(width: pw, height: ph)
         DisplayListRenderer.rasterize(plane.items[...], background: bottom ? board.background : nil, view: view,
-                                      originX: rect.x0, originY: rect.y0, into: buffer, bands: bands)
+                                      originX: rect.x0, originY: rect.y0, into: buffer,
+                                      bands: plane.isSlot && cropGrid > 0 ? 1 : bands)
         plane.image = buffer.takeImage()
         plane.renders += 1
         plane.pixelRect = CGRect(x: rect.x0, y: rect.y0, width: pw, height: ph)
         plane.frame = CGRect(x: CGFloat(rect.x0) / view.backing, y: CGFloat(rect.y0) / view.backing,
                              width: CGFloat(pw) / view.backing, height: CGFloat(ph) / view.backing)
         return pw * ph
+    }
+
+    /// A crop rectangle (view pixels) clamped to the view; with `grid` > 0
+    /// first widened to multiples of `grid`.
+    nonisolated static func snap(_ r: (Int, Int, Int, Int), grid: Int, width w: Int, height h: Int)
+        -> (x0: Int, y0: Int, x1: Int, y1: Int) {
+        var (x0, y0, x1, y1) = r
+        if grid > 0 {
+            func down(_ v: Int) -> Int { v >= 0 ? v / grid * grid : -((-v + grid - 1) / grid * grid) }
+            x0 = down(x0)
+            y0 = down(y0)
+            x1 = -down(-x1)
+            y1 = -down(-y1)
+        }
+        return (max(0, x0), max(0, y0), min(w, x1), min(h, y1))
+    }
+
+    /// Carry-over measurement (M6): how much a cropped plane's pixels change
+    /// when only its crop changes (the same batches drawn over a larger
+    /// rectangle, as when a slot gains copper elsewhere): every non-wavefront
+    /// slot plane with batches, drawn at its own crop and at `trials` crops
+    /// grown by 0 to 48 pixels on each side, with `cropGrid` and `bands` as
+    /// set; the overlap compared.  Pixels compared, differing at all, by
+    /// more than 48, and the largest channel difference.
+    public func cropStability(view: ViewTransform, trials: Int, seed: UInt64 = 1)
+        -> (compared: Int, differing: Int, over48: Int, worst: Int) {
+        render(view: view)
+        let w = max(1, Int((view.width * view.backing).rounded()))
+        let h = max(1, Int((view.height * view.backing).rounded()))
+        var rng = seed
+        func next(_ n: Int) -> Int {
+            rng = rng &* 6364136223846793005 &+ 1442695040888963407
+            return Int((rng >> 33) % UInt64(n))
+        }
+        var compared = 0, differing = 0, over48 = 0, worst = 0
+        for plane in planes where !plane.nearest && !plane.items.isEmpty && plane.isSlot {
+            if plane.items.count == 1, plane.items[0].primitive == .fill, plane.items[0].path.isRect(nil) { continue }
+            var b = plane.items[0].bbox
+            for item in plane.items.dropFirst() { b = b.union(item.bbox) }
+            let s = view.scale * view.backing
+            let base = (Int((b.minX * s + view.tx * view.backing).rounded(.down)) - 2,
+                        Int((b.minY * s + view.ty * view.backing).rounded(.down)) - 2,
+                        Int((b.maxX * s + view.tx * view.backing).rounded(.up)) + 2,
+                        Int((b.maxY * s + view.ty * view.backing).rounded(.up)) + 2)
+            func draw(_ r: (Int, Int, Int, Int)) -> (rect: (x0: Int, y0: Int, x1: Int, y1: Int), px: [UInt8])? {
+                let c = LayeredRenderer.snap(r, grid: cropGrid, width: w, height: h)
+                guard c.x1 > c.x0, c.y1 > c.y0 else { return nil }
+                let buffer = PixelBuffer(width: c.x1 - c.x0, height: c.y1 - c.y0)
+                DisplayListRenderer.rasterize(plane.items[...], background: nil, view: view, originX: c.x0,
+                                              originY: c.y0, into: buffer, bands: cropGrid > 0 ? 1 : bands)
+                guard let image = buffer.takeImage(), let data = image.dataProvider?.data,
+                      let p = CFDataGetBytePtr(data) else { return nil }
+                let stride = image.bytesPerRow
+                var px = [UInt8](repeating: 0, count: (c.x1 - c.x0) * (c.y1 - c.y0) * 4)
+                for y in 0..<(c.y1 - c.y0) {
+                    for x in 0..<((c.x1 - c.x0) * 4) { px[(y * (c.x1 - c.x0)) * 4 + x] = p[y * stride + x] }
+                }
+                return (c, px)
+            }
+            guard let a = draw(base) else { continue }
+            for _ in 0..<trials {
+                let grown = (base.0 - next(49), base.1 - next(49), base.2 + next(49), base.3 + next(49))
+                guard let g = draw(grown) else { continue }
+                let x0 = max(a.rect.x0, g.rect.x0), y0 = max(a.rect.y0, g.rect.y0)
+                let x1 = min(a.rect.x1, g.rect.x1), y1 = min(a.rect.y1, g.rect.y1)
+                guard x1 > x0, y1 > y0 else { continue }
+                let aw = a.rect.x1 - a.rect.x0, gw = g.rect.x1 - g.rect.x0
+                for y in y0..<y1 {
+                    for x in x0..<x1 {
+                        let i = ((y - a.rect.y0) * aw + (x - a.rect.x0)) * 4
+                        let j = ((y - g.rect.y0) * gw + (x - g.rect.x0)) * 4
+                        var d = 0
+                        for k in 0..<4 { d = max(d, abs(Int(a.px[i + k]) - Int(g.px[j + k]))) }
+                        compared += 1
+                        if d > 0 { differing += 1 }
+                        if d > 48 { over48 += 1 }
+                        worst = max(worst, d)
+                    }
+                }
+            }
+        }
+        return (compared, differing, over48, worst)
     }
 
     /// A plane that is one filled axis-aligned rectangle of one colour (the

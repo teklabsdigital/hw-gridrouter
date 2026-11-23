@@ -21,6 +21,42 @@ public struct CoreError: Error, Sendable, CustomStringConvertible {
     public static let io: UInt32 = RV_E_IO.rawValue
     public static let format: UInt32 = RV_E_FORMAT.rawValue
     public static let unsupported: UInt32 = RV_E_UNSUPPORTED.rawValue
+    /// M6: the file is no longer the trace that was opened; reload it.
+    public static let replaced: UInt32 = RV_E_REPLACED.rawValue
+}
+
+/// rv_open_ex flags (M6).
+public struct OpenFlags: OptionSet, Sendable {
+    public let rawValue: UInt32
+    public init(rawValue: UInt32) { self.rawValue = rawValue }
+    /// A path with no file yet opens an empty trace that waits for it.
+    public static let wait = OpenFlags(rawValue: RV_OPEN_WAIT)
+    /// Follow the trace while it grows.
+    public static let live = OpenFlags(rawValue: RV_OPEN_LIVE)
+}
+
+/// What the file is doing (rv_live_state, M6).
+public enum LiveState: UInt32, Sendable {
+    case none = 0, waiting, growing, stalled, complete, stopped, replaced, failed
+}
+
+/// The live state of the open trace (rv_live, M6).
+public struct LiveInfo: Sendable {
+    public let state: LiveState
+    public let idleSeconds: Double
+    public let lagSeconds: Double
+    public let fileSize: UInt64
+    public let indexedEnd: UInt64
+    public let following: Bool
+    public let live: Bool
+    public let chunks: UInt32
+    public let events: UInt32
+    public let skips: UInt32
+
+    /// Still to be polled: no END yet and not failed or replaced.
+    public var needsPolling: Bool {
+        state == .waiting || state == .growing || state == .stalled || state == .none
+    }
 }
 
 /// File-level facts about the open trace (`rv_trace_info`).
@@ -91,11 +127,62 @@ public final class Session {
     /// Open a trace file.  On failure the previously open trace stays open.
     public func open(path: String) throws(CoreError) {
         try check(rv_open(handle, path))
+        cachedEvents = []
+    }
+
+    /// Open with flags (M6): `.live` follows a growing trace, `.wait` waits
+    /// for a file that does not exist yet.
+    public func open(path: String, flags: OpenFlags) throws(CoreError) {
+        try check(rv_open_ex(handle, path, flags.rawValue))
+        cachedEvents = []
+    }
+
+    /// Open the same path again after `CoreError.replaced`, keeping the
+    /// camera, visibility, pacing, speed and selected net (M6).
+    public func reload() throws(CoreError) {
+        try check(rv_reload(handle))
+        cachedEvents = []
+    }
+
+    /// rv_refresh for a client following a file (M6): call it on a timer.
+    /// `now` is the client's clock in seconds.
+    @discardableResult
+    public func poll(now: Double) throws(CoreError) -> (added: UInt32, change: PlaybackChange) {
+        var added: UInt32 = 0
+        var changed: UInt32 = 0
+        try check(rv_poll(handle, now, &added, &changed))
+        return (added, PlaybackChange(rawValue: changed))
+    }
+
+    /// What the file is doing (M6).
+    public func live() throws(CoreError) -> LiveInfo {
+        var l = rv_live()
+        try check(rv_live_get(handle, &l))
+        return LiveInfo(state: LiveState(rawValue: l.state) ?? .none, idleSeconds: l.idle_seconds,
+                        lagSeconds: l.lag_seconds, fileSize: l.file_size, indexedEnd: l.indexed_end,
+                        following: l.following != 0, live: l.live != 0, chunks: l.chunks, events: l.events,
+                        skips: l.skips)
+    }
+
+    /// The core's one-line text for a live indicator (M6).
+    public func liveText() throws(CoreError) -> String {
+        var p: UnsafePointer<CChar>?
+        try check(rv_live_text(handle, &p))
+        return p.map { String(cString: $0) } ?? ""
+    }
+
+    /// Following on ("Live") or off (M6).
+    @discardableResult
+    public func setFollowing(_ on: Bool) throws(CoreError) -> PlaybackChange {
+        var changed: UInt32 = 0
+        try check(rv_set_following(handle, on ? 1 : 0, &changed))
+        return PlaybackChange(rawValue: changed)
     }
 
     /// Close the open trace, if any.
     public func close() {
         _ = rv_close(handle)
+        cachedEvents = []
     }
 
     /// Read chunks appended since the last open or refresh; returns how many.
@@ -292,27 +379,39 @@ public final class Session {
 
     /// The timeline's generation (changes on open and refresh), without copying it.
     public func timelineGeneration() throws(CoreError) -> UInt32 {
-        var t = rv_timeline()
-        try check(rv_get_timeline(handle, &t))
-        return t.generation
+        return try fetchTimeline().generation
     }
 
-    /// A copy of the timeline: events, ticks and phases.
-    public func timeline() throws(CoreError) -> Timeline {
+    // The events as of the last rv_get_timeline (M6): every call goes through
+    // fetchTimeline, so the core's `unchanged` is relative to this copy and
+    // only the events after it are converted again.
+    private var cachedEvents: [TimelineEvent] = []
+
+    private func fetchTimeline() throws(CoreError) -> rv_timeline {
         var t = rv_timeline()
         try check(rv_get_timeline(handle, &t))
-        var events: [TimelineEvent] = []
-        events.reserveCapacity(Int(t.event_count))
-        if let p = t.events {
-            for e in UnsafeBufferPointer(start: p, count: Int(t.event_count)) {
-                events.append(TimelineEvent(start: e.start, duration: e.duration, size: e.size,
-                                            kind: TimelineEvent.Kind(rawValue: e.kind) ?? .end, flags: e.flags,
-                                            chunk: e.chunk, lastChunk: e.last_chunk,
-                                            phase: e.phase == RV_NONE ? nil : e.phase,
-                                            board: e.board == RV_NONE ? nil : e.board,
-                                            net: e.flags & RV_EVF_HAS_NET != 0 ? e.net : nil))
+        let n = Int(t.event_count)
+        let keep = min(Int(t.unchanged), cachedEvents.count, n)
+        if keep < cachedEvents.count { cachedEvents.removeSubrange(keep...) }
+        if n > keep, let p = t.events {
+            cachedEvents.reserveCapacity(n)
+            for e in UnsafeBufferPointer(start: p + keep, count: n - keep) {
+                cachedEvents.append(TimelineEvent(start: e.start, duration: e.duration, size: e.size,
+                                                  kind: TimelineEvent.Kind(rawValue: e.kind) ?? .end,
+                                                  flags: e.flags, chunk: e.chunk, lastChunk: e.last_chunk,
+                                                  phase: e.phase == RV_NONE ? nil : e.phase,
+                                                  board: e.board == RV_NONE ? nil : e.board,
+                                                  net: e.flags & RV_EVF_HAS_NET != 0 ? e.net : nil))
             }
         }
+        return t
+    }
+
+    /// A copy of the timeline: events, ticks and phases.  Events that did
+    /// not change since the last copy are not converted again (M6).
+    public func timeline() throws(CoreError) -> Timeline {
+        let t = try fetchTimeline()
+        let events = cachedEvents
         func copy(_ p: UnsafePointer<Double>?, _ n: UInt32) -> [Double] {
             guard let p, n > 0 else { return [] }
             return Array(UnsafeBufferPointer(start: p, count: Int(n)))
@@ -328,7 +427,8 @@ public final class Session {
                                         event: p.event))
         }
         return Timeline(events: events, ripTicks: rips, failureTicks: failures, phases: phases, total: total,
-                        routerSeconds: routerSeconds, generation: generation)
+                        routerSeconds: routerSeconds, generation: generation, span: t.span,
+                        unchanged: Int(t.unchanged))
     }
 
     /// The playback position and what is shown there.
@@ -741,6 +841,10 @@ public struct Timeline: Sendable {
     public let total: Double
     public let routerSeconds: Double
     public let generation: UInt32
+    /// The length the axis shows (M6): `total`, or more while a live trace grows.
+    public let span: Double
+    /// Events [0, unchanged) are the same as in the previous copy (M6).
+    public let unchanged: Int
 }
 
 public struct PlaybackPosition: Sendable {
@@ -806,6 +910,8 @@ public struct PlaybackChange: OptionSet, Sendable {
     public static let selection = PlaybackChange(rawValue: 16)
     /// The timeline's events or times (pacing; M5).
     public static let timeline = PlaybackChange(rawValue: 32)
+    /// Following or playing changed (M6).
+    public static let live = PlaybackChange(rawValue: 64)
 }
 
 public enum StepKind: UInt32, CaseIterable, Sendable {

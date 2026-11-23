@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace rv {
 
@@ -324,10 +325,23 @@ void Overlay::build(const OverlayInput &in) {
     // The selection: the dim rectangle and the board's copper of the net.
     if (in.select_active) {
         const std::array<float, 4> &r = in.dim_rect;
-        if (r[0] < r[2] && r[1] < r[3])
+        if (r[0] < r[2] && r[1] < r[3]) {
+            // M6: the key names the rectangle too (it changes with the board
+            // drawn and the session's grid while its colour stays), so a
+            // client never keeps the plane or the path of another one.
+            std::uint64_t h = 1469598103934665603ull; // FNV-1a over the four floats
+            for (float v : r) {
+                std::uint32_t bits;
+                std::memcpy(&bits, &v, 4);
+                for (int k = 0; k < 4; ++k) {
+                    h ^= (bits >> (8 * k)) & 0xFFu;
+                    h *= 1099511628211ull;
+                }
+            }
             lb.at(order_key(kRankDim, 0), Prim::Fill, 0, kClassRouted, kNone32,
-                  with_alpha(theme.background, colors.dim_alpha), 0, kGroupDim)
+                  with_alpha(theme.background, colors.dim_alpha), 0, kGroupDim | (h & ((1ull << 40) - 1)))
                 .rect(r[0], r[1], r[2], r[3]);
+        }
         if (in.select_board != nullptr) {
             const DisplayList &sl = *in.select_board;
             for (std::size_t k = 0; k < sl.batches.size(); ++k) {

@@ -58,7 +58,8 @@ final class TimelineView: NSView {
     /// The playhead's x, points (for the self-test).
     var playheadX: CGFloat { playhead.frame.midX }
 
-    /// The timeline changed (open, refresh): take it again.
+    /// The timeline changed (open, refresh, M6: a poll that read new events):
+    /// take it again.  Unchanged events are not converted again (RVKit).
     func reload() {
         timeline = try? session.timeline()
         columnsWidth = -1
@@ -80,9 +81,18 @@ final class TimelineView: NSView {
         placePlayhead()
     }
 
+    /// The length the strip shows: the run's, or (M6, a run being written)
+    /// the core's span, which grows by steps so that the events already
+    /// there keep their places, and the playhead with them.
+    private var span: Double {
+        guard let tl = timeline else { return 0 }
+        return max(tl.span, tl.total)
+    }
+
     private func x(of t: Double) -> CGFloat {
-        guard let tl = timeline, tl.total > 0 else { return 0 }
-        return CGFloat(t / tl.total) * bounds.width
+        let span = self.span
+        guard span > 0 else { return 0 }
+        return CGFloat(t / span) * bounds.width
     }
 
     private func placePlayhead() {
@@ -117,8 +127,9 @@ final class TimelineView: NSView {
         columns = Array(repeating: (0, false), count: n)
         columnsWidth = bounds.width
         guard let tl = timeline, tl.total > 0 else { return }
+        let span = self.span
         for e in tl.events where e.kind == .search {
-            let c = min(n - 1, max(0, Int(CGFloat(e.start / tl.total) * bounds.width)))
+            let c = min(n - 1, max(0, Int(CGFloat(e.start / span) * bounds.width)))
             // The largest search of the column; red if any found nothing.
             columns[c].size = max(columns[c].size, e.size)
             if !e.isFound { columns[c].failed = true }
@@ -200,7 +211,7 @@ final class TimelineView: NSView {
     private func time(at event: NSEvent) -> Double {
         guard let tl = timeline, bounds.width > 0 else { return 0 }
         let p = convert(event.locationInWindow, from: nil)
-        return Double(min(max(p.x / bounds.width, 0), 1)) * tl.total
+        return min(Double(min(max(p.x / bounds.width, 0), 1)) * span, tl.total)
     }
 
     override func mouseDown(with event: NSEvent) {

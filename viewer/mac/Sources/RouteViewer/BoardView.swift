@@ -85,9 +85,16 @@ final class BoardView: NSView {
     /// new display list and fit it.
     func reload() {
         try? session.zoomToFit()
+        fitWhenShown = false
         refresh()
+        fitWhenShown = layered.boardList.map { $0.board == nil && $0.batches.isEmpty } ?? true
         reportStatus()
     }
+
+    /// M6: the board was empty when the trace was opened (a run being
+    /// written): fit it once when it first shows something.  Later growth
+    /// keeps the camera.
+    private var fitWhenShown = false
 
     /// Visibility or the position changed: take the new lists, keep the camera.
     func displayListChanged() {
@@ -137,6 +144,12 @@ final class BoardView: NSView {
             if let list = try session.displayList(ifChangedSince: layered.boardList?.generation) {
                 layered.update(board: list)
                 updateMessage(list)
+                if fitWhenShown && !(list.board == nil && list.batches.isEmpty) {
+                    fitWhenShown = false
+                    try session.zoomToFit()
+                    setNeedsRefresh()
+                    reportStatus()
+                }
             }
             if let overlay = try session.overlay(ifChangedSince: layered.overlayList?.generation) {
                 layered.update(overlay: overlay)
@@ -385,9 +398,25 @@ enum TraceFiles {
         return urls.filter { $0.pathExtension.lowercased() == "grtrace" }
     }
 
+    /// Open each file as a document (File > Open, drops, Open Recent, the
+    /// command line and Finder all come here).  M6: a file that does not
+    /// exist yet (a run about to be recorded) opens a window that waits
+    /// for it; an empty or growing file is followed as it is written.
     @discardableResult
     static func open(_ urls: [URL]) -> Bool {
         for url in urls {
+            if let open = NSDocumentController.shared.document(for: url) {
+                open.showWindows()
+                continue
+            }
+            if !FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) {
+                do {
+                    try TraceDocument.openWaiting(url).showWindows()
+                } catch {
+                    NSApp.presentError(error)
+                }
+                continue
+            }
             NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, error in
                 if let error {
                     Task { @MainActor in NSApp.presentError(error) }

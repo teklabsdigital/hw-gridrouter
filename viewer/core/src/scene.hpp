@@ -35,6 +35,9 @@ public:
     // A new trace was opened or the trace was closed: forget the cached
     // lists and follow the position again.  Visibility and camera stay.
     void reset();
+    // M6: the outline of router session s gained items (the trace grew):
+    // forget its cached list.
+    void invalidate_outline(std::uint32_t session);
 
     // Board selection: a BRD index, or kNone32 to follow the position.
     void select(std::uint32_t index) { selection_ = index; }

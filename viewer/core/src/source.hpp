@@ -28,24 +28,39 @@ public:
     // which is less than n only at the end of the data.  Throws IoError on a
     // read error.
     virtual std::size_t read_at(std::uint64_t offset, void *buf, std::size_t n) = 0;
+
+    // M6.  Is the source still the one that was opened?  A file is not when
+    // its path now names another file, or no file (it was renamed away or
+    // deleted).  Throws IoError if that cannot be determined.
+    virtual bool replaced() { return false; }
+    // M6.  True while a source opened to wait for its file has none yet
+    // (size() is then 0).
+    virtual bool waiting() const { return false; }
 };
 
 // A trace file on disk, read with 64-bit positioned reads.  The file is
 // opened read-only and shared, so a writer can keep appending to it.
 class FileSource final : public Source {
 public:
-    // Opens the file at path (UTF-8).  Throws IoError.
-    explicit FileSource(const std::string &utf8_path);
+    // Opens the file at path (UTF-8).  Throws IoError.  With wait = true a
+    // path that does not exist yet is not an error: the source is empty and
+    // waiting() until a file appears there (size() opens it).
+    explicit FileSource(const std::string &utf8_path, bool wait = false);
     ~FileSource() override;
     FileSource(const FileSource &) = delete;
     FileSource &operator=(const FileSource &) = delete;
 
     std::uint64_t size() override;
     std::size_t read_at(std::uint64_t offset, void *buf, std::size_t n) override;
+    bool replaced() override;
+    bool waiting() const override { return !open_; }
 
 private:
+    bool try_open(bool missing_ok); // false: the path does not exist (missing_ok only)
+
     std::string path_;      // for messages
     std::intptr_t handle_;  // POSIX file descriptor or Windows HANDLE
+    bool open_ = false;
 };
 
 // Bytes in memory.  The buffer is shared so that a test can append to it

@@ -18,6 +18,7 @@
 #include "trace.hpp"
 #include "wavefront.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -59,18 +60,41 @@ public:
     // --- the open trace -------------------------------------------------
 
     // Replace the open trace (on success only: a failed open throws before
-    // anything changes).
-    void open(const std::string &path) {
-        std::unique_ptr<Trace> t = Trace::open_file(path);
+    // anything changes).  M6: wait opens a path with no file yet (waiting
+    // for it); live paces the trace as growing while it grows (prefix
+    // pacing) and follows it (see follow_step) when it is not complete.
+    void open(const std::string &path, bool wait = false, bool live = false) {
+        std::unique_ptr<Trace> t = Trace::open_file(path, wait);
         drop_borrowed();
         trace_ = std::move(t);
+        path_ = path;
+        open_wait_ = wait;
+        live_ = live;
         scene.reset();
         player = Player();
         timeline_.reset();
         waves.reset();
         picker.reset();
         select_board_.reset();
+        have_clock_ = false;
+        growth_now_ = poll_now_ = 0;
+        following_ = false;
+        skips_ = 0;
         rebuild_timeline(true);
+        span_ = live_paced() ? std::max(1.0, timeline_->total() * kSpanGrowth) : timeline_->total();
+        if (live_paced()) set_following(true);
+    }
+
+    // M6: open the path of the last open again with its flags, keeping the
+    // camera, the visibility, the pacing, the speed and the selection (a
+    // replaced file).
+    void reload() {
+        if (path_.empty()) throw std::invalid_argument("invalid argument: no trace was opened in this session");
+        const int speed = player.speed;
+        const std::string path = path_;
+        open(path, open_wait_, live_);
+        player.speed = speed;
+        if (selection_.active && selection_.has_net) select_net(selection_.net);
     }
 
     void close() noexcept {
@@ -85,6 +109,7 @@ public:
         nets.clear();
         select_board_.reset();
         player = Player();
+        following_ = false;
         ++timeline_generation_;
         sig_valid_ = false;
     }
@@ -98,14 +123,47 @@ public:
     // time), or at the end if it was there.
     void set_pacing(const PacingSettings &p);
 
-    // Read appended chunks and rebuild the timeline, keeping the position.
-    std::uint32_t refresh() {
-        Trace &t = trace();
-        drop_borrowed();
-        const std::uint32_t n = t.refresh();
-        if (n > 0) rebuild_timeline(false);
-        return n;
+    // Read appended chunks and extend the timeline (M6: incrementally),
+    // keeping the position (refresh_trace in session.cpp).  poll does the
+    // same with the client's clock `now` (seconds, any origin), which tells
+    // how long the file has not grown.
+    std::uint32_t refresh() { return refresh_trace(nullptr); }
+    std::uint32_t poll(double now) { return refresh_trace(&now); }
+
+    // --- M6: following a growing trace ---------------------------------------
+
+    // Is the trace still growing (no END, not stopped, not failed)?
+    bool growing() const { return trace_ && !trace_->complete() && !trace_->stopped() && !trace_->failed(); }
+    // Paced as a growing trace: opened live and still growing.
+    bool live_paced() const { return live_ && growing(); }
+    bool live() const { return live_; }
+    bool following() const { return following_; }
+    // Following on: to the end, playing forward, pulled along by new events
+    // (follow_step).  Off: pause.  On a trace that is not growing or was not opened live,
+    // on only moves the position to the end.
+    void set_following(bool on);
+    // Leave following (scrubbing, seeking, stepping): pause.
+    void stop_following() {
+        if (!following_) return;
+        following_ = false;
+        player.playing = false;
     }
+    // Seeking (the rv_seek_* calls): leaves following.
+    void seek(double t) {
+        stop_following();
+        set_time(t);
+    }
+    // The width of the timeline axis a client shows (rv_timeline.span).
+    double span() const { return span_; }
+
+    struct LiveInfo {
+        std::uint32_t state = 0; // RV_LIVE_*
+        double idle = 0;         // client seconds since the file last grew
+        double lag = 0;          // router seconds between the position and the newest chunk
+        std::uint32_t skips = 0; // times following jumped ahead
+    };
+    LiveInfo live_info() const;
+    std::string live_text() const;
 
     bool has_trace() const noexcept { return trace_ != nullptr; }
 
@@ -135,17 +193,24 @@ public:
         std::uint32_t board = kNone32, outline = kNone32;
         std::uint64_t overlay = 0, wave = 0, selection = 0;
         std::uint32_t timeline = 0;
+        std::uint32_t lists = 0;  // M6: scene lists built (an outline rebuilt as the trace grew)
+        bool following = false, playing = false;
     };
     Mark mark() {
         sync();
-        return Mark{player.t, scene.effective_board(trace_.get()), scene.effective_outline(trace_.get()), sig_count_,
-                    wave_count_, selection_serial_, timeline_generation_};
+        Mark m{player.t, scene.effective_board(trace_.get()), scene.effective_outline(trace_.get()), sig_count_,
+               wave_count_, selection_serial_, timeline_generation_};
+        m.lists = scene.builds();
+        m.following = following_;
+        m.playing = player.playing;
+        return m;
     }
     std::uint32_t changed_since(const Mark &m) {
         const Mark now = mark();
         std::uint32_t f = 0;
         if (now.t != m.t) f |= RV_CHANGED_POSITION;
-        if (now.board != m.board || now.outline != m.outline) f |= RV_CHANGED_BOARD;
+        if (now.board != m.board || now.outline != m.outline || now.lists != m.lists) f |= RV_CHANGED_BOARD;
+        if (now.following != m.following || now.playing != m.playing) f |= RV_CHANGED_LIVE;
         if (now.overlay != m.overlay) f |= RV_CHANGED_OVERLAY;
         if (now.wave != m.wave) f |= RV_CHANGED_WAVEFRONT;
         if (now.selection != m.selection) f |= RV_CHANGED_SELECTION;
@@ -159,13 +224,21 @@ public:
         sync();
     }
 
-    // Advance the clock by dt seconds of wall time (see rv_advance).
+    // Advance the clock by dt seconds of wall time (see rv_advance and, M6,
+    // follow_step).
     void advance(double dt) {
-        if (!player.playing || !timeline_ || timeline_->size() == 0) return;
+        if (!player.playing || !timeline_) return;
+        if (following_) {
+            follow_step(dt);
+            return;
+        }
+        if (timeline_->size() == 0) return;
         const double t = player.t + dt * player.speed_value() * player.direction;
         if (player.direction > 0 && t >= total()) {
             set_time(total());
-            player.playing = false;
+            // Playing into the end of a growing trace follows it (M6).
+            if (live_paced()) following_ = true;
+            else player.playing = false;
         } else if (player.direction < 0 && t <= 0) {
             set_time(0);
             player.playing = false;
@@ -175,13 +248,28 @@ public:
     }
 
     void play(bool on) {
-        if (!on || !timeline_ || timeline_->size() == 0) {
+        if (!on) {
+            following_ = false;
+            player.playing = false;
+            return;
+        }
+        if (!timeline_) return;
+        if (player.direction > 0 && player.t >= total() && live_paced()) {
+            set_following(true); // M6: play at the end of a growing trace: follow it
+            return;
+        }
+        if (timeline_->size() == 0) {
             player.playing = false;
             return;
         }
         if (player.direction > 0 && player.t >= total()) set_time(0);
         else if (player.direction < 0 && player.t <= 0) set_time(total());
         player.playing = true;
+    }
+
+    void set_direction(int direction) {
+        player.direction = direction > 0 ? 1 : -1;
+        if (player.direction < 0) following_ = false;
     }
 
     // Bring the scene's board choice and the overlay signature up to date.
@@ -266,8 +354,20 @@ public:
         hover.clear();
     }
 
+    // M6, following: constants of the rule (see rv.h, "Following").
+    static constexpr double kFollowLag = 2.0;     // router seconds behind before jumping
+    static constexpr double kCatchUp = 0.5;       // wall seconds to close the gap
+    static constexpr double kFollowSettled = 0.9; // fraction of a search shown at least
+    static constexpr double kStallSeconds = 5.0;  // idle this long: "stalled"
+    static constexpr double kSpanGrowth = 1.5;
+
 private:
     void rebuild_timeline(bool to_end);
+    std::uint32_t refresh_trace(const double *now);
+    void follow_step(double dt);
+    // Put the position at fraction frac of event e (just inside it at its
+    // end, so that the event stays the current one).
+    void keep_position(std::uint32_t e, double frac);
 
     struct Signature {
         std::uint32_t timeline = 0, event = kNone32, visibility = 0, board = kNone32, outline = kNone32;
@@ -315,6 +415,20 @@ private:
     std::uint64_t select_board_serial_ = ~0ull;
     std::uint32_t select_build_ = 0;
     const DisplayList *selected_board_list();
+    // M6
+    std::string path_;
+    bool open_wait_ = false, live_ = false;
+    bool following_ = false;
+    bool have_clock_ = false;
+    double poll_now_ = 0, growth_now_ = 0;
+    double span_ = 0;
+    std::uint32_t skips_ = 0;
+
+public:
+    // rv_get_timeline: leading entries of c_events still valid, and the
+    // largest search size they were scaled with.
+    std::uint32_t c_events_valid = 0;
+    double c_events_lmax = -1;
 };
 
 } // namespace rv

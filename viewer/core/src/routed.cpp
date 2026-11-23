@@ -110,8 +110,15 @@ CopperGeom via_geometry(const Run &run, const Via &v) {
 }
 
 std::vector<CopperGeom> build_copper_geometry(const Trace &t) {
-    std::vector<CopperGeom> out(t.copper().size());
-    for (std::size_t k = 0; k < out.size(); ++k) {
+    std::vector<CopperGeom> out;
+    append_copper_geometry(t, out);
+    return out;
+}
+
+void append_copper_geometry(const Trace &t, std::vector<CopperGeom> &out) {
+    const std::size_t from = out.size();
+    out.resize(std::max(from, t.copper().size()));
+    for (std::size_t k = from; k < out.size(); ++k) {
         const Copper &cu = t.copper()[k];
         if (!cu.valid || cu.session >= t.runs().size() || !t.runs()[cu.session].valid) continue;
         const Run &run = t.runs()[cu.session];
@@ -121,7 +128,6 @@ std::vector<CopperGeom> build_copper_geometry(const Trace &t) {
             out[k] = via_geometry(run, t.vias()[cu.record]);
         out[k].session = cu.session;
     }
-    return out;
 }
 
 DisplayList build_outline_list(const Trace &t, std::uint32_t session, const Theme &theme) {
@@ -168,7 +174,10 @@ DisplayList build_outline_list(const Trace &t, std::uint32_t session, const Them
          gx0, gy0, gx1, gy1);
     ++layers[edge].items;
 
-    for (const Chunk &c : t.chunks()) {
+    // The session's chunks only (M6: an outline is rebuilt as the trace grows).
+    const std::uint32_t end = std::min<std::uint32_t>(run.end_chunk, static_cast<std::uint32_t>(t.chunks().size()));
+    for (std::uint32_t k = std::min(run.chunk, end); k < end; ++k) {
+        const Chunk &c = t.chunks()[k];
         if (c.session != session || c.corrupt || c.record == kNone32) continue;
         if (c.kind == Kind::Pad) {
             const Pad &p = t.pads()[c.record];

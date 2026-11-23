@@ -12,7 +12,8 @@
  *   - No function aborts or lets a C++ exception escape.
  *   - Pointers returned by the core are borrowed: they stay valid until the
  *     next call that changes the same session, or until rv_destroy().  The
- *     calls that change a session are rv_open, rv_close, rv_refresh,
+ *     calls that change a session are rv_open, rv_open_ex, rv_reload,
+ *     rv_close, rv_refresh, rv_poll, rv_set_following, rv_live_text,
  *     rv_board_select, rv_layer_set_visible, rv_class_set_visible, the
  *     playback calls (rv_advance, rv_play, rv_set_direction, rv_set_speed,
  *     rv_speed_step, rv_seek_*, rv_step, rv_jump, rv_set_pacing), the
@@ -35,7 +36,9 @@
  * overlay of router copper, rip-up ghosts, failure markers and the current
  * event.  Milestone M4: the wavefront of each search as images, and pacing
  * modes.  Milestone M5: the nets table, the net selection and its
- * highlight, hit testing, and the attempt history of a net.
+ * highlight, hit testing, and the attempt history of a net.  Milestone M6:
+ * following a trace while it is written (rv_open_ex, rv_poll, rv_live_*,
+ * rv_set_following), with every table extended incrementally.
  *
  * The trace file format is docs/TRACE_FORMAT.md in the router repository.
  */
@@ -53,7 +56,7 @@ extern "C" {
  * compares this compile-time value with rv_api_version() at run time to make
  * sure it was linked against the core it was compiled for.
  */
-#define RV_API_VERSION 6u
+#define RV_API_VERSION 7u
 
 /* "No id": an absent search, route, copper or session index. */
 #define RV_NONE 0xFFFFFFFFu
@@ -65,8 +68,9 @@ typedef enum rv_status {
     RV_E_NO_MEMORY = 2,        /* an allocation failed */
     RV_E_INTERNAL = 3,         /* any other failure inside the core */
     RV_E_IO = 4,               /* the file could not be opened or read */
-    RV_E_FORMAT = 5,           /* not a trace file, or it shrank or was rewritten */
-    RV_E_UNSUPPORTED = 6       /* a trace format major version this core cannot read */
+    RV_E_FORMAT = 5,           /* not a trace file */
+    RV_E_UNSUPPORTED = 6,      /* a trace format major version this core cannot read */
+    RV_E_REPLACED = 7          /* M6: the file is no longer the trace that was opened: reload it */
 } rv_status;
 
 /* Opaque session handle. */
@@ -109,12 +113,125 @@ rv_status rv_close(rv_session *session);
 
 /*
  * Read chunks appended to the file since the last open or refresh.  Stores
- * the number of new chunks in *new_chunks (if not NULL).  If the file shrank
- * or its header changed, the trace enters a failed state: this and every
- * later refresh return RV_E_FORMAT, and the facts already read stay
- * available.  Close and reopen the file to read it again.
+ * the number of new chunks in *new_chunks (if not NULL).  Everything derived
+ * (timeline, nets table, histories, overlay, hit testing, the board list) is
+ * extended incrementally, in time proportional to what was appended, and the
+ * session then equals one opened afresh on the same bytes (the position,
+ * the view and the selection aside).  With RV_OPEN_LIVE the current event
+ * never changes because of a refresh: events that existed keep their times
+ * while the trace grows, and when it completes (refit) the position keeps
+ * its event and the fraction of it played; following moves the position
+ * only in rv_advance.  Without RV_OPEN_LIVE (M5 behaviour) every refresh
+ * refits; a position at the end goes to the new end, any other keeps its
+ * event and fraction.
+ *
+ * Replacement (M6): if the file is no longer the one opened (it shrank, its
+ * header or the last indexed chunk header changed, or its path now names
+ * another file or none), the trace enters a failed state: this and every
+ * later refresh return RV_E_REPLACED, and the facts already read stay
+ * available and unchanged (two runs are never mixed).  Reload it
+ * (rv_reload).  A header that is not a trace's gives RV_E_FORMAT or
+ * RV_E_UNSUPPORTED, also for good.  RV_E_IO (the file cannot be read now)
+ * is not a failed state.
  */
 rv_status rv_refresh(rv_session *session, uint32_t *new_chunks);
+
+/* ---- M6: following a trace while it is written ----------------------------- */
+
+/* rv_open_ex flags. */
+#define RV_OPEN_WAIT 1u /* a path with no file yet opens an empty trace that waits for it
+                           (RV_LIVE_WAITING; rv_poll opens the file once it appears) */
+#define RV_OPEN_LIVE 2u /* follow the trace while it grows: prefix pacing (see rv_pacing)
+                           and following on at open if the trace is not complete */
+
+/*
+ * rv_open with flags (RV_OPEN_*; rv_open is rv_open_ex with 0).  Opening a
+ * complete trace with RV_OPEN_LIVE is the same as without it.
+ */
+rv_status rv_open_ex(rv_session *session, const char *path, uint32_t flags);
+
+/*
+ * Open the path of the last rv_open or rv_open_ex again, with its flags,
+ * after RV_E_REPLACED.  Keeps the camera, layer and object visibility, the
+ * pacing, the speed and the selected router net; everything else is as
+ * after an open.  RV_E_INVALID_ARGUMENT if nothing was opened.
+ */
+rv_status rv_reload(rv_session *session);
+
+/*
+ * rv_refresh for a client that follows a file: call it on a timer (the Mac
+ * client: every 0.25 s while the trace is not complete).  `now` is the
+ * client's clock in seconds (any origin, non-decreasing); the core has no
+ * clock of its own and uses it only to tell how long the file has not grown
+ * (rv_live.idle_seconds).  `changed` (may be NULL) gets RV_CHANGED_* bits:
+ * RV_CHANGED_TIMELINE when events were added or retimed, the others as for
+ * the playback calls.  Errors as rv_refresh.
+ */
+rv_status rv_poll(rv_session *session, double now, uint32_t *new_chunks, uint32_t *changed);
+
+/* What the file is doing (rv_live.state). */
+typedef enum rv_live_state {
+    RV_LIVE_NONE = 0,     /* no trace open */
+    RV_LIVE_WAITING = 1,  /* no file yet (RV_OPEN_WAIT), or its header is not written yet */
+    RV_LIVE_GROWING = 2,  /* no END yet, and it grew within RV_LIVE_STALL_SECONDS */
+    RV_LIVE_STALLED = 3,  /* no END, and it has not grown for RV_LIVE_STALL_SECONDS or more
+                             (a run that died without END stays here: the core has no timeout) */
+    RV_LIVE_COMPLETE = 4, /* END read */
+    RV_LIVE_STOPPED = 5,  /* reading stopped at a corrupt chunk header */
+    RV_LIVE_REPLACED = 6, /* RV_E_REPLACED: reload */
+    RV_LIVE_FAILED = 7    /* the header is not a trace's */
+} rv_live_state;
+
+#define RV_LIVE_STALL_SECONDS 5.0
+
+typedef struct rv_live {
+    double idle_seconds;   /* now of the last rv_poll minus now of the rv_poll that last saw
+                              the file grow (0 before the first rv_poll) */
+    double lag_seconds;    /* router seconds from the current event's last chunk to the
+                              newest chunk */
+    uint64_t file_size;    /* bytes seen */
+    uint64_t indexed_end;  /* bytes indexed (a chunk being written is not) */
+    uint32_t state;        /* rv_live_state */
+    uint32_t following;    /* 1 while following (see rv_set_following) */
+    uint32_t live;         /* 1 if opened with RV_OPEN_LIVE */
+    uint32_t chunks;       /* chunks indexed */
+    uint32_t events;
+    uint32_t skips;        /* times following jumped ahead (more than RV_FOLLOW_LAG behind) */
+} rv_live;
+
+rv_status rv_live_get(rv_session *session, rv_live *out);
+
+/* One line for a live indicator: "Live: growing, 12.3 MB, 4 012 events",
+ * "Live: stalled, no new data for 12 s, ...", "Complete: ...", "Waiting for
+ * the file", "Replaced: ...".  "" with no trace.  Borrowed until the next
+ * rv_live_text or any call that changes the session. */
+rv_status rv_live_text(rv_session *session, const char **text);
+
+/*
+ * Following.  On (rv_set_following 1, rv_jump to the end, rv_play at the
+ * end, playing forward into the end, or rv_open_ex with RV_OPEN_LIVE of a
+ * growing trace): the position goes to the end (rv_play: stays there) and
+ * the session plays forward toward the newest event; each rv_advance(dt):
+ *   - if the current event's last chunk is more than RV_FOLLOW_LAG router
+ *     seconds older than the newest chunk, jumps to the start of the first
+ *     event within RV_FOLLOW_LAG of it (rv_live.skips counts these);
+ *   - else moves forward at max(speed, gap / RV_FOLLOW_CATCH_UP) playback
+ *     seconds per second, gap being the playback time left to the end, but
+ *     stops at RV_FOLLOW_SETTLED of the first search with time (the current
+ *     event included) that has not reached that point: at most one new
+ *     search per call, and no search is skipped (each is shown with its
+ *     wavefront settled);
+ *   - at the end, stays there (playing) while the trace grows; when the
+ *     trace no longer grows (END), following ends there and playback pauses.
+ * Off: pausing (rv_play 0), any seek, rv_step, rv_set_direction(-1) or
+ * rv_set_following 0 (which pauses).  rv_set_following 1 on a trace that is
+ * not growing, or not opened with RV_OPEN_LIVE, only jumps to the end.
+ * `changed` gets RV_CHANGED_LIVE when following or playing changed.
+ */
+#define RV_FOLLOW_LAG 2.0
+#define RV_FOLLOW_CATCH_UP 0.5
+#define RV_FOLLOW_SETTLED 0.9
+rv_status rv_set_following(rv_session *session, uint32_t on, uint32_t *changed);
 
 /* ---- file-level facts --------------------------------------------------- */
 
@@ -686,13 +803,19 @@ typedef struct rv_timeline {
     const double *failure_ticks; /* start of each event with failed pads; borrowed */
     double total;                /* playback seconds of the whole run at 1x (0 if no event has time) */
     double router_seconds;       /* t of the last chunk */
+    double span;                 /* M6: the length the axis shows: total, except while a trace
+                                    opened with RV_OPEN_LIVE grows: then it grows by steps
+                                    (x1.5 when total reaches it), so old events keep their
+                                    place on the axis between steps */
     uint32_t event_count;
     uint32_t rip_tick_count;
     uint32_t failure_tick_count;
     uint32_t phase_count;
-    uint32_t generation;         /* changes when the timeline is rebuilt or repaced
-                                    (open, refresh, rv_set_pacing) */
-    uint32_t reserved;           /* 0 */
+    uint32_t generation;         /* changes when the timeline is rebuilt, extended or repaced
+                                    (open, refresh, rv_poll, rv_set_pacing) */
+    uint32_t unchanged;          /* M6: events [0, unchanged) are the same, in every field, as
+                                    at the previous rv_get_timeline call on this session (0
+                                    after an open) */
 } rv_timeline;
 
 /* The timeline.  With no trace open: no events.  Borrowed. */
@@ -744,7 +867,8 @@ rv_status rv_position_get(rv_session *session, rv_position *out);
                                    change an image's order or layer. */
 #define RV_CHANGED_SELECTION 16u /* M5: the selection changed (the overlay too) */
 #define RV_CHANGED_TIMELINE 32u  /* M5: the timeline was repaced (one-net pacing follows the
-                                    selection): fetch rv_get_timeline again */
+                                    selection) or (M6) extended: fetch rv_get_timeline again */
+#define RV_CHANGED_LIVE 64u      /* M6: following or playing changed */
 
 /*
  * The clock.  rv_advance moves t by dt * speed * direction seconds of wall
@@ -832,7 +956,8 @@ rv_status rv_text(rv_session *session, uint32_t which, const char **text);
  *
  * Keys: an overlay key always names the same geometry for one value of the
  * overlay list's geometry_generation (the key epoch; it changes on rv_open
- * and rv_refresh), so a client may keep prepared paths across positions.
+ * and rv_reload, M6: no longer on rv_refresh, which only adds keys), so a
+ * client may keep prepared paths across positions and refreshes.
  * Copper is grouped in blocks of 64 copper ids per (slot, primitive,
  * width), so a commit or a rip-up changes only a few batches.  Overlay keys
  * are >= 0x80000000 and never equal a board key.  `generation` changes
@@ -954,7 +1079,16 @@ rv_status rv_get_wavefront_image(rv_session *session, uint32_t index, rv_wavefro
  *                          first event: 0), times `slowdown`; a search that
  *                          found nothing at most 0.010 s of router time.
  * When no event gets time the run lasts 0 s and shows its end.
+ *
+ * Prefix pacing (M6): while a trace opened with RV_OPEN_LIVE grows, an
+ * event's time depends only on itself and the events before it, so events
+ * already read keep their times when the file grows.  The fit modes then
+ * give an event weight * fit_seconds / RV_LIVE_FIT_WEIGHT seconds at 1x
+ * (the run's total grows as it is written); real time is a prefix pacing
+ * anyway.  When END is read the fit modes are refitted to fit_seconds over
+ * the whole run (the position keeps its event and fraction).
  */
+#define RV_LIVE_FIT_WEIGHT 30000.0
 typedef enum rv_pacing_mode {
     RV_PACING_FIT = 0,
     RV_PACING_NETS_ONLY = 1,
@@ -1070,7 +1204,9 @@ typedef struct rv_net_row {
     double seconds;
     int64_t expanded;
     const char *name;       /* borrowed: the NETS name, else "net <code>" */
-    uint32_t row;           /* index in the table (stable until the table is rebuilt) */
+    uint32_t row;           /* index in the table (stable until the table is rebuilt; M6: a
+                               refresh that adds rows can move it, rows being sorted by
+                               net and session) */
     int32_t net;            /* router net code */
     uint32_t session;       /* RUN index, RV_NONE for a net no chunk mentions */
     uint32_t named;         /* 1 if NETS gives it a name (it can match board nets) */

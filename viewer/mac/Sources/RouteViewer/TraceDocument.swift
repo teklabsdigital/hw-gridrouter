@@ -28,7 +28,9 @@ final class TraceDocument: NSDocument {
                               userInfo: [NSLocalizedFailureReasonErrorKey: "The viewer core is unavailable."])
             }
             do throws(CoreError) {
-                try session.open(path: url.path(percentEncoded: false))
+                // M6: a trace still being written is followed (live), and a
+                // file with no header yet is waited for.
+                try session.open(path: url.path(percentEncoded: false), flags: [.live, .wait])
             } catch {
                 throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadCorruptFileError,
                               userInfo: [NSLocalizedDescriptionKey:
@@ -42,6 +44,36 @@ final class TraceDocument: NSDocument {
         }
     }
 
+    /// M6: the file grows while it is followed; the window's poll reads it.
+    /// NSDocument must not offer to revert, nor warn that the file changed
+    /// on disk (the document is read only and never saved).
+    nonisolated override func presentedItemDidChange() {}
+
+    /// The poll keeps the date NSDocument compares in step with the file.
+    func noteFileChanged() {
+        guard let path = fileURL?.path(percentEncoded: false),
+              let date = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+        else { return }
+        if fileModificationDate != date { fileModificationDate = date }
+    }
+
+    /// M6: open a trace whose file does not exist yet (the recorder has not
+    /// created it): a document that waits for it.  `noteRecent` false for
+    /// the self-test.
+    @discardableResult
+    static func openWaiting(_ url: URL, noteRecent: Bool = true) throws -> TraceDocument {
+        let doc = TraceDocument()
+        doc.fileURL = url
+        doc.fileType = TraceDocument.typeName
+        try doc.read(from: url, ofType: TraceDocument.typeName)
+        NSDocumentController.shared.addDocument(doc)
+        doc.makeWindowControllers()
+        if noteRecent { NSDocumentController.shared.noteNewRecentDocumentURL(url) }
+        return doc
+    }
+
+    static let typeName = "local.visual-gridrouter.grtrace"
+
     /// The window title: the file name, extension included.
     override var displayName: String! {
         get { fileURL?.lastPathComponent ?? super.displayName }
@@ -49,7 +81,7 @@ final class TraceDocument: NSDocument {
     }
 
     override func makeWindowControllers() {
-        guard let session else { return }
+        guard let session, windowControllers.isEmpty else { return }
         let controller = BoardWindowController(session: session)
         addWindowController(controller)
         controller.reload()
@@ -79,6 +111,22 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
     private var link: CADisplayLink?
     private var lastTick: CFTimeInterval?
     private var resumeAfterScrub = false
+
+    // M6: following a trace while it is written.
+    /// The core's live text ("Live: growing, ..."); hidden for a trace that
+    /// was complete when it was opened.
+    let liveLabel = NSTextField(labelWithString: "")
+    private var liveButton: NSButton!
+    /// Polls the file every `pollInterval` seconds while it is not complete.
+    private var pollTimer: Timer?
+    static let pollInterval: TimeInterval = 0.25
+    /// The clock handed to the core's poll (the self-test drives its own).
+    var clock: () -> Double = { ProcessInfo.processInfo.systemUptime }
+    /// The trace was not complete when it was (re)opened: show the live text.
+    private var showsLive = false
+    /// Polls made, and the time they took in the core and in the views (seconds).
+    private(set) var pollCount = 0
+    private(set) var pollSeconds: [Double] = []
 
     init(session: Session) {
         self.session = session
@@ -135,6 +183,13 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         caption.lineBreakMode = .byTruncatingTail
         caption.cell?.truncatesLastVisibleLine = true
         caption.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        liveLabel.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        liveLabel.textColor = .secondaryLabelColor
+        liveLabel.alignment = .right
+        liveLabel.lineBreakMode = .byTruncatingTail
+        liveLabel.isHidden = true
+        liveLabel.translatesAutoresizingMaskIntoConstraints = false
+        liveLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         message.font = .systemFont(ofSize: 15)
         message.textColor = NSColor(white: 0.75, alpha: 1)
         message.alignment = .center
@@ -156,7 +211,11 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         content.addSubview(panel)
         content.addSubview(bar)
         bar.addSubview(status)
+        bar.addSubview(liveLabel)
         NSLayoutConstraint.activate([
+            liveLabel.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -8),
+            liveLabel.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            liveLabel.leadingAnchor.constraint(greaterThanOrEqualTo: status.trailingAnchor, constant: 12),
             inspector.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             inspector.topAnchor.constraint(equalTo: content.topAnchor),
             inspector.bottomAnchor.constraint(equalTo: content.bottomAnchor),
@@ -196,7 +255,6 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
             bar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             bar.heightAnchor.constraint(equalToConstant: 22),
             status.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 8),
-            status.trailingAnchor.constraint(lessThanOrEqualTo: bar.trailingAnchor, constant: -8),
             status.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
         ])
         window.contentView = content
@@ -221,6 +279,13 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
             button("forward.frame.fill", "Step forward (→; ⇧→ by net)", #selector(stepForward(_:))),
             button("forward.end.fill", "Go to the end (End)", #selector(goToEnd(_:))),
         ]
+        // M6: back to following a trace that is being written.
+        liveButton = NSButton(title: "Live", target: self, action: #selector(goLive(_:)))
+        liveButton.controlSize = .small
+        liveButton.bezelStyle = .push
+        liveButton.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+        liveButton.toolTip = "Follow the run as it is written (L or End)"
+        liveButton.isHidden = true
         for kind in StepKind.allCases {
             stepPopup.addItem(withTitle: "Step by \(kind.name)")
             stepPopup.lastItem?.tag = Int(kind.rawValue)
@@ -251,11 +316,13 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         positionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        let stack = NSStackView(views: buttons + [stepPopup, slower, speedLabel, faster, pacingPopup, spacer,
-                                                  positionLabel])
+        let stack = NSStackView(views: buttons + [liveButton, stepPopup, slower, speedLabel, faster, pacingPopup,
+                                                  spacer, positionLabel])
+        stack.detachesHiddenViews = true
         stack.orientation = .horizontal
         stack.spacing = 4
         stack.setCustomSpacing(12, after: buttons.last!)
+        stack.setCustomSpacing(12, after: liveButton)
         stack.setCustomSpacing(12, after: stepPopup)
         stack.setCustomSpacing(12, after: faster)
         return stack
@@ -271,6 +338,111 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         inspector.reload()
         updateNetMarks()
         updateTransport()
+        startLive()
+    }
+
+    // MARK: - Following a trace while it is written (M6)
+
+    /// After an open or a reload: poll while the trace is not complete.
+    private func startLive() {
+        let info = try? session.live()
+        showsLive = info?.needsPolling ?? false
+        if showsLive { startPolling() } else { stopPolling() }
+        updateLive()
+    }
+
+    private func startPolling() {
+        guard pollTimer == nil else { return }
+        let timer = Timer(timeInterval: BoardWindowController.pollInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.poll() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        pollTimer = timer
+    }
+
+    private func stopPolling() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+    }
+
+    var isPolling: Bool { pollTimer != nil }
+
+    /// Read what the recorder appended and bring every view up to date (the
+    /// timer calls this; the self-test too, with its own clock).
+    func poll() {
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        defer {
+            pollCount += 1
+            pollSeconds.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9)
+            updateLive()
+        }
+        let result: (added: UInt32, change: PlaybackChange)
+        do throws(CoreError) {
+            result = try session.poll(now: clock())
+        } catch {
+            // The file is another run now: read it from the start, keeping
+            // the camera and the visibility (the core keeps them).
+            if error.status == CoreError.replaced { reloadReplaced() }
+            return
+        }
+        if result.added > 0 {
+            (document as? TraceDocument)?.noteFileChanged()
+            grew(result.change)
+        } else if !result.change.isEmpty {
+            apply(result.change)
+        }
+    }
+
+    /// New chunks: the timeline grows (its events keep their places), the
+    /// board and the overlay take the new lists, the nets table its rows;
+    /// the position and the camera stay.
+    private func grew(_ changed: PlaybackChange) {
+        if changed.contains(.timeline) {
+            timelineView.reload()
+            updateNetMarks()
+        }
+        if changed.contains(.board) { panel.reload() }
+        boardView.refresh()
+        updateTransport()
+        inspector.update(force: true)
+    }
+
+    /// The file was replaced by another run: open it again in place.
+    private func reloadReplaced() {
+        stopPolling()
+        do throws(CoreError) {
+            try session.reload()
+        } catch {
+            boardView.onMessage?("The trace could not be read again: \(error.message)")
+        }
+        panel.reload()
+        timelineView.reload()
+        boardView.refresh()
+        boardView.reportStatus()
+        inspector.reload()
+        updateNetMarks()
+        updateTransport()
+        startLive()
+    }
+
+    /// The live text, the Live button; stop polling once complete.
+    func updateLive() {
+        guard let info = try? session.live() else { return }
+        let text = showsLive ? ((try? session.liveText()) ?? "") : ""
+        if liveLabel.stringValue != text { liveLabel.stringValue = text }
+        liveLabel.isHidden = text.isEmpty
+        liveLabel.textColor = info.state == .replaced || info.state == .failed || info.state == .stopped
+            ? .systemRed : (info.following ? .labelColor : .secondaryLabelColor)
+        let growing = info.live && (info.state == .growing || info.state == .stalled || info.state == .waiting)
+        if liveButton.isHidden == growing { liveButton.isHidden = !growing }
+        liveButton.state = info.following ? .on : .off
+        liveButton.isEnabled = !info.following
+        if !info.needsPolling && info.state != .replaced { stopPolling() }
+    }
+
+    @objc func goLive(_ sender: Any?) {
+        apply((try? session.setFollowing(true)) ?? [])
+        updateLive()
     }
 
     /// Bring the views up to date after a playback call.
@@ -280,6 +452,7 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         if !changed.intersection([.board, .overlay, .wavefront]).isEmpty { boardView.refresh() }
         updateTransport()
         inspector.update(playing: isPlaying)
+        if showsLive && (changed.contains(.live) || changed.contains(.position)) { updateLive() }
     }
 
     /// The selection changed (a click on the board, a row of the table).
@@ -355,10 +528,14 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         apply(changed)
     }
 
-    private func scrub(_ phase: TimelineView.Scrub, to t: Double) {
+    /// The timeline view's scrubbing (the self-test calls this too).  M6: a
+    /// scrub stops following (the core's rule), and playback does not resume
+    /// after it if it was following: the position stays where it was put.
+    func scrub(_ phase: TimelineView.Scrub, to t: Double) {
         if phase == .began {
-            resumeAfterScrub = isPlaying
-            if resumeAfterScrub { _ = try? session.setPlaying(false) }
+            let following = (try? session.live().following) ?? false
+            resumeAfterScrub = isPlaying && !following
+            if isPlaying { _ = try? session.setPlaying(false) }
         }
         apply((try? session.seek(time: t)) ?? [])
         if phase == .ended, resumeAfterScrub {
@@ -477,6 +654,10 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         case #selector(stepForward(_:))?, #selector(stepBackward(_:))?, #selector(nextNet(_:))?,
              #selector(previousNet(_:))?, #selector(goToStart(_:))?, #selector(goToEnd(_:))?:
             return hasEvents
+        case #selector(goLive(_:))?:
+            guard let info = try? session.live() else { return false }
+            menuItem.state = info.following ? .on : .off
+            return info.live && (info.state == .growing || info.state == .stalled || info.state == .waiting)
         default:
             return true
         }
@@ -491,6 +672,7 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
     func windowWillClose(_ notification: Notification) {
         link?.invalidate()
         link = nil
+        stopPolling()
         // After the document has gone: show the welcome window if it was the last.
         DispatchQueue.main.async {
             (NSApp.delegate as? AppDelegate)?.showWelcomeIfIdle()

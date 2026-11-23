@@ -9,7 +9,11 @@
 //   rvrender --compare GOLDEN.png NEW.png [--tolerance T] [--max-fraction F]
 //   rvrender --bench FILE [--size WxH] [--frames N] [--board N]
 //   rvrender --bench-playback FILE [--size WxH] [--speed S] [--frames N] [--bands B] [--pacing PACING]
-//                                  [--select NET]
+//                                  [--select NET] [--crop-grid G]
+//   rvrender --crops FILE [--size WxH] [--at F] [--frames TRIALS]
+//                                  how much a slot plane changes when only its crop does (M6)
+//   rvrender --bench-live SRC DIR [--size WxH] [--rate BYTES_PER_S] [--bands B]
+//                                  SRC written into DIR while followed (M6)
 //   rvrender --selftest FILE [--size WxH]
 //   rvrender --repeat FILE [--size WxH] [--at FRACTION]   how repeatable the banded rasteriser is
 //
@@ -43,6 +47,9 @@ func usage() -> Never {
            rvrender --bench FILE [--size WxH] [--frames N] [--board N]
            rvrender --bench-playback FILE [--size WxH] [--speed S] [--frames N] [--bands B] [--pacing PACING]
                                           [--select NET]
+           rvrender --bench-live SRC DIR [--size WxH] [--rate BYTES_PER_S] [--bands B]
+           rvrender --crops FILE [--size WxH] [--at F] [--frames TRIALS]
+           (--bench-playback also takes --crop-grid G)
            rvrender --selftest FILE [--size WxH]
            rvrender --repeat FILE [--size WxH] [--at FRACTION]
     PACING: fit[:SECONDS], nets, net:NET, skip-failed, real[:SLOWDOWN]
@@ -70,6 +77,10 @@ struct Options {
     var into: Double?
     var pacing: Pacing?
     var select: String?
+    /// --bench-live: bytes per second.
+    var rate = 5_000_000.0
+    /// LayeredRenderer.cropGrid (M6 carry-over measurements).
+    var cropGrid = 0
 }
 
 /// "fit", "fit:60", "nets", "net:4", "skip-failed", "real", "real:10" (as rvdump).
@@ -155,6 +166,12 @@ func parseOptions(_ args: ArraySlice<String>) -> Options {
         case "--pacing":
             guard let p = parsePacing(value(a)) else { usage() }
             o.pacing = p
+        case "--crop-grid":
+            guard let g = Int(value(a)), g >= 0, g <= 4096 else { usage() }
+            o.cropGrid = g
+        case "--rate":
+            guard let r = Double(value(a)), r > 0 else { usage() }
+            o.rate = r
         case "--select":
             let v = value(a)
             guard !v.isEmpty else { usage() }
@@ -536,6 +553,7 @@ func benchPlayback(_ o: Options) -> Int32 {
     let s = openSession(o.positional[0], o2, needBoard: false)
     let r = LayeredRenderer()
     r.bands = o.bands
+    r.cropGrid = o.cropGrid
     do {
         try s.setSpeed(o.speed)
         let p0 = try s.position()
@@ -670,6 +688,160 @@ func benchPlayback(_ o: Options) -> Int32 {
             return String(format: "%@ %.1f", name, Double(image.width * image.height * 4) / 1e6)
         }
         print("    MB by plane: " + sizes.joined(separator: ", "))
+        return 0
+    } catch {
+        fail("\(error)")
+    }
+}
+
+/// Carry-over from M5 (M6): how much a cropped slot plane changes when only
+/// its crop changes, for crop grids 0 (M5) and 16 to 256 pixels, in one band
+/// and in the default bands, at five positions of the run (--at: one).
+@MainActor
+func crops(_ o: Options) -> Int32 {
+    guard o.positional.count == 1 else { usage() }
+    let s = openSession(o.positional[0], o, needBoard: false)
+    let trials = o.framesGiven ? o.frames : 6
+    do {
+        let view = try s.view()
+        print("rvrender: crops \(o.positional[0]) at \(o.width) x \(o.height) px, \(trials) grown crops per slot plane")
+        for bands in [1, 0] {
+            // With a grid, slot planes are drawn in one context (bands do not apply).
+            for grid in bands == 1 ? [0, 64, 128, 256, 512] : [0] {
+                var total = (compared: 0, differing: 0, over48: 0, worst: 0)
+                for f in o.at.map({ [$0] }) ?? [0.2, 0.4, 0.6, 0.8, 1.0] {
+                    try s.seek(fraction: f)
+                    let r = LayeredRenderer()
+                    r.bands = bands
+                    r.cropGrid = grid
+                    try sync(s, r)
+                    let m = r.cropStability(view: view, trials: trials)
+                    total.compared += m.compared
+                    total.differing += m.differing
+                    total.over48 += m.over48
+                    total.worst = max(total.worst, m.worst)
+                }
+                print(String(format: "  bands %@ grid %3d: %10d px compared, %7d differ (%.4f%%), %5d by more than 48, "
+                                + "largest difference %d",
+                             bands == 0 ? "auto" : "1   ", grid, total.compared, total.differing,
+                             100 * Double(total.differing) / Double(max(1, total.compared)), total.over48, total.worst))
+            }
+        }
+        return 0
+    } catch {
+        fail("\(error)")
+    }
+}
+
+// MARK: - Following a run while it is written (M6)
+
+/// SRC written again into a file in DIR at RATE bytes per second (simulated:
+/// the writes are not waited for), polled every 0.25 s as the app's timer
+/// does, with 15 frames of 1/60 s between polls while following.  Per poll:
+/// the core's rv_poll, then the client's share (the timeline copy, the nets
+/// table's info and its first 40 rows of cells, the board and overlay lists
+/// and the planes).  Ends when following stops at END.
+@MainActor
+func benchLive(_ o: Options) -> Int32 {
+    guard o.positional.count == 2 else { usage() }
+    let src = o.positional[0], dir = o.positional[1]
+    // Read piece by piece, so that the copy does not count in the memory peak.
+    guard let input = FileHandle(forReadingAtPath: src),
+          let size = (try? FileManager.default.attributesOfItem(atPath: src))?[.size] as? Int
+    else { fail("cannot read \(src)") }
+    let path = (dir as NSString).appendingPathComponent("bench-live-\(getpid()).grtrace")
+    try? FileManager.default.removeItem(atPath: path)
+    defer { try? FileManager.default.removeItem(atPath: path) }
+    guard FileManager.default.createFile(atPath: path, contents: nil),
+          let handle = FileHandle(forWritingAtPath: path) else { fail("cannot write \(path)") }
+    let interval = 0.25
+    let piece = max(1, Int(o.rate * interval))
+    let r = LayeredRenderer()
+    r.bands = o.bands
+    do {
+        let s = try Session()
+        try s.open(path: path, flags: [.live, .wait])
+        try s.setViewSize(width: Double(o.width), height: Double(o.height), backing: 1)
+        var written = 0, polls = 0
+        var now = 0.0
+        var core: [Double] = [], client: [Double] = [], frames: [Double] = []
+        var worst: (ms: Double, poll: Int, chunks: UInt32, bytes: Int, events: UInt32) = (0, 0, 0, 0, 0)
+        var fitted = false
+        var following = 0
+        while true {
+            if written < size {
+                autoreleasepool {
+                    let data = input.readData(ofLength: min(piece, size - written))
+                    handle.write(data)
+                    written += data.count
+                }
+                if written >= size { handle.closeFile() }
+            }
+            now += interval
+            let before = try s.live()
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            let result = try s.poll(now: now)
+            let t1 = DispatchTime.now().uptimeNanoseconds
+            if result.added > 0 {
+                // The client's share, as the window's poll does it.
+                _ = try s.timeline()
+                let info = try s.netsInfo()
+                for p in 0..<min(40, info.viewCount) {
+                    for c in NetColumn.allCases { _ = try s.netCell(at: p, column: c) }
+                }
+                if !fitted, let list = try s.displayList(), list.board != nil || !list.batches.isEmpty {
+                    try s.zoomToFit()
+                    fitted = true
+                }
+                try sync(s, r)
+                r.render(view: try s.view())
+            }
+            let t2 = DispatchTime.now().uptimeNanoseconds
+            polls += 1
+            let coreMs = Double(t1 - t0) / 1e6
+            core.append(coreMs)
+            if result.added > 0 { client.append(Double(t2 - t1) / 1e6) }
+            if coreMs > worst.ms {
+                let after = try s.live()
+                worst = (coreMs, polls, result.added, Int(after.indexedEnd - before.indexedEnd), after.events - before.events)
+            }
+            // A quarter of a second of frames.
+            for _ in 0..<15 {
+                try autoreleasepool { () throws -> Void in
+                    let f0 = DispatchTime.now().uptimeNanoseconds
+                    _ = try s.advance(by: 1.0 / 60)
+                    try sync(s, r)
+                    r.render(view: try s.view())
+                    let ms = Double(DispatchTime.now().uptimeNanoseconds - f0) / 1e6
+                    if try s.live().following {
+                        frames.append(ms)
+                        following += 1
+                    }
+                }
+            }
+            let l = try s.live()
+            if written >= size && l.state == .complete && !l.following { break }
+            if polls > 100_000 { fail("did not end") }
+        }
+        let pe = try s.position()
+        let l = try s.live()
+        print(String(format: "rvrender: live bench %@: %d bytes at %.1f MB/s (%d per poll), %d polls of %.2f s, "
+                        + "%u events, run %.1f s at the end",
+                     src, size, o.rate / 1e6, piece, polls, interval, pe.eventCount, pe.total))
+        func row(_ label: String, _ v: [Double]) {
+            print("  " + label.padding(toLength: 44, withPad: " ", startingAt: 0)
+                  + String(format: " median %6.2f ms   p90 %6.2f ms   p99 %6.2f ms   worst %6.2f ms   sum %7.1f ms",
+                           median(v), percentile(v, 0.9), percentile(v, 0.99), v.max() ?? 0, v.reduce(0, +)))
+        }
+        row("refresh (rv_poll), every poll", core)
+        row("client share of a poll that read chunks", client)
+        row("frames while following (\(following))", frames)
+        print(String(format: "  worst poll: #%d, %u chunks, %d bytes, %u events, %.2f ms", worst.poll, worst.chunks,
+                     worst.bytes, worst.events, worst.ms))
+        print("  following: \(l.skips) jumps ahead (more than RV_FOLLOW_LAG behind); state at the end: \(l.state)")
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        print(String(format: "  peak resident memory: %.1f MB", Double(usage.ru_maxrss) / 1e6))
         return 0
     } catch {
         fail("\(error)")
@@ -1077,6 +1249,8 @@ switch first {
 case "--compare": exit(compare(parseOptions(args.dropFirst())))
 case "--bench": exit(bench(parseOptions(args.dropFirst())))
 case "--bench-playback": exit(benchPlayback(parseOptions(args.dropFirst())))
+case "--bench-live": exit(benchLive(parseOptions(args.dropFirst())))
+case "--crops": exit(crops(parseOptions(args.dropFirst())))
 case "--selftest": exit(selfTest(parseOptions(args.dropFirst())))
 case "--repeat": exit(repeatTest(parseOptions(args.dropFirst())))
 default: exit(render(parseOptions(args)))

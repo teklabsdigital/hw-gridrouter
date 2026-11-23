@@ -177,6 +177,24 @@ int main(void) {
         if (RV_PICK_POINTS != 3.0 || RV_HIT_WAVEFRONT != 7u || RV_HIST_RIP_OTHER != 10u) ++failures;
     }
 
+    /* M6, following a growing file, from C with no trace open. */
+    {
+        rv_live live;
+        uint32_t changed = 7;
+        if (rv_open_ex(s, "/nonexistent/dir/missing.grtrace", RV_OPEN_LIVE) != RV_E_IO) ++failures;
+        if (rv_open_ex(s, "/nonexistent/dir/missing.grtrace", 8u) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (rv_reload(s) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (rv_poll(s, 1.0, &count, &changed) != RV_E_INVALID_ARGUMENT || count != 0 || changed != 0) ++failures;
+        if (rv_live_get(s, &live) != RV_OK || live.state != RV_LIVE_NONE || live.following != 0) ++failures;
+        if (rv_live_text(s, &text) != RV_OK || text == NULL || text[0] != '\0') ++failures;
+        if (rv_set_following(s, 1, &changed) != RV_OK || changed != 0) ++failures;
+        if (rv_live_get(NULL, &live) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (RV_E_REPLACED != 7 || RV_CHANGED_LIVE != 64u || RV_LIVE_FAILED != 7) ++failures;
+        if (RV_FOLLOW_LAG != 2.0 || RV_FOLLOW_CATCH_UP != 0.5 || RV_FOLLOW_SETTLED != 0.9) ++failures;
+        if (RV_LIVE_STALL_SECONDS != 5.0 || RV_OPEN_WAIT != 1u || RV_OPEN_LIVE != 2u) ++failures;
+        if (RV_LIVE_FIT_WEIGHT != 30000.0) ++failures;
+    }
+
     if (strcmp(rv_kind_tag(RV_CHUNK_BRD), "BRD ") != 0) ++failures;
     if (strcmp(rv_kind_tag(RV_CHUNK_KIND_COUNT), "????") != 0) ++failures;
     if (RV_NONE != 0xFFFFFFFFu || (RV_SRCH_HAS_TRACE >> 9) != 1u) ++failures;

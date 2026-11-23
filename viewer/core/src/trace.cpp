@@ -315,16 +315,23 @@ Trace::Trace(std::unique_ptr<Source> source) : src_(std::move(source)) {
     scan();
 }
 
-std::unique_ptr<Trace> Trace::open_file(const std::string &utf8_path) {
-    std::unique_ptr<Source> src(new FileSource(utf8_path));
+std::unique_ptr<Trace> Trace::open_file(const std::string &utf8_path, bool wait) {
+    std::unique_ptr<Source> src(new FileSource(utf8_path, wait));
     return std::unique_ptr<Trace>(new Trace(std::move(src)));
 }
 
 std::uint32_t Trace::refresh() {
-    if (failed()) throw FormatError(failure_);
+    if (failed()) {
+        if (replaced_) throw ReplacedError(failure_);
+        throw FormatError(failure_);
+    }
     const std::size_t before = chunks_.size();
     try {
         scan();
+    } catch (const ReplacedError &e) {
+        replaced_ = true;
+        fail_state(e.what());
+        throw;
     } catch (const FormatError &e) {
         fail_state(e.what());
         throw;
@@ -358,7 +365,7 @@ void Trace::read_exact(std::uint64_t offset, void *buf, std::size_t n) {
     if (n == 0) return;
     const std::size_t got = src_->read_at(offset, buf, n);
     if (got != n)
-        throw FormatError("the file ended at offset " + std::to_string(offset + got) +
+        throw ReplacedError("the file ended at offset " + std::to_string(offset + got) +
                           " although " + std::to_string(offset + n) +
                           " bytes were indexed; it shrank or was rewritten");
 }
@@ -377,7 +384,7 @@ const unsigned char *Trace::window(std::uint64_t offset, std::size_t n) {
     if (want < n) throw FormatError("internal: window read outside the file");
     const std::size_t got = src_->read_at(offset, win_.data(), want);
     if (got < n)
-        throw FormatError("the file ended at offset " + std::to_string(offset + got) +
+        throw ReplacedError("the file ended at offset " + std::to_string(offset + got) +
                           " although it was " + std::to_string(size_) +
                           " bytes long; it shrank or was rewritten");
     win_have_ = got;
@@ -428,7 +435,7 @@ void Trace::check_unchanged() {
     unsigned char h[24];
     read_exact(0, h, 24);
     if (std::memcmp(h, header_, 24) != 0)
-        throw FormatError("the file header changed: the file was rewritten since it was opened");
+        throw ReplacedError("the file header changed: the file was rewritten since it was opened");
     if (!chunks_.empty()) {
         const Chunk &c = chunks_.back();
         unsigned char x[16];
@@ -436,16 +443,20 @@ void Trace::check_unchanged() {
         std::uint64_t tbits;
         std::memcpy(&tbits, &c.t, 8);
         if (std::memcmp(x, c.tag, 4) != 0 || get_u32(x + 4) != c.len || get_u64(x + 8) != tbits)
-            throw FormatError("the chunk header at offset " + std::to_string(c.offset) +
+            throw ReplacedError("the chunk header at offset " + std::to_string(c.offset) +
                               " changed: the file was rewritten since it was opened");
     }
 }
 
 void Trace::scan() {
     win_have_ = 0; // the window never outlives one scan
+    // M6: another file now has the name (renamed over, deleted and created
+    // again): the bytes read so far belong to another run.
+    if (size_ > 0 && src_->replaced())
+        throw ReplacedError("the file was replaced: its name now refers to another file or to none");
     const std::uint64_t size = src_->size();
     if (size < size_)
-        throw FormatError("the file shrank from " + std::to_string(size_) + " to " +
+        throw ReplacedError("the file shrank from " + std::to_string(size_) + " to " +
                           std::to_string(size) + " bytes; it is no longer the trace that was opened");
     size_ = size;
 
@@ -507,6 +518,7 @@ void Trace::process(Chunk c) {
     c.kind = kind_from_tag(c.tag);
     c.session = session_;
     ++kind_counts_[static_cast<int>(c.kind)];
+    cur_has_net_ = false;
 
     if (!chunks_.empty() && !(c.t >= chunks_.back().t))
         issue(Issue::Warning, idx, c.offset,
@@ -556,6 +568,8 @@ void Trace::process(Chunk c) {
               "SNAP is not immediately followed by a GRDS with which = 1 (6 rule 5)");
 
     if (c.session != kNone32) runs_[c.session].end_chunk = idx + 1;
+    c.has_net = cur_has_net_;
+    c.net = cur_has_net_ ? cur_net_ : 0;
     chunks_.push_back(c);
 }
 
@@ -586,6 +600,8 @@ void Trace::add_net_chunk(std::int32_t net, std::uint32_t idx) {
     if (net == kBlock) return;
     if (session_ != kNone32 && runs_[session_].valid && net == runs_[session_].block) return;
     net_chunks_[net].push_back(idx);
+    cur_has_net_ = true;
+    cur_net_ = net;
 }
 
 // --- one function per kind --------------------------------------------------------

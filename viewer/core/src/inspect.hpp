@@ -3,6 +3,10 @@
 // Both are functions of the trace and the timeline; the table's "now"
 // columns are functions of the playback position as well.
 //
+// M6: the table grows with the trace (extend): only the rows the appended
+// chunks touch are computed again, and the rows equal those of a table built
+// at once from the same chunks.  Rows are stored by (net, session).
+//
 // The table has one row per (router session, router net) that any chunk is
 // about (Trace::net_chunks, plus the RIP chunks that removed the net's
 // copper), and one row with session kNone32 for each net named by NETS that
@@ -42,7 +46,9 @@
 #include "records.hpp"
 
 #include <cstdint>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace rv {
@@ -92,12 +98,17 @@ struct NetRow {
         NetNow now;
     };
     std::vector<Point> points;              // the state after each event that changes it
+    bool open_route = false;                // M6: a route_net call without RNE (seconds grow)
 };
 
 class NetTable {
 public:
     void clear();
     void build(const Trace &t, const Timeline &tl);
+    // M6: take in what the trace and the timeline gained since the build or
+    // the last extend (the timeline extended once since then).  Nothing if
+    // not built.
+    void extend(const Trace &t, const Timeline &tl);
     bool built() const { return built_; }
 
     const std::vector<NetRow> &rows() const { return rows_; }
@@ -122,8 +133,16 @@ public:
 
 private:
     void resort();
+    void sync(const Trace &t, const Timeline &tl, bool fresh);
+    std::uint32_t find_row(std::uint32_t session, std::int32_t net) const;
+    bool row_exists(const Trace &t, std::uint32_t session, std::int32_t net) const;
+    void build_row(const Trace &t, const Timeline &tl, NetRow &r) const;
+    void place_row(const Trace &t, const Timeline &tl, std::uint32_t session, std::int32_t net, bool exists);
 
     bool built_ = false;
+    // (session, net) -> copper indices and failure indices, all of them
+    std::map<std::pair<std::uint32_t, std::int32_t>, std::vector<std::uint32_t>> copper_by_, failures_by_;
+    std::uint32_t chunks_seen_ = 0, copper_seen_ = 0, failures_seen_ = 0;
     std::vector<NetRow> rows_;
     std::uint32_t column_ = netcol::Name;
     bool descending_ = false;

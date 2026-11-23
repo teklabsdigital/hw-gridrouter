@@ -40,6 +40,8 @@ struct Chunk {
     char tag[4] = {0, 0, 0, 0};
     Kind kind = Kind::Unknown;
     bool corrupt = false;           // payload did not fit its layout; see issues
+    bool has_net = false;           // M6: the chunk is in Trace::net_chunks() under `net`
+    std::int32_t net = 0;
 
     std::uint64_t payload_offset() const { return offset + 16; }
     std::uint64_t end_offset() const { return offset + 16 + len + (8 - len % 8) % 8; }

@@ -10,8 +10,10 @@
 // The reader never loads the whole file.
 //
 // refresh() indexes chunks appended since the last scan, so a viewer can
-// follow a file that is still being written.  A file that shrank or whose
-// header changed puts the trace in a failed state.
+// follow a file that is still being written.  A file that is no longer the
+// one opened (M6: it shrank, its header or the last indexed chunk header
+// changed, or its path names another file or none) puts the trace in a
+// failed state with replaced() true.
 //
 // A corrupt chunk (payload not fitting its layout) becomes an error issue
 // and is skipped; it never stops the reader, except a chunk header with a
@@ -93,15 +95,18 @@ public:
     // Fewer than 24 bytes that agree with the start of a header are not an
     // error: the header is "not written yet" (10 of the spec).
     explicit Trace(std::unique_ptr<Source> source);
-    static std::unique_ptr<Trace> open_file(const std::string &utf8_path);
+    // wait (M6): a path with no file yet opens as an empty trace that is
+    // waiting() for its file.
+    static std::unique_ptr<Trace> open_file(const std::string &utf8_path, bool wait = false);
 
     Trace(const Trace &) = delete;
     Trace &operator=(const Trace &) = delete;
 
     // Index chunks appended since the last scan.  Returns how many were
-    // added.  Throws FormatError if the file shrank or was rewritten (and
-    // keeps failing afterwards; the tables stay as they were), IoError if it
-    // cannot be read.
+    // added.  Throws ReplacedError (a FormatError) if the file is no longer
+    // the one opened, FormatError or UnsupportedVersion for a header that is
+    // not a trace's (each keeps failing afterwards; the tables stay as they
+    // were), IoError if it cannot be read (not a failed state).
     std::uint32_t refresh();
 
     // --- file-level facts -------------------------------------------------
@@ -113,6 +118,8 @@ public:
     bool complete() const { return complete_; }  // END indexed
     bool stopped() const { return stopped_; }    // corrupt chunk header; reading stopped
     bool failed() const { return !failure_.empty(); }
+    bool replaced() const { return replaced_; }  // M6: failed because the file was replaced
+    bool waiting() const { return src_->waiting(); } // M6: no file at the path yet
     const std::string &failure() const { return failure_; }
     std::uint64_t file_size() const { return size_; }
     std::uint64_t indexed_end() const { return scan_off_; } // first byte not yet indexed
@@ -244,7 +251,11 @@ private:
     bool complete_ = false;
     bool stopped_ = false;
     bool after_end_warned_ = false;
+    bool replaced_ = false;
     std::string failure_;
+    // the net of the chunk being processed (add_net_chunk), for Chunk::net
+    bool cur_has_net_ = false;
+    std::int32_t cur_net_ = 0;
 
     // read-ahead window, valid only within one scan
     std::vector<unsigned char> win_;

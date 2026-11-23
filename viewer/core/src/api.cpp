@@ -41,6 +41,9 @@ rv_status status_from_current_exception(rv::Session *session) noexcept {
     } catch (const rv::IoError &e) {
         status = RV_E_IO;
         message = e.what();
+    } catch (const rv::ReplacedError &e) {
+        status = RV_E_REPLACED;
+        message = e.what();
     } catch (const rv::FormatError &e) {
         status = RV_E_FORMAT;
         message = e.what();
@@ -143,10 +146,20 @@ const char *rv_last_error(const rv_session *session) {
 // --- opening ---------------------------------------------------------------------
 
 rv_status rv_open(rv_session *session, const char *path) {
+    return rv_open_ex(session, path, 0);
+}
+
+rv_status rv_open_ex(rv_session *session, const char *path, uint32_t flags) {
     return guarded(session, [&](rv::Session &s) {
         require_out(path, "path");
-        s.open(path);
+        if ((flags & ~(RV_OPEN_WAIT | RV_OPEN_LIVE)) != 0)
+            throw std::invalid_argument("invalid argument: unknown open flags " + std::to_string(flags));
+        s.open(path, (flags & RV_OPEN_WAIT) != 0, (flags & RV_OPEN_LIVE) != 0);
     });
+}
+
+rv_status rv_reload(rv_session *session) {
+    return guarded(session, [&](rv::Session &s) { s.reload(); });
 }
 
 rv_status rv_close(rv_session *session) {
@@ -159,6 +172,50 @@ rv_status rv_refresh(rv_session *session, uint32_t *new_chunks) {
         const uint32_t n = s.refresh();
         if (new_chunks != nullptr) *new_chunks = n;
     });
+}
+
+rv_status rv_poll(rv_session *session, double now, uint32_t *new_chunks, uint32_t *changed) {
+    if (new_chunks != nullptr) *new_chunks = 0;
+    return playback(session, changed, [&](rv::Session &s) {
+        require_finite(now, "now");
+        const uint32_t n = s.poll(now);
+        if (new_chunks != nullptr) *new_chunks = n;
+    });
+}
+
+rv_status rv_live_get(rv_session *session, rv_live *out) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        rv_live l;
+        std::memset(&l, 0, sizeof l);
+        const rv::Session::LiveInfo li = s.live_info();
+        l.state = li.state;
+        l.idle_seconds = li.idle;
+        l.lag_seconds = li.lag;
+        l.skips = li.skips;
+        l.following = s.following() ? 1u : 0u;
+        l.live = s.live() ? 1u : 0u;
+        if (const rv::Trace *t = s.trace_or_null()) {
+            l.file_size = t->file_size();
+            l.indexed_end = t->indexed_end();
+            l.chunks = static_cast<uint32_t>(t->chunks().size());
+            l.events = s.timeline() != nullptr ? s.timeline()->size() : 0;
+        }
+        *out = l;
+    });
+}
+
+rv_status rv_live_text(rv_session *session, const char **text) {
+    if (text != nullptr) *text = nullptr;
+    return guarded(session, [&](rv::Session &s) {
+        require_out(text, "text");
+        s.text_out = s.live_text();
+        *text = s.text_out.c_str();
+    });
+}
+
+rv_status rv_set_following(rv_session *session, uint32_t on, uint32_t *changed) {
+    return playback(session, changed, [&](rv::Session &s) { s.set_following(on != 0); });
 }
 
 // --- facts -----------------------------------------------------------------------
@@ -656,10 +713,18 @@ rv_status rv_get_timeline(rv_session *session, rv_timeline *out) {
         const rv::Timeline *t = s.timeline();
         if (t != nullptr) {
             std::vector<rv_event> &ce = s.c_events;
+            tl.unchanged = t->size();
             if (s.c_events_generation != s.timeline_generation()) {
+                // M6: only the events that changed since the last call (the
+                // others too when the largest search grew: it scales `size`).
                 const double lmax = std::log1p(t->max_search_size());
+                std::size_t from = lmax == s.c_events_lmax ? std::min<std::size_t>(s.c_events_valid, ce.size()) : 0;
+                if (from > t->size()) from = t->size();
                 ce.resize(t->size());
-                for (std::size_t k = 0; k < ce.size(); ++k) {
+                tl.unchanged = static_cast<uint32_t>(from);
+                s.c_events_lmax = lmax;
+                s.c_events_valid = t->size();
+                for (std::size_t k = from; k < ce.size(); ++k) {
                     const rv::Event &e = t->events()[k];
                     rv_event &c = ce[k];
                     std::memset(&c, 0, sizeof c);
@@ -689,6 +754,7 @@ rv_status rv_get_timeline(rv_session *session, rv_timeline *out) {
             tl.failure_tick_count = static_cast<uint32_t>(t->failure_ticks().size());
             tl.phase_count = static_cast<uint32_t>(t->phases().size());
             tl.total = t->total();
+            tl.span = std::max(s.span(), t->total());
             const rv::Trace &tr = s.trace();
             tl.router_seconds = tr.chunks().empty() ? 0.0 : tr.chunks().back().t;
         }
@@ -775,7 +841,7 @@ rv_status rv_play(rv_session *session, uint32_t playing, uint32_t *changed) {
 rv_status rv_set_direction(rv_session *session, int32_t direction) {
     return guarded(session, [&](rv::Session &s) {
         if (direction == 0) throw std::invalid_argument("invalid argument: direction must be +1 or -1");
-        s.player.direction = direction > 0 ? 1 : -1;
+        s.set_direction(direction);
     });
 }
 
@@ -802,14 +868,14 @@ rv_status rv_speed_step(rv_session *session, int32_t steps) {
 rv_status rv_seek_time(rv_session *session, double t, uint32_t *changed) {
     return playback(session, changed, [&](rv::Session &s) {
         require_finite(t, "t");
-        s.set_time(t);
+        s.seek(t);
     });
 }
 
 rv_status rv_seek_fraction(rv_session *session, double fraction, uint32_t *changed) {
     return playback(session, changed, [&](rv::Session &s) {
         require_finite(fraction, "fraction");
-        s.set_time(fraction * s.total());
+        s.seek(fraction * s.total());
     });
 }
 
@@ -817,18 +883,23 @@ rv_status rv_seek_event(rv_session *session, uint32_t event, uint32_t *changed) 
     return playback(session, changed, [&](rv::Session &s) {
         const rv::Timeline *t = s.timeline();
         require_index(event, t == nullptr ? 0 : t->size(), "event");
-        s.set_time(t->events()[event].start);
+        s.seek(t->events()[event].start);
     });
 }
 
 rv_status rv_jump(rv_session *session, uint32_t to_end, uint32_t *changed) {
-    return playback(session, changed, [&](rv::Session &s) { s.set_time(to_end != 0 ? s.total() : 0.0); });
+    return playback(session, changed, [&](rv::Session &s) {
+        // M6: to the end of a growing trace opened live is "Live": follow it.
+        if (to_end != 0 && s.live_paced()) s.set_following(true);
+        else s.seek(to_end != 0 ? s.total() : 0.0);
+    });
 }
 
 rv_status rv_step(rv_session *session, uint32_t kind, int32_t direction, uint32_t *changed) {
     return playback(session, changed, [&](rv::Session &s) {
         require_index(kind, rv::kStepKindCount, "step kind");
         if (direction == 0) throw std::invalid_argument("invalid argument: direction must be +1 or -1");
+        s.stop_following();
         s.player.playing = false;
         const rv::Timeline *t = s.timeline();
         if (t == nullptr) return;

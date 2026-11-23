@@ -3,6 +3,8 @@
 #include "session.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 
 namespace rv {
 
@@ -17,7 +19,7 @@ void Session::rebuild_timeline(bool to_end) {
     }
     timeline_.reset();
     geometry_.clear();
-    timeline_.reset(new Timeline(*trace_, *make_pacing(pacing_)));
+    timeline_.reset(new Timeline(*trace_, *make_pacing(pacing_), live_paced()));
     geometry_ = build_copper_geometry(*trace_);
     overlay.reset();
     nets.clear();
@@ -25,6 +27,7 @@ void Session::rebuild_timeline(bool to_end) {
     select_board_.reset();
     select_board_serial_ = ~0ull;
     ++timeline_generation_;
+    c_events_valid = 0;
     sig_valid_ = false;
     if (at_end || timeline_->size() == 0) {
         player.t = timeline_->total();
@@ -36,6 +39,249 @@ void Session::rebuild_timeline(bool to_end) {
     sync();
 }
 
+void Session::keep_position(std::uint32_t e, double frac) {
+    const Timeline &tl = *timeline_;
+    if (e >= tl.size()) {
+        player.t = std::min(player.t, tl.total());
+        return;
+    }
+    const Event &ev = tl.events()[e];
+    double t = std::min(tl.total(), ev.start + frac * ev.duration);
+    if (tl.event_at(t) != e && ev.duration > 0) {
+        // At the event's end, which is now the next event's start: just
+        // before it, so that the event stays the current one.
+        t = std::max(ev.start, std::nextafter(ev.start + ev.duration, ev.start));
+    }
+    player.t = t;
+}
+
+std::uint32_t Session::refresh_trace(const double *now) {
+    Trace &t = trace();
+    drop_borrowed();
+    if (now != nullptr && !have_clock_) {
+        have_clock_ = true;
+        growth_now_ = *now;
+    }
+    if (now != nullptr) poll_now_ = *now;
+    const std::uint64_t size_before = t.file_size();
+    const auto chunks_before = static_cast<std::uint32_t>(t.chunks().size());
+    const bool paced_live = timeline_ && timeline_->live();
+    std::uint32_t n = 0;
+    try {
+        n = t.refresh();
+    } catch (...) {
+        if (now != nullptr && t.file_size() > size_before) growth_now_ = *now;
+        throw;
+    }
+    if (now != nullptr && t.file_size() > size_before) growth_now_ = *now;
+    if (!timeline_ || (n == 0 && paced_live == live_paced())) return n;
+
+    // The position: its event and the fraction of it played.
+    const std::uint32_t e_cur = event();
+    const bool at_end = timeline_->size() == 0 || player.t >= timeline_->total();
+    const double frac = e_cur != kNone32 ? event_fraction(*timeline_, e_cur, player.t) : 0.0;
+
+    const Timeline::Change c = timeline_->extend(*make_pacing(pacing_), live_paced());
+    append_copper_geometry(t, geometry_);
+    nets.extend(t, *timeline_);
+
+    // Outlines of sessions that gained pads, claims, keep-outs or discs.
+    const std::vector<Chunk> &ch = t.chunks();
+    std::uint32_t last_session = kNone32;
+    for (std::uint32_t k = chunks_before; k < ch.size(); ++k) {
+        const Chunk &cc = ch[k];
+        if ((cc.kind == Kind::Pad || cc.kind == Kind::Rect || cc.kind == Kind::Disc) && cc.session != last_session) {
+            scene.invalidate_outline(cc.session);
+            last_session = cc.session;
+        }
+    }
+    // A selected router net gets the name NETS gives it.
+    if (selection_.active && selection_.has_net) {
+        auto it = t.net_names().find(selection_.net);
+        const std::string name = it != t.net_names().end() ? it->second : std::string();
+        if (name != selection_.name) {
+            selection_.name = name;
+            ++selection_serial_;
+        }
+    }
+    ++timeline_generation_;
+    c_events_valid = std::min(c_events_valid, c.first);
+    sig_valid_ = false;
+
+    // The current event never changes because of a refresh: events before
+    // c.first kept their times; otherwise the same event at the same
+    // fraction.  Following, the position stays where it is (follow_step
+    // moves it), unless the trace was refitted.
+    if (!live_ && at_end) {
+        // Opened without RV_OPEN_LIVE (M5 behaviour): at the end stays at the end.
+        player.t = timeline_->total();
+    } else if (e_cur == kNone32) {
+        // No event before: following plays from the start (jumping ahead if
+        // far behind); otherwise the end, as when opened.
+        player.t = following_ ? 0.0 : timeline_->total();
+    } else if (c.repaced) {
+        keep_position(e_cur, frac);
+    } else if (e_cur >= c.first) {
+        // Prefix pacing: the event was recomputed (it was the last, still
+        // growing) but kept its start; the same time is still in it, exactly
+        // (recomputing it from the fraction could move it by a rounding).
+        if (!(player.t <= timeline_->total() && timeline_->event_at(player.t) == e_cur)) keep_position(e_cur, frac);
+    }
+    // The axis: the total once complete; while growing it grows by
+    // kSpanGrowth when the total reaches it.
+    if (!live_paced()) span_ = timeline_->total();
+    else if (timeline_->total() > span_) span_ = timeline_->total() * kSpanGrowth;
+    // Following ends at the end of a trace that is no longer growing.
+    if (!live_paced() && following_ && player.t >= timeline_->total()) {
+        following_ = false;
+        player.playing = false;
+    }
+    if (scene.effective_outline(&t) != kNone32) scene.full(&t); // rebuilt now: reported as RV_CHANGED_BOARD
+    sync();
+    return n;
+}
+
+void Session::set_following(bool on) {
+    if (!on) {
+        following_ = false;
+        player.playing = false;
+        return;
+    }
+    if (!timeline_) return;
+    if (!live_paced()) {
+        following_ = false;
+        set_time(total());
+        return;
+    }
+    // To the newest event, then pulled along.
+    following_ = true;
+    player.playing = true;
+    player.direction = 1;
+    set_time(total());
+}
+
+// Following (rv.h, "Following"): play forward toward the newest event.
+//   - Behind by more than kFollowLag router seconds (the newest chunk's time
+//     minus the time of the current event's last chunk): jump to the start
+//     of the first event within kFollowLag of the newest chunk.
+//   - Else move at max(speed, gap / kCatchUp) playback seconds per second,
+//     gap being the playback time to the end, so a gap closes in about
+//     kCatchUp seconds; but stop at kFollowSettled of the first search with
+//     time whose point kFollowSettled is still ahead (the current event
+//     included): at most one new search per frame, and none is skipped:
+//     each is shown with its wavefront settled.
+//   - At the end: stay there, playing, while the trace grows; once it no
+//     longer grows, stop following and pause.
+void Session::follow_step(double dt) {
+    const Timeline &tl = *timeline_;
+    const double total_t = tl.total();
+    if (tl.size() == 0 || player.t >= total_t) {
+        if (!live_paced()) {
+            following_ = false;
+            player.playing = false;
+        }
+        if (tl.size() > 0) set_time(total_t);
+        return;
+    }
+    const std::vector<Chunk> &ch = trace_->chunks();
+    const double newest = ch.empty() ? 0.0 : ch.back().t;
+    const std::uint32_t e = event();
+    const double lag = newest - ch[tl.events()[e].last].t;
+    if (lag > kFollowLag) {
+        std::uint32_t k = tl.size() - 1;
+        while (k > e + 1 && newest - ch[tl.events()[k - 1].last].t <= kFollowLag) --k;
+        if (k > e) {
+            ++skips_;
+            set_time(tl.events()[k].start);
+            return;
+        }
+    }
+    const double v = std::max(player.speed_value(), (total_t - player.t) / kCatchUp);
+    double t1 = std::min(total_t, player.t + v * dt);
+    for (std::uint32_t k = e; k < tl.size() && tl.events()[k].start < t1; ++k) {
+        const Event &ev = tl.events()[k];
+        if (ev.kind != EvKind::Search || ev.duration <= 0) continue;
+        const double settled = ev.start + kFollowSettled * ev.duration;
+        if (!(settled > player.t)) continue; // the current search, shown settled already
+        t1 = std::min(t1, settled);
+        break;
+    }
+    set_time(std::max(player.t, t1));
+    if (player.t >= total_t && !live_paced()) {
+        following_ = false;
+        player.playing = false;
+    }
+}
+
+Session::LiveInfo Session::live_info() const {
+    LiveInfo li;
+    if (!trace_) return li;
+    const Trace &t = *trace_;
+    if (t.replaced()) li.state = RV_LIVE_REPLACED;
+    else if (t.failed()) li.state = RV_LIVE_FAILED;
+    else if (t.stopped()) li.state = RV_LIVE_STOPPED;
+    else if (t.complete()) li.state = RV_LIVE_COMPLETE;
+    else if (!t.header_complete()) li.state = RV_LIVE_WAITING;
+    else li.state = RV_LIVE_GROWING;
+    li.idle = have_clock_ ? std::max(0.0, poll_now_ - growth_now_) : 0.0;
+    if (li.state == RV_LIVE_GROWING && li.idle >= kStallSeconds) li.state = RV_LIVE_STALLED;
+    if (timeline_ && !t.chunks().empty()) {
+        const std::uint32_t e = event();
+        if (e != kNone32) li.lag = std::max(0.0, t.chunks().back().t - t.chunks()[timeline_->events()[e].last].t);
+    }
+    li.skips = skips_;
+    return li;
+}
+
+namespace {
+std::string megabytes(std::uint64_t bytes) {
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%.1f MB", static_cast<double>(bytes) / 1e6);
+    return buf;
+}
+std::string grouped_count(std::uint64_t v) {
+    std::string d = std::to_string(v), out;
+    for (std::size_t k = 0; k < d.size(); ++k) {
+        if (k > 0 && (d.size() - k) % 3 == 0) out += "\u2009";
+        out += d[k];
+    }
+    return out;
+}
+} // namespace
+
+std::string Session::live_text() const {
+    if (!trace_) return "";
+    const LiveInfo li = live_info();
+    const Trace &t = *trace_;
+    const std::string size = megabytes(t.file_size());
+    const std::string events = grouped_count(timeline_ ? timeline_->size() : 0) + " events";
+    char buf[160];
+    switch (li.state) {
+    case RV_LIVE_WAITING:
+        return t.waiting() ? "Waiting for the file" : "Waiting for the recorder to start";
+    case RV_LIVE_GROWING: {
+        std::string s = "Live: growing, " + size + ", " + events;
+        if (following_ && li.lag >= 0.5) {
+            std::snprintf(buf, sizeof buf, ", %.1f s behind", li.lag);
+            s += buf;
+        }
+        return s;
+    }
+    case RV_LIVE_STALLED:
+        std::snprintf(buf, sizeof buf, "Live: stalled, no new data for %.0f s", std::floor(li.idle));
+        return std::string(buf) + ", " + size + ", " + events;
+    case RV_LIVE_COMPLETE:
+        return "Complete: " + size + ", " + events;
+    case RV_LIVE_STOPPED:
+        return "Reading stopped at a corrupt chunk header: " + size + ", " + events;
+    case RV_LIVE_REPLACED:
+        return "Replaced: the file on disk is another run";
+    case RV_LIVE_FAILED:
+        return "Unreadable: " + t.failure();
+    default: return "";
+    }
+}
+
 void Session::set_pacing(const PacingSettings &p) {
     if (p == pacing_) return;
     pacing_ = p;
@@ -45,6 +291,9 @@ void Session::set_pacing(const PacingSettings &p) {
     const double frac = at_end ? 0.0 : event_fraction(*timeline_, e, player.t);
     timeline_->repace(*make_pacing(pacing_));
     ++timeline_generation_;
+    c_events_valid = 0;
+    if (!live_paced()) span_ = timeline_->total();
+    else span_ = std::max(span_, timeline_->total() * kSpanGrowth);
     sig_valid_ = false;
     if (at_end) {
         player.t = timeline_->total();

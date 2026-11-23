@@ -1,8 +1,12 @@
 // file.cpp: FileSource, the only platform-specific code in the core.
 //
-// POSIX (macOS, Linux): open + fstat + pread, 64-bit offsets.
+// POSIX (macOS, Linux): open + fstat + pread, 64-bit offsets; replaced()
+// compares stat(path) with fstat of the open descriptor (device and inode).
 // Windows: CreateFileW (UTF-8 path converted to UTF-16) + GetFileSizeEx +
-// ReadFile with an OVERLAPPED offset.
+// ReadFile with an OVERLAPPED offset; replaced() compares the volume serial
+// number and file index of the path with those of the open handle.
+// A source opened to wait (M6) opens its path on the first size() call that
+// finds a file there.
 //
 // This file holds the core's single `#ifdef _WIN32` (viewer/CLAUDE.md rule 3).
 // The Windows branch has NOT been compiled or run: no Windows toolchain is
@@ -60,25 +64,54 @@ HANDLE as_handle(std::intptr_t h) { return reinterpret_cast<HANDLE>(h); }
 
 } // namespace
 
-FileSource::FileSource(const std::string &utf8_path) : path_(utf8_path), handle_(0) {
-    const std::wstring wide = widen(utf8_path);
+FileSource::FileSource(const std::string &utf8_path, bool wait) : path_(utf8_path), handle_(0) {
+    try_open(wait);
+}
+
+bool FileSource::try_open(bool missing_ok) {
+    const std::wstring wide = widen(path_);
     // Share read, write and delete: the recorder may still be appending.
     HANDLE h = CreateFileW(wide.c_str(), GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) throw IoError(win_error("cannot open", path_));
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD err = GetLastError();
+        if (missing_ok && (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)) return false;
+        throw IoError(win_error("cannot open", path_));
+    }
     if (GetFileType(h) != FILE_TYPE_DISK) {
         CloseHandle(h);
         throw IoError("not a regular file: " + path_);
     }
     handle_ = reinterpret_cast<std::intptr_t>(h);
+    open_ = true;
+    return true;
+}
+
+bool FileSource::replaced() {
+    if (!open_) return false;
+    const std::wstring wide = widen(path_);
+    HANDLE h = CreateFileW(wide.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return true;
+        throw IoError(win_error("cannot open", path_));
+    }
+    BY_HANDLE_FILE_INFORMATION a, b;
+    const bool ok = GetFileInformationByHandle(h, &a) && GetFileInformationByHandle(as_handle(handle_), &b);
+    CloseHandle(h);
+    if (!ok) throw IoError(win_error("cannot identify", path_));
+    return a.dwVolumeSerialNumber != b.dwVolumeSerialNumber || a.nFileIndexHigh != b.nFileIndexHigh ||
+           a.nFileIndexLow != b.nFileIndexLow;
 }
 
 FileSource::~FileSource() {
-    CloseHandle(as_handle(handle_));
+    if (open_) CloseHandle(as_handle(handle_));
 }
 
 std::uint64_t FileSource::size() {
+    if (!open_ && !try_open(true)) return 0;
     LARGE_INTEGER s;
     if (!GetFileSizeEx(as_handle(handle_), &s)) throw IoError(win_error("cannot get the size of", path_));
     if (s.QuadPart < 0) throw IoError("negative file size: " + path_);
@@ -86,6 +119,7 @@ std::uint64_t FileSource::size() {
 }
 
 std::size_t FileSource::read_at(std::uint64_t offset, void *buf, std::size_t n) {
+    if (!open_) return 0;
     unsigned char *out = static_cast<unsigned char *>(buf);
     std::size_t done = 0;
     while (done < n) {
@@ -128,13 +162,20 @@ int as_fd(std::intptr_t h) { return static_cast<int>(h); }
 
 } // namespace
 
-FileSource::FileSource(const std::string &utf8_path) : path_(utf8_path), handle_(-1) {
+FileSource::FileSource(const std::string &utf8_path, bool wait) : path_(utf8_path), handle_(-1) {
     if (utf8_path.empty()) throw IoError("cannot open a file with an empty path");
+    try_open(wait);
+}
+
+bool FileSource::try_open(bool missing_ok) {
     int fd;
     do {
-        fd = ::open(utf8_path.c_str(), O_RDONLY | O_CLOEXEC);
+        fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
     } while (fd < 0 && errno == EINTR);
-    if (fd < 0) throw IoError(posix_error("cannot open", path_, errno));
+    if (fd < 0) {
+        if (missing_ok && errno == ENOENT) return false;
+        throw IoError(posix_error("cannot open", path_, errno));
+    }
     struct stat st;
     if (::fstat(fd, &st) != 0) {
         const int err = errno;
@@ -146,20 +187,35 @@ FileSource::FileSource(const std::string &utf8_path) : path_(utf8_path), handle_
         throw IoError("not a regular file: " + path_);
     }
     handle_ = fd;
+    open_ = true;
+    return true;
 }
 
 FileSource::~FileSource() {
-    ::close(as_fd(handle_));
+    if (open_) ::close(as_fd(handle_));
 }
 
 std::uint64_t FileSource::size() {
+    if (!open_ && !try_open(true)) return 0;
     struct stat st;
     if (::fstat(as_fd(handle_), &st) != 0) throw IoError(posix_error("cannot stat", path_, errno));
     if (st.st_size < 0) throw IoError("negative file size: " + path_);
     return static_cast<std::uint64_t>(st.st_size);
 }
 
+bool FileSource::replaced() {
+    if (!open_) return false;
+    struct stat now, mine;
+    if (::stat(path_.c_str(), &now) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) return true;
+        throw IoError(posix_error("cannot stat", path_, errno));
+    }
+    if (::fstat(as_fd(handle_), &mine) != 0) throw IoError(posix_error("cannot stat", path_, errno));
+    return now.st_dev != mine.st_dev || now.st_ino != mine.st_ino;
+}
+
 std::size_t FileSource::read_at(std::uint64_t offset, void *buf, std::size_t n) {
+    if (!open_) return 0;
     unsigned char *out = static_cast<unsigned char *>(buf);
     std::size_t done = 0;
     while (done < n) {

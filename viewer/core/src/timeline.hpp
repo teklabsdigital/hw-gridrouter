@@ -1,8 +1,11 @@
 // timeline.hpp: the routing run as a sequence of events on a playback clock.
 //
-// Built once from the reader's tables (and again after a refresh).  The
-// state at any event is a pure function of the event index, computed
-// without keyframes:
+// Built from the reader's tables and extended (M6) when the trace grows:
+// extend() processes the appended chunks and recomputes only the last event
+// of the previous build (the chunks after it may yet join it or the next
+// event), so after any sequence of extends the timeline equals one built at
+// once from the same chunks.  The state at any event is a pure function of
+// the event index, computed without keyframes:
 //   - copper: each copper item is alive from the event of its creating chunk
 //     until the event of the RIP that removed it, or the next RUN (spec 8);
 //   - failures: each failed pad is shown from the RNE or DROP that reported
@@ -26,6 +29,7 @@
 #include "records.hpp"
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -103,6 +107,13 @@ struct CopperLife {
 // Pacing: how long each event lasts in playback seconds.  Replaceable.
 // An event may get no time (duration 0): it is applied together with the
 // next event that has time and is never the current event itself.
+//
+// M6: two ways to pace.  A finished trace (END read, or reading stopped) is
+// paced whole by durations().  A trace that is still growing is paced
+// event by event with step() ("prefix pacing"): an event's time depends only
+// on the events up to it, so new events never move the old ones.  Pacings
+// whose durations() is itself a prefix pacing (prefix_only()) use step()
+// always and are never refitted.
 class Pacing {
 public:
     virtual ~Pacing() = default;
@@ -110,6 +121,11 @@ public:
     // length of the run: the sum of the durations (rounding aside; the last
     // event with time is stretched or shrunk to end there), 0 if none.
     virtual double durations(const Trace &t, const std::vector<Event> &events, std::vector<double> &out) const = 0;
+    // Playback seconds of event e from the events up to it.  `state` carries
+    // what the pacing needs from the events before e: 0 before the first
+    // event, then whatever the previous call left in it.
+    virtual double step(const Trace &t, const std::vector<Event> &events, std::size_t e, double &state) const = 0;
+    virtual bool prefix_only() const { return false; }
 };
 
 // Pacing modes; values match rv_pacing_mode in rv.h.
@@ -140,16 +156,21 @@ constexpr double kSlowdownMin = 0.01, kSlowdownMax = 100000.0;
 // 2, the end 1.  The variants set some weights to 0: NetsOnly every search,
 // SkipFailed every search that found nothing, OneNet every event that is not
 // of `net`.  When every weight is 0 the run lasts 0 s.
+// While the trace grows (step()), an event lasts weight * fit_seconds /
+// kLiveWeight: a run of kLiveWeight weight units lasts fit_seconds, as the
+// dongle's run (about that weight) does once complete.
 class FitLengthPacing : public Pacing {
 public:
     static constexpr double kTotal = 180.0;
     static constexpr double kFailedSizeCap = 1000.0;
+    static constexpr double kLiveWeight = 30000.0;
     explicit FitLengthPacing(double total = kTotal, PacingMode mode = PacingMode::Fit, std::int32_t net = 0)
         : total_(total), mode_(mode), net_(net) {}
     // The weight of an event in this mode (>= 0).
     double weight(const Event &e) const;
     double total_seconds() const { return total_; }
     double durations(const Trace &t, const std::vector<Event> &events, std::vector<double> &out) const override;
+    double step(const Trace &t, const std::vector<Event> &events, std::size_t e, double &state) const override;
 
 private:
     double total_;
@@ -161,12 +182,14 @@ private:
 // event before it to the end of this one (the times of their last chunks;
 // the first event lasts 0), times the slowdown.  A search that found nothing
 // lasts at most kFailedSecondsCap router seconds (its wavefront plays
-// shortened).
+// shortened).  A prefix pacing: the same whether the trace grows or not.
 class RealTimePacing : public Pacing {
 public:
     static constexpr double kFailedSecondsCap = 0.010;
     explicit RealTimePacing(double slowdown) : slowdown_(slowdown) {}
     double durations(const Trace &t, const std::vector<Event> &events, std::vector<double> &out) const override;
+    double step(const Trace &t, const std::vector<Event> &events, std::size_t e, double &state) const override;
+    bool prefix_only() const override { return true; }
 
 private:
     double slowdown_;
@@ -175,19 +198,27 @@ private:
 std::unique_ptr<Pacing> make_pacing(const PacingSettings &s);
 
 // Items alive at an event: births non-decreasing in item order, each alive
-// for events [birth, death).
+// for events [birth, death).  Grows (M6): items are appended, the last ones
+// dropped, and deaths changed, each in O(log n).
 class IntervalIndex {
 public:
     void build(const std::vector<std::uint32_t> &births, const std::vector<std::uint32_t> &deaths);
+    void clear();
+    void push(std::uint32_t birth, std::uint32_t death);
+    void set_death(std::size_t k, std::uint32_t death);
+    void truncate(std::size_t n);
+    std::size_t size() const { return size_; }
+    std::uint32_t birth(std::size_t k) const { return births_[k]; }
     // Appends the items alive at event e, ascending.
     void query(std::uint32_t e, std::vector<std::uint32_t> &out) const;
 
 private:
+    void set_leaf(std::size_t k, std::uint32_t v);
     void collect(std::size_t node, std::size_t lo, std::size_t hi, std::size_t n, std::uint32_t e,
                  std::vector<std::uint32_t> &out) const;
     std::vector<std::uint32_t> births_;
-    std::vector<std::uint32_t> tree_; // max death per node
-    std::size_t size_ = 0;
+    std::vector<std::uint32_t> tree_; // max death per node; leaves at [cap_, 2 cap_)
+    std::size_t size_ = 0, cap_ = 0;
 };
 
 class Timeline {
@@ -196,7 +227,23 @@ public:
     // after the rip-up, alpha falling linearly from 1 to 0.
     static constexpr double kGhostSeconds = 1.5;
 
-    Timeline(const Trace &t, const Pacing &pacing);
+    // live (M6): pace as a growing trace (prefix pacing, see Pacing).
+    Timeline(const Trace &t, const Pacing &pacing, bool live = false);
+
+    // M6: what an extend changed.  Events before `first` are unchanged in
+    // every field, unless `repaced`: then every event's times changed (the
+    // trace was refitted); the rest of each event is unchanged before `first`.
+    struct Change {
+        std::uint32_t first = 0;
+        bool repaced = false;
+    };
+    // Take in the chunks the trace indexed since the last build or extend.
+    Change extend(const Pacing &pacing, bool live);
+    bool live() const { return live_; }
+    // From the last extend (or the build): copper whose life is new or
+    // changed, and failures that are new or changed (ascending).
+    const std::vector<std::uint32_t> &changed_copper() const { return changed_copper_; }
+    const std::vector<std::uint32_t> &changed_failures() const { return changed_failures_; }
 
     // Give the events new times (another pacing); everything else stays.
     void repace(const Pacing &pacing);
@@ -239,12 +286,38 @@ public:
     bool board_holds_routing(std::uint32_t e, std::uint32_t board) const;
 
 private:
-    void build_events();
-    void build_lives();
-    void build_failures();
-    void pace(const Pacing &pacing);
+    struct State {
+        Counts cnt;
+        std::uint32_t open_route = kNone32, board = kNone32, phase = kNone32, drop_search = kNone32;
+    };
+    void scan_chunk(std::uint32_t k);
+    void apply_event(std::uint32_t e);
+    void extend_lives(std::uint32_t e0);
+    void extend_failures();
+    // Times of events from e0 on (all of them when the pacing is global).
+    // Returns true if every event's time was recomputed.
+    bool pace(const Pacing &pacing, std::uint32_t e0);
 
     const Trace &t_;
+    bool live_ = false;
+    // pass 1
+    std::uint32_t scanned_ = 0;   // chunks taken in
+    std::uint32_t pending_ = 0;   // first chunk not yet in an event
+    std::uint32_t last_real_ = 0; // last chunk of the last event before the trailing chunks joined it
+    // pass 2: the state after the events before p2_done_ (the last event is
+    // recomputed by the next extend)
+    std::uint32_t p2_done_ = 0;
+    State state_, ckpt_;
+    std::vector<std::uint32_t> ckpt_last_change_;
+    // lives and failures
+    std::vector<std::uint32_t> open_copper_;   // born, not dead, index < life_.size(); ascending
+    std::uint32_t fail_done_ = 0;              // events whose failures are taken in
+    std::vector<std::uint32_t> fail_alive_;
+    std::map<std::string, std::uint32_t> latest_route_; // name -> routes() index
+    std::vector<std::uint32_t> changed_copper_, changed_failures_;
+    // pacing
+    std::vector<double> pace_state_;           // Pacing::step state before each event
+    std::vector<std::uint32_t> rip_tick_events_, failure_tick_events_;
     std::vector<Event> events_;
     std::vector<std::uint32_t> chunk_event_; // per chunk
     std::vector<Counts> counts_;

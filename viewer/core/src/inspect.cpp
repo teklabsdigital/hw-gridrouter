@@ -122,6 +122,9 @@ void NetTable::clear() {
     rows_.clear();
     view_.clear();
     now_.clear();
+    copper_by_.clear();
+    failures_by_.clear();
+    chunks_seen_ = copper_seen_ = failures_seen_ = 0;
     event_ = kNone32 - 1;
     view_dirty_ = true;
     ++generation_;
@@ -129,39 +132,71 @@ void NetTable::clear() {
 
 void NetTable::build(const Trace &t, const Timeline &tl) {
     clear();
+    sync(t, tl, true);
+}
+
+void NetTable::extend(const Trace &t, const Timeline &tl) {
+    if (!built_) return;
+    sync(t, tl, false);
+}
+
+std::uint32_t NetTable::find_row(std::uint32_t session, std::int32_t net) const {
+    auto it = std::lower_bound(rows_.begin(), rows_.end(), std::make_pair(net, session),
+                               [](const NetRow &r, const std::pair<std::int32_t, std::uint32_t> &k) {
+                                   return r.net != k.first ? r.net < k.first : r.session < k.second;
+                               });
+    if (it == rows_.end() || it->net != net || it->session != session) return kNone32;
+    return static_cast<std::uint32_t>(it - rows_.begin());
+}
+
+bool NetTable::row_exists(const Trace &t, std::uint32_t session, std::int32_t net) const {
+    if (session == kNone32 || session >= t.runs().size()) return false;
+    auto it = t.net_chunks().find(net);
+    if (it != t.net_chunks().end()) {
+        const Run &run = t.runs()[session];
+        auto lo = std::lower_bound(it->second.begin(), it->second.end(), run.chunk);
+        for (; lo != it->second.end() && *lo < run.end_chunk; ++lo)
+            if (*lo < t.chunks().size() && t.chunks()[*lo].session == session) return true;
+    }
+    auto cu = copper_by_.find(std::make_pair(session, net));
+    if (cu != copper_by_.end())
+        for (std::uint32_t k : cu->second)
+            if (t.copper()[k].removed_by != kNone32) return true;
+    return false;
+}
+
+// Everything of one row but session_last, from the trace and the timeline.
+void NetTable::build_row(const Trace &t, const Timeline &tl, NetRow &r) const {
+    const std::int32_t net = r.net;
+    const std::uint32_t session = r.session;
+    r = NetRow();
+    r.net = net;
+    r.session = session;
+    auto nm = t.net_names().find(net);
+    r.named = nm != t.net_names().end() && !nm->second.empty();
+    r.name = router_net_name(t, net);
+    if (session == kNone32 || session >= t.runs().size()) return;
     const std::vector<Chunk> &ch = t.chunks();
     const std::uint32_t nev = tl.size();
-    std::map<std::pair<std::uint32_t, std::int32_t>, std::uint32_t> index; // (session, net) -> row
-    auto row = [&](std::uint32_t session, std::int32_t net) -> NetRow & {
-        auto key = std::make_pair(session, net);
-        auto it = index.find(key);
-        if (it == index.end()) {
-            it = index.emplace(key, static_cast<std::uint32_t>(rows_.size())).first;
-            NetRow r;
-            r.net = net;
-            r.session = session;
-            auto nm = t.net_names().find(net);
-            r.named = nm != t.net_names().end() && !nm->second.empty();
-            r.name = router_net_name(t, net);
-            rows_.push_back(r);
-        }
-        return rows_[it->second];
+    const Run &run = t.runs()[session];
+    const double session_end = run.end_chunk > 0 && run.end_chunk <= ch.size() ? ch[run.end_chunk - 1].t
+                                                                               : (ch.empty() ? 0.0 : ch.back().t);
+    struct Change {
+        std::uint32_t event;
+        int kind; // 0 copper born, 1 copper removed, 2 failure born, 3 failure gone, 4 route begins, 5 route ends
+        bool complete;
     };
-    auto session_end_time = [&](std::uint32_t s) {
-        if (s >= t.runs().size()) return ch.empty() ? 0.0 : ch.back().t;
-        const std::uint32_t end = t.runs()[s].end_chunk;
-        return end > 0 && end <= ch.size() ? ch[end - 1].t : (ch.empty() ? 0.0 : ch.back().t);
-    };
+    std::vector<Change> routes;
 
     // Totals and events, chunk by chunk.
-    std::vector<std::set<std::uint32_t>> rip_events; // per row
-    for (const auto &kv : t.net_chunks()) {
-        const std::int32_t net = kv.first;
-        for (std::uint32_t k : kv.second) {
+    auto it = t.net_chunks().find(net);
+    if (it != t.net_chunks().end()) {
+        for (auto lo = std::lower_bound(it->second.begin(), it->second.end(), run.chunk);
+             lo != it->second.end() && *lo < run.end_chunk; ++lo) {
+            const std::uint32_t k = *lo;
             if (k >= ch.size()) continue;
             const Chunk &c = ch[k];
-            if (c.session == kNone32) continue;
-            NetRow &r = row(c.session, net);
+            if (c.session != session) continue;
             if (event_chunk(t, c) && nev > 0) r.events.push_back(tl.event_of_chunk(k));
             if (c.corrupt || c.record == kNone32) continue;
             switch (c.kind) {
@@ -187,9 +222,13 @@ void NetTable::build(const Trace &t, const Timeline &tl) {
                 if (!ro.valid) break;
                 ++r.routes;
                 if (ro.end == kNone32 || ro.end >= t.route_ends().size()) {
-                    const double d = session_end_time(c.session) - c.t;
+                    // Unfinished: up to the session's last chunk (which moves
+                    // while the trace grows).
+                    r.open_route = true;
+                    const double d = session_end - c.t;
                     if (d > 0) r.seconds += d;
                 }
+                if (nev > 0) routes.push_back({tl.event_of_chunk(k), 4, false});
                 break;
             }
             case Kind::Rne: {
@@ -200,6 +239,7 @@ void NetTable::build(const Trace &t, const Timeline &tl) {
                     const double d = c.t - ch[t.routes()[ri].chunk].t;
                     if (d > 0) r.seconds += d;
                 }
+                if (nev > 0) routes.push_back({tl.event_of_chunk(k), 5, re.status == 0 && re.failed.empty()});
                 break;
             }
             case Kind::Drop:
@@ -209,126 +249,174 @@ void NetTable::build(const Trace &t, const Timeline &tl) {
             }
         }
     }
-    // Rip-ups suffered: the events of the RIPs that removed the row's copper.
-    rip_events.resize(rows_.size());
-    for (const Copper &cu : t.copper()) {
-        if (cu.removed_by == kNone32 || cu.session == kNone32 || nev == 0) continue;
-        NetRow &r = row(cu.session, cu.net);
-        const std::uint32_t idx = static_cast<std::uint32_t>(&r - rows_.data());
-        if (rip_events.size() < rows_.size()) rip_events.resize(rows_.size());
-        const std::uint32_t e = tl.event_of_chunk(cu.removed_by);
-        rip_events[idx].insert(e);
-        r.events.push_back(e);
+
+    // Rip-ups suffered (the events of the RIPs that removed the row's
+    // copper), and the changes of the at-position values: copper, failures,
+    // route_net calls, in that order within an event.
+    std::vector<Change> cs;
+    std::set<std::uint32_t> rip_events;
+    const std::vector<CopperLife> &life = tl.copper_life();
+    auto cu = copper_by_.find(std::make_pair(session, net));
+    if (cu != copper_by_.end()) {
+        for (std::uint32_t k : cu->second) {
+            const Copper &c = t.copper()[k];
+            if (c.removed_by != kNone32 && nev > 0) {
+                const std::uint32_t e = tl.event_of_chunk(c.removed_by);
+                rip_events.insert(e);
+                r.events.push_back(e);
+            }
+            if (k >= life.size() || life[k].birth == kNone32) continue;
+            cs.push_back({life[k].birth, 0, false});
+            if (life[k].death != kNone32) cs.push_back({life[k].death, 1, false});
+        }
     }
-    // Nets named but never mentioned.
-    {
-        std::set<std::int32_t> seen;
-        for (const NetRow &r : rows_) seen.insert(r.net);
-        for (const auto &kv : t.net_names())
-            if (seen.count(kv.first) == 0) row(kNone32, kv.first);
+    auto fl = failures_by_.find(std::make_pair(session, net));
+    if (fl != failures_by_.end())
+        for (std::uint32_t f : fl->second) {
+            const Failure &fa = tl.failures()[f];
+            cs.push_back({fa.birth, 2, false});
+            if (fa.death != kNone32) cs.push_back({fa.death, 3, false});
+        }
+    cs.insert(cs.end(), routes.begin(), routes.end());
+
+    std::sort(r.events.begin(), r.events.end());
+    r.events.erase(std::unique(r.events.begin(), r.events.end()), r.events.end());
+    if (!r.events.empty()) {
+        r.first_event = r.events.front();
+        r.last_event = r.events.back();
     }
-    rip_events.resize(rows_.size());
+    r.rips = static_cast<std::uint32_t>(rip_events.size());
+
+    std::stable_sort(cs.begin(), cs.end(), [](const Change &a, const Change &b) { return a.event < b.event; });
+    std::int64_t copper = 0, failures = 0;
+    bool routing = false, complete = false, last_removed = false;
+    for (std::size_t k = 0; k < cs.size();) {
+        const std::uint32_t e = cs[k].event;
+        for (; k < cs.size() && cs[k].event == e; ++k) {
+            switch (cs[k].kind) {
+            case 0:
+                ++copper;
+                last_removed = false;
+                break;
+            case 1:
+                --copper;
+                last_removed = true;
+                complete = false;
+                break;
+            case 2: ++failures; break;
+            case 3: --failures; break;
+            case 4:
+                routing = true;
+                complete = false;
+                break;
+            case 5:
+                routing = false;
+                complete = cs[k].complete;
+                break;
+            default: break;
+            }
+        }
+        NetRow::Point p;
+        p.event = e;
+        p.now.copper = static_cast<std::uint32_t>(std::max<std::int64_t>(0, copper));
+        p.now.failures = static_cast<std::uint32_t>(std::max<std::int64_t>(0, failures));
+        if (routing) p.now.state = NetState::Routing;
+        else if (failures > 0) p.now.state = NetState::Failed;
+        else if (last_removed) p.now.state = NetState::Ripped;
+        else if (complete) p.now.state = NetState::Complete;
+        else if (copper > 0) p.now.state = NetState::Routed;
+        else p.now.state = NetState::NotStarted;
+        if (!r.points.empty() && r.points.back().now == p.now) continue;
+        r.points.push_back(p);
+    }
+}
+
+void NetTable::place_row(const Trace &t, const Timeline &tl, std::uint32_t session, std::int32_t net, bool exists) {
+    const std::uint32_t at = find_row(session, net);
+    if (!exists) {
+        if (at != kNone32) rows_.erase(rows_.begin() + at);
+        return;
+    }
+    NetRow r;
+    r.net = net;
+    r.session = session;
+    build_row(t, tl, r);
+    if (at != kNone32) {
+        rows_[at] = std::move(r);
+        return;
+    }
+    auto pos = std::lower_bound(rows_.begin(), rows_.end(), r, [](const NetRow &a, const NetRow &b) {
+        return a.net != b.net ? a.net < b.net : a.session < b.session;
+    });
+    rows_.insert(pos, std::move(r));
+}
+
+void NetTable::sync(const Trace &t, const Timeline &tl, bool fresh) {
+    const std::vector<Chunk> &ch = t.chunks();
+    const auto n = static_cast<std::uint32_t>(ch.size());
+    std::set<std::pair<std::uint32_t, std::int32_t>> dirty; // (session, net)
+    bool names = fresh;
+    for (std::uint32_t k = chunks_seen_; k < n; ++k) {
+        const Chunk &c = ch[k];
+        if (c.has_net && c.session != kNone32) dirty.emplace(c.session, c.net);
+        if (c.kind == Kind::Nets) names = true;
+    }
+    const std::vector<Copper> &cu = t.copper();
+    for (std::uint32_t k = copper_seen_; k < cu.size(); ++k)
+        if (cu[k].session != kNone32) copper_by_[std::make_pair(cu[k].session, cu[k].net)].push_back(k);
+    auto copper_dirty = [&](std::uint32_t k) {
+        if (k < cu.size() && cu[k].session != kNone32) dirty.emplace(cu[k].session, cu[k].net);
+    };
+    const std::vector<Failure> &fs = tl.failures();
+    for (std::uint32_t f = failures_seen_; f < fs.size(); ++f)
+        failures_by_[std::make_pair(fs[f].session, fs[f].net)].push_back(f);
+    auto failure_dirty = [&](std::uint32_t f) {
+        if (f < fs.size()) dirty.emplace(fs[f].session, fs[f].net);
+    };
+    if (fresh) {
+        for (std::uint32_t k = 0; k < cu.size(); ++k) copper_dirty(k);
+        for (std::uint32_t f = 0; f < fs.size(); ++f) failure_dirty(f);
+    } else {
+        for (std::uint32_t k : tl.changed_copper()) copper_dirty(k);
+        for (std::uint32_t f : tl.changed_failures()) failure_dirty(f);
+        // Rows whose router time grows with the session (an unfinished
+        // route_net call) or whose session's last event moved.
+        for (const NetRow &r : rows_)
+            if (r.open_route) dirty.emplace(r.session, r.net);
+    }
+    for (const auto &k : dirty) {
+        if (k.first == kNone32) continue;
+        place_row(t, tl, k.first, k.second, row_exists(t, k.first, k.second));
+    }
+    // Nets that NETS names and no row is about: one row each without a session.
+    for (const auto &kv : t.net_names()) {
+        auto lo = std::lower_bound(rows_.begin(), rows_.end(), kv.first,
+                                   [](const NetRow &r, std::int32_t net) { return r.net < net; });
+        const bool about = lo != rows_.end() && lo->net == kv.first && lo->session != kNone32;
+        place_row(t, tl, kNone32, kv.first, !about);
+    }
+    if (names && !fresh)
+        for (NetRow &r : rows_) {
+            auto nm = t.net_names().find(r.net);
+            r.named = nm != t.net_names().end() && !nm->second.empty();
+            r.name = router_net_name(t, r.net);
+        }
 
     // Session ends: the last event of each session.
+    const std::uint32_t nev = tl.size();
     std::vector<std::uint32_t> session_last(t.runs().size(), nev == 0 ? kNone32 : nev - 1);
     for (std::size_t s = 0; s + 1 < t.runs().size(); ++s) {
         const std::uint32_t e = tl.event_of_chunk(t.runs()[s + 1].chunk);
         session_last[s] = e == kNone32 || e == 0 ? 0 : e - 1;
     }
+    for (NetRow &r : rows_) r.session_last = r.session < session_last.size() ? session_last[r.session] : kNone32;
 
-    // Changes of the at-position values, per row.
-    struct Change {
-        std::uint32_t event;
-        int kind; // 0 copper born, 1 copper removed, 2 failure born, 3 failure gone, 4 route begins, 5 route ends
-        bool complete;
-    };
-    std::vector<std::vector<Change>> changes(rows_.size());
-    const std::vector<CopperLife> &life = tl.copper_life();
-    for (std::size_t k = 0; k < t.copper().size() && k < life.size(); ++k) {
-        const Copper &cu = t.copper()[k];
-        const CopperLife &l = life[k];
-        if (l.birth == kNone32 || cu.session == kNone32) continue;
-        auto it = index.find(std::make_pair(cu.session, cu.net));
-        if (it == index.end()) continue;
-        changes[it->second].push_back({l.birth, 0, false});
-        if (l.death != kNone32) changes[it->second].push_back({l.death, 1, false});
-    }
-    for (const Failure &f : tl.failures()) {
-        auto it = index.find(std::make_pair(f.session, f.net));
-        if (it == index.end()) continue;
-        changes[it->second].push_back({f.birth, 2, false});
-        if (f.death != kNone32) changes[it->second].push_back({f.death, 3, false});
-    }
-    for (std::uint32_t e = 0; e < nev; ++e) {
-        const Event &ev = tl.events()[e];
-        if (ev.kind != EvKind::RouteBegin && ev.kind != EvKind::RouteEnd) continue;
-        auto it = index.find(std::make_pair(ev.session, ev.net));
-        if (it == index.end()) continue;
-        if (ev.kind == EvKind::RouteBegin) {
-            changes[it->second].push_back({e, 4, false});
-        } else {
-            const RouteEnd &re = t.route_ends()[ev.record];
-            changes[it->second].push_back({e, 5, re.status == 0 && re.failed.empty()});
-        }
-    }
-
-    for (std::size_t ri = 0; ri < rows_.size(); ++ri) {
-        NetRow &r = rows_[ri];
-        std::sort(r.events.begin(), r.events.end());
-        r.events.erase(std::unique(r.events.begin(), r.events.end()), r.events.end());
-        if (!r.events.empty()) {
-            r.first_event = r.events.front();
-            r.last_event = r.events.back();
-        }
-        r.rips = static_cast<std::uint32_t>(rip_events[ri].size());
-        r.session_last = r.session < session_last.size() ? session_last[r.session] : kNone32;
-
-        std::vector<Change> &cs = changes[ri];
-        std::stable_sort(cs.begin(), cs.end(), [](const Change &a, const Change &b) { return a.event < b.event; });
-        std::int64_t copper = 0, failures = 0;
-        bool routing = false, complete = false, last_removed = false;
-        for (std::size_t k = 0; k < cs.size();) {
-            const std::uint32_t e = cs[k].event;
-            for (; k < cs.size() && cs[k].event == e; ++k) {
-                switch (cs[k].kind) {
-                case 0:
-                    ++copper;
-                    last_removed = false;
-                    break;
-                case 1:
-                    --copper;
-                    last_removed = true;
-                    complete = false;
-                    break;
-                case 2: ++failures; break;
-                case 3: --failures; break;
-                case 4:
-                    routing = true;
-                    complete = false;
-                    break;
-                case 5:
-                    routing = false;
-                    complete = cs[k].complete;
-                    break;
-                default: break;
-                }
-            }
-            NetRow::Point p;
-            p.event = e;
-            p.now.copper = static_cast<std::uint32_t>(std::max<std::int64_t>(0, copper));
-            p.now.failures = static_cast<std::uint32_t>(std::max<std::int64_t>(0, failures));
-            if (routing) p.now.state = NetState::Routing;
-            else if (failures > 0) p.now.state = NetState::Failed;
-            else if (last_removed) p.now.state = NetState::Ripped;
-            else if (complete) p.now.state = NetState::Complete;
-            else if (copper > 0) p.now.state = NetState::Routed;
-            else p.now.state = NetState::NotStarted;
-            if (!r.points.empty() && r.points.back().now == p.now) continue;
-            r.points.push_back(p);
-        }
-    }
+    chunks_seen_ = n;
+    copper_seen_ = static_cast<std::uint32_t>(cu.size());
+    failures_seen_ = static_cast<std::uint32_t>(fs.size());
     built_ = true;
     now_.assign(rows_.size(), NetNow());
+    event_ = kNone32 - 1;
     view_dirty_ = true;
 }
 

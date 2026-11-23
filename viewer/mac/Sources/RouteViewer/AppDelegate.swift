@@ -13,9 +13,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var welcome: NSWindow?
     private let recentMenu = NSMenu(title: "Open Recent")
 
-    init(selfTest: Bool, file: String?) {
+    /// Files named on the command line (M6), opened at launch.
+    private let commandLineFiles: [URL]
+
+    init(selfTest: Bool, file: String?, open files: [URL] = []) {
         self.selfTest = selfTest
         selfTestFile = file
+        commandLineFiles = files
         super.init()
     }
 
@@ -32,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         NSApp.activate()
+        if !commandLineFiles.isEmpty { TraceFiles.open(commandLineFiles) }
         // Files opened from Finder or the Dock arrive before this; show the
         // welcome window only if none did.
         DispatchQueue.main.async { [self] in showWelcomeIfIdle() }
@@ -113,11 +118,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openRecent(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
-        NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, error in
-            if let error {
-                Task { @MainActor in NSApp.presentError(error) }
-            }
-        }
+        TraceFiles.open([url])
+    }
+
+    /// Finder, the Dock and `open -a`: through TraceFiles, so that a file
+    /// still being written, or not there yet, is followed (M6).
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard !selfTest else { return }
+        TraceFiles.open(urls)
     }
 
     // MARK: - Self-test
@@ -269,6 +277,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let playback = checkPlayback(controller, compareLayers)
         failures += playback
+        // M6: the same trace again, written while the window follows it.
+        if let selfTestFile { failures += SelfTestLive.run(source: selfTestFile) }
         document.close()
         // The self-test's file must not have been opened a second time by
         // AppKit (as a command-line argument) nor added to Open Recent.
@@ -843,6 +853,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         add("Go to Start", #selector(BoardWindowController.goToStart(_:)), key(.home))
         add("Go to End", #selector(BoardWindowController.goToEnd(_:)), key(.end))
+        // M6: follow a run that is being written (End does the same then).
+        add("Follow Live", #selector(BoardWindowController.goLive(_:)), "l")
         menu.addItem(.separator())
         add("Faster", #selector(BoardWindowController.faster(_:)), "]", [.command])
         add("Slower", #selector(BoardWindowController.slower(_:)), "[", [.command])

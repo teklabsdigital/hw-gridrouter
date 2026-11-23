@@ -20,6 +20,13 @@ struct FormatError : std::runtime_error {
     explicit FormatError(const std::string &what) : std::runtime_error(what) {}
 };
 
+// M6: the file is no longer the trace that was opened: it shrank, its header
+// or an indexed chunk header changed, or another file now has its name
+// (maps to RV_E_REPLACED).  The client reopens it from scratch.
+struct ReplacedError : FormatError {
+    explicit ReplacedError(const std::string &what) : FormatError(what) {}
+};
+
 // A trace major version this reader does not know (maps to RV_E_UNSUPPORTED).
 struct UnsupportedVersion : std::runtime_error {
     explicit UnsupportedVersion(const std::string &what) : std::runtime_error(what) {}

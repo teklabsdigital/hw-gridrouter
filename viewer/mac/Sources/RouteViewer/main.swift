@@ -1,6 +1,8 @@
 // main.swift: programmatic AppKit start-up, no nib or storyboard.
 //
 //   RouteViewer                     the app
+//   RouteViewer [FILE.grtrace ...]  the app, opening the files; a file that
+//                                   does not exist yet is waited for (M6)
 //   RouteViewer --selftest [FILE]   check the app (and FILE's board), print
 //                                   "selftest ok" and exit; see AppDelegate
 
@@ -12,6 +14,15 @@ var selfTestFile: String?
 if selfTest, let i = arguments.firstIndex(of: "--selftest"), i + 1 < arguments.count,
    !arguments[i + 1].hasPrefix("-") {
     selfTestFile = arguments[i + 1]
+}
+// M6: trace files named on the command line are opened by the app itself
+// (TraceFiles.open), not by AppKit, which would refuse one that does not
+// exist yet.
+let commandLineFiles: [URL] = selfTest ? [] : arguments.dropFirst()
+    .filter { !$0.hasPrefix("-") && $0.lowercased().hasSuffix(".grtrace") }
+    .map { URL(fileURLWithPath: $0).standardizedFileURL }
+if !selfTest && !commandLineFiles.isEmpty {
+    UserDefaults.standard.register(defaults: ["NSTreatUnknownArgumentsAsOpen": "NO"])
 }
 if selfTest {
     // The file is the self-test's: AppKit must not also open it as a
@@ -32,6 +43,6 @@ if selfTest {
 }
 
 let app = NSApplication.shared
-let delegate = AppDelegate(selfTest: selfTest, file: selfTestFile)
+let delegate = AppDelegate(selfTest: selfTest, file: selfTestFile, open: commandLineFiles)
 app.delegate = delegate  // weak reference; the global keeps it alive
 app.run()

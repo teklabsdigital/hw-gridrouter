@@ -222,14 +222,15 @@ TEST(api_follows_a_growing_file) {
     CHECK_EQ(info.complete, 1u);
     CHECK_EQ(info.issue_count, 0u);
 
-    // the writer starts over (file truncated and rewritten): failed state
+    // the writer starts over (file truncated and rewritten): failed state,
+    // reported as a replacement (M6)
     CHECK(synth::write_file(path, std::vector<unsigned char>(s.bytes.begin(), s.bytes.begin() + 100)));
-    CHECK_EQ(rv_refresh(g.s, &added), RV_E_FORMAT);
+    CHECK_EQ(rv_refresh(g.s, &added), RV_E_REPLACED);
     CHECK(std::strlen(rv_last_error(g.s)) > 0);
     CHECK_EQ(rv_info(g.s, &info), RV_OK);
     CHECK_EQ(info.failed, 1u);
     CHECK_EQ(info.chunk_count, s.tags.size()); // what was read stays readable
-    CHECK_EQ(rv_refresh(g.s, &added), RV_E_FORMAT);
+    CHECK_EQ(rv_refresh(g.s, &added), RV_E_REPLACED);
 }
 
 TEST(api_reports_issues) {

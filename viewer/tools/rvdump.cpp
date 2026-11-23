@@ -18,6 +18,13 @@
 //                            what is under board point (X, Y) mm, in a
 //                            1600 x 1000 view fitted to the board, and the
 //                            time of N hit tests at random view points
+//   rvdump --follow [--interval MS] [--stall-exit S] [--quiet] FILE
+//                            M6: follow a file being written (it may not
+//                            exist yet): poll it every MS milliseconds
+//                            (default 250), print each new event, and stop
+//                            at END; reload when it is replaced; give up
+//                            after S seconds without growth (default never).
+//                            Ends with the refresh times.
 //
 // Exit status: 0 for a readable trace with no errors (complete, or a valid
 // file that is still being written: "incomplete"); 1 if the file cannot be
@@ -36,6 +43,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -50,6 +58,7 @@ int usage() {
                  "       rvdump --nets [--at AT] [--sort COLUMN[:desc]] [--filter TEXT] FILE\n"
                  "       rvdump --net NAME [--at AT] FILE\n"
                  "       rvdump --hit X,Y [--at AT] [--bench N] FILE\n"
+                 "       rvdump --follow [--interval MS] [--stall-exit S] [--quiet] FILE\n"
                  "PACING: fit[:SECONDS], nets, net:NET, skip-failed, real[:SLOWDOWN]\n"
                  "AT: a fraction of the timeline 0..1, or end (the default)\n"
                  "COLUMN: a column title in lower case, spaces as '-' (name, state, failed-pads, ...)\n");
@@ -723,7 +732,132 @@ bool parse_column(const char *spec, Opts *o) {
 
 } // namespace
 
+// --- M6: following a file being written ------------------------------------------
+
+struct FollowOpts {
+    double interval_ms = 250;
+    double stall_exit = 0;
+    bool quiet = false;
+};
+
+int follow(const char *path, const FollowOpts &o) {
+    rv_session *s = nullptr;
+    if (rv_create(&s) != RV_OK) return 1;
+    if (rv_open_ex(s, path, RV_OPEN_WAIT | RV_OPEN_LIVE) != RV_OK) {
+        std::fprintf(stderr, "rvdump: %s\n", rv_last_error(s));
+        rv_destroy(s);
+        return 1;
+    }
+    const double t0 = now_ms();
+    uint32_t printed = 0, polls = 0, reloads = 0;
+    struct Poll {
+        double ms;
+        uint32_t chunks;
+        uint64_t bytes;
+    };
+    std::vector<Poll> work; // polls that read something
+    uint64_t size = 0;
+    int rc = 1;
+    std::string last_text;
+    for (;;) {
+        const double a = now_ms();
+        uint32_t added = 0, changed = 0;
+        const rv_status st = rv_poll(s, (a - t0) / 1000.0, &added, &changed);
+        const double ms = now_ms() - a;
+        ++polls;
+        if (st == RV_E_REPLACED) {
+            std::printf("rvdump: %s; reloading\n", rv_last_error(s));
+            if (rv_reload(s) != RV_OK) {
+                std::fprintf(stderr, "rvdump: %s\n", rv_last_error(s));
+                break;
+            }
+            ++reloads;
+            printed = 0;
+            size = 0;
+            continue;
+        }
+        if (st != RV_OK) {
+            std::fprintf(stderr, "rvdump: %s\n", rv_last_error(s));
+            break;
+        }
+        rv_live live;
+        rv_live_get(s, &live);
+        if (live.file_size != size) {
+            work.push_back({ms, added, live.file_size - size});
+            size = live.file_size;
+        }
+        rv_timeline tl;
+        rv_get_timeline(s, &tl);
+        for (; printed < tl.event_count; ++printed) {
+            if (o.quiet) continue;
+            const rv_event &e = tl.events[printed];
+            rv_chunk_info ci;
+            rv_chunk(s, e.chunk, &ci);
+            std::printf("event %u  %-16s", printed + 1, rv_event_kind_name(e.kind));
+            if ((e.flags & RV_EVF_HAS_NET) != 0) std::printf("  net %d", e.net);
+            std::printf("  chunk %u  t %.3f s\n", e.chunk, ci.time);
+        }
+        const char *text = nullptr;
+        rv_live_text(s, &text);
+        if (text != nullptr && last_text != text && (live.state != RV_LIVE_GROWING || last_text.empty())) {
+            std::printf("rvdump: %s\n", text);
+        }
+        if (text != nullptr) last_text = text;
+        if (live.state == RV_LIVE_COMPLETE) {
+            rc = 0;
+            break;
+        }
+        if (live.state == RV_LIVE_STOPPED || live.state == RV_LIVE_FAILED) break;
+        if (o.stall_exit > 0 && live.idle_seconds >= o.stall_exit) {
+            std::printf("rvdump: gave up after %.1f s without growth\n", live.idle_seconds);
+            break;
+        }
+        std::fflush(stdout);
+        std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(o.interval_ms));
+    }
+    rv_live live;
+    rv_live_get(s, &live);
+    std::vector<double> ms;
+    double total = 0;
+    std::size_t worst = 0;
+    for (std::size_t k = 0; k < work.size(); ++k) {
+        ms.push_back(work[k].ms);
+        total += work[k].ms;
+        if (work[k].ms > work[worst].ms) worst = k;
+    }
+    std::sort(ms.begin(), ms.end());
+    auto q = [&](double f) { return ms.empty() ? 0.0 : ms[std::min(ms.size() - 1, static_cast<std::size_t>(f * ms.size()))]; };
+    std::printf("rvdump: %u chunks, %u events, %llu bytes; %u polls, %zu that read data, %u reloads, %u follow jumps\n",
+                live.chunks, live.events, static_cast<unsigned long long>(live.file_size), polls, work.size(), reloads,
+                live.skips);
+    if (!work.empty())
+        std::printf("rvdump: refresh ms: median %.3f, p90 %.3f, p99 %.3f, max %.3f (%u chunks, %llu bytes); total %.1f\n",
+                    q(0.5), q(0.9), q(0.99), ms.back(), work[worst].chunks,
+                    static_cast<unsigned long long>(work[worst].bytes), total);
+    rv_destroy(s);
+    return rc;
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 3 && std::strcmp(argv[1], "--follow") == 0) {
+        FollowOpts o;
+        int a = 2;
+        for (; a < argc - 1; ++a) {
+            char *end = nullptr;
+            if (std::strcmp(argv[a], "--quiet") == 0) {
+                o.quiet = true;
+            } else if (std::strcmp(argv[a], "--interval") == 0 && a + 1 < argc - 1) {
+                o.interval_ms = std::strtod(argv[++a], &end);
+                if (end == argv[a] || *end != '\0' || !(o.interval_ms >= 0)) return usage();
+            } else if (std::strcmp(argv[a], "--stall-exit") == 0 && a + 1 < argc - 1) {
+                o.stall_exit = std::strtod(argv[++a], &end);
+                if (end == argv[a] || *end != '\0' || !(o.stall_exit >= 0)) return usage();
+            } else {
+                return usage();
+            }
+        }
+        return follow(argv[argc - 1], o);
+    }
     enum { Summary, Chunks, Search, Board, Timeline, Nets, Net, Hit } mode = Summary;
     uint32_t search_id = 0;
     rv_pacing pacing = {RV_PACING_FIT, 0, 180.0, 10.0};

@@ -37,6 +37,14 @@ void Scene::reset() {
     ++generation_;
 }
 
+void Scene::invalidate_outline(std::uint32_t session) {
+    std::vector<Built> keep;
+    for (const Built &b : cache_)
+        if (!(b.board == kNone32 && b.session == session)) keep.push_back(b);
+    cache_ = keep;
+    if (built_board_ == kNone32 && built_session_ == session) built_ = false;
+}
+
 std::uint32_t Scene::effective_board(const Trace *t) const {
     if (t == nullptr || t->boards().empty()) return kNone32;
     const auto n = static_cast<std::uint32_t>(t->boards().size());

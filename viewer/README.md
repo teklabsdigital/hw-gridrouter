@@ -5,18 +5,20 @@ file (`.grtrace`): the board as KiCad draws it, the A* wavefront of each
 search, paths committing, rip-ups, retries and failures. It only watches; it
 never steers the router.
 
-Status: **milestone M5**, inspect. The core reads `.grtrace` files (M1),
+Status: **milestone M6**, live. The core reads `.grtrace` files (M1),
 turns a trace's `BRD` board into a display list in KiCad's default colours
 and draw order and owns the camera (M2), cuts the run into events on a
 timeline, keeps the playback clock, and builds an overlay of the router's
 copper, rip-up ghosts, failed pads and the current event's highlights at any
 position (M3), draws each search's A* wavefront as images and paces the run
-in five ways (M4), and now keeps a nets table, a selected net with a
-KiCad-style highlight, hit testing and each net's attempt history (M5). The
-app opens trace files as read-only documents and plays them: inspector
-(nets table and history), board, caption, timeline strip, transport bar,
-Playback menu, Appearance panel. `rvrender` draws any position to a PNG
-without a window, with a net highlighted if asked.
+in five ways (M4), keeps a nets table, a selected net with a KiCad-style
+highlight, hit testing and each net's attempt history (M5), and now follows a
+run while the recorder is still writing it, extending everything as the file
+grows (M6, "Following a run while it is written"). The app opens trace files
+as read-only documents and plays them: inspector (nets table and history),
+board, caption, timeline strip, transport bar, Playback menu, Appearance
+panel, and a live indicator. `rvrender` draws any position to a PNG without
+a window, with a net highlighted if asked.
 
 ## Layout
 
@@ -28,7 +30,8 @@ viewer/
                         reader, file.cpp the only platform-specific file I/O;
                         theme, display, scene and camera are the M2 board;
                         timeline, routed, overlay, playback and session are M3;
-                        wavefront is M4; inspect and hittest are M5)
+                        wavefront is M4; inspect and hittest are M5; M6
+                        extends trace, timeline, inspect and session in place)
     tests/              self-contained tests (no framework), a C99 smoke test,
                         synth.cpp, a test-only trace writer built from the spec,
                         synth_board.cpp, the synthetic stress board, and
@@ -38,7 +41,7 @@ viewer/
     Sources/RVKit/      Swift wrapper over rv.h, the Core Graphics display-list
                         renderer and LayeredRenderer (cached planes for playback)
     Sources/RouteViewer the app (TraceDocument, BoardView, TimelineView, AppearancePanel,
-                        InspectorPanel)
+                        InspectorPanel; SelfTestLive, the self-test's live phase)
     Sources/rvrender/   headless renderer: any position to PNG, frames, PNG comparison,
                         timing, playback self-test
     Tests/golden.sh     golden-image tests; Tests/golden/*.png are the expected images
@@ -74,8 +77,8 @@ sh check_additive.sh   # read-only: fails if anything outside viewer/ changed be
 
 `make selftest` opens one window per run for a few seconds and exits on its
 own (0 on success, 1 on a failed check, 2 if it does not finish in 10 s;
-`RV_SELFTEST_TIMEOUT=SECONDS` allows longer, which the dongle trace needs,
-about 11 s). With a file (`RouteViewer --selftest FILE`) it opens the trace
+`RV_SELFTEST_TIMEOUT=SECONDS` allows longer, which the dongle trace needs:
+about 11 s with M6's live phase; use 60). With a file (`RouteViewer --selftest FILE`) it opens the trace
 as a document without adding it to Open Recent, checks the window title, the
 Appearance panel (12 object classes) and the display list, redraws every
 plane, checks that something besides the background was drawn, and checks
@@ -99,8 +102,29 @@ tree with a fresh single-pass render after every step. Then clicks through
 the view's own mouse handlers: a press with a 1-point wobble on a net
 selects it (and its row in the table), a click on empty space clears, a
 20-point drag that starts on a net pans by exactly the drag and selects
-nothing, and the hover text names what is under the pointer. Last it plays
+nothing, and the hover text names what is under the pointer. Then it plays
 the run to the end in every pacing mode.
+
+Last (M6) the **live phase**: the same file written again, about 60 pieces,
+into a temporary file that does not exist when its window opens (the path
+`TraceFiles.open` takes for a missing file), with a clock the test drives
+(0.25 s a poll, four frames between polls), through the window's own poll,
+clock, scrub and Live button. It checks: a missing file shows "Waiting for
+the file"; the window follows the growing trace; while following, no frame
+enters more than one new search and no search is passed without being shown
+settled unless the core jumped ahead (counted, not a failure); no poll moves
+the position (time and event; at the end, one ulp back, see below) or the
+playhead; a net selected at 30 % stays selected; a scrub back stops
+following, playback does not resume and the position stays exactly put over
+five more polls; Live follows again from the end; at END following stops,
+playback pauses and polling ends ("Complete: ..."); the timeline (every
+event), the nets table (every cell) and the board at two positions equal a
+fresh open of the same bytes (0 px between the two single-pass renders) and
+the layer tree equals a single-pass render (0 px); then the file is replaced
+by the first half of the run: the window reloads it, keeping the camera and a
+hidden layer, keeps polling, and after more than 5 s without growth shows
+"Live: stalled, no new data for 5 s, ...". On the dongle the whole self-test
+takes about 11 s, the live phase 1.2 s (`RV_SELFTEST_TIMEOUT=60`).
 
 The comparisons rasterise in one band. (M4 believed Core Graphics drawing on
 several threads was not repeatable; M5 found it is: see "Bands" under
@@ -126,10 +150,19 @@ hit with a net decides the selection, nothing clears it).
 ## The app
 
 - **Opening:** File > Open (⌘O), Open Recent, double-click in Finder, or drop
-  a `.grtrace` file on the Dock icon or on any window. Each file is a
-  read-only document (`TraceDocument`); the window title is the file name.
-  With no trace open, the welcome window shows the board background and an
-  Open button.
+  a `.grtrace` file on the Dock icon or on any window, or name it on the
+  command line (`"Visual Gridrouter.app/Contents/MacOS/RouteViewer" FILE`).
+  Each file is a read-only document (`TraceDocument`); the window title is
+  the file name. With no trace open, the welcome window shows the board
+  background and an Open button. M6: every way of opening follows a file
+  that is still being written, and the command line and Open Recent also
+  take a path that does not exist yet (the window waits for it).
+- **Live** (M6): while the file grows, the right of the status line shows
+  the core's live text ("Live: growing, 12.3 MB, 4 012 events, 3.1 s
+  behind", "Live: stalled, no new data for 12 s, ...", then "Complete:
+  ..."), and a **Live** button on the transport bar (Playback > Follow Live,
+  key L; End does the same) goes back to following. The file is read every
+  0.25 s until it is complete.
 - **Board:** by default the latest `BRD` board at or before the playback
   position ("Board at the playhead"), or before any board the router's
   outline (grid, pads and keep-outs of the router session); the board menu
@@ -282,6 +315,137 @@ forwards clicks.
   time* (each event lasts the router's own time since the event before,
   × 10 by default; a search that found nothing at most 0.010 s of router
   time). It is a setting of the session, kept when another trace is opened.
+
+## Following a run while it is written (M6)
+
+The recorder writes a chunk with one write and a flush; a short last chunk
+is "not written yet" and END means complete (`docs/TRACE_FORMAT.md`). All of
+the following is in the core (`rv.h`, section M6); the app polls and draws.
+
+- **Opening.** `rv_open_ex(path, RV_OPEN_LIVE | RV_OPEN_WAIT)`. With WAIT a
+  path that names no file yet opens an empty trace in the "waiting" state;
+  the file is opened when it appears. A file shorter than its header is
+  waiting too. With LIVE a trace that is not complete is followed from the
+  start (prefix pacing, below); a complete one opens as without it.
+- **Polling.** `rv_poll(now)` reads what was appended and extends
+  everything derived, in time proportional to what was appended: the chunk
+  index, the timeline (events, copper lives, ghosts, failures, phases,
+  ticks; only the last event, still being written, is recomputed), the
+  router copper geometry, the board list and outlines, the overlay (its keys
+  stay valid: the key epoch no longer changes on a refresh), the nets table
+  (only rows whose net had new chunks, plus rows with a route_net still
+  open), histories, hit testing. After any sequence of polls the session
+  equals a fresh open of the same bytes, position and view aside (tested
+  at every split point of the synthetic run, one byte at a time, 12 random
+  runs in four pacings and the stress board). The selection stays. `now` is
+  the client's clock; the core has none and uses it only for "time since the
+  file last grew". There are no timeouts: a run that dies without END stays
+  "growing", then "stalled" after `RV_LIVE_STALL_SECONDS` (5 s) without
+  growth, for ever.
+- **The current event never changes because of a poll.** While a trace
+  opened with LIVE grows, pacing is *prefix* pacing: an event's time depends
+  only on itself and the events before it (fit modes: weight × fit_seconds
+  / 30 000, `RV_LIVE_FIT_WEIGHT`; the dongle's whole run weighs 30 667), so
+  events already read keep their times and the time position stays exactly
+  where it was (at the very end of a finished last event, which becomes the
+  next event's start, it steps one ulp back to stay in its event). At END
+  the fit modes are refitted to fit_seconds over the whole run, keeping the
+  event and the fraction of it. Without LIVE (M5 behaviour) every refresh
+  refits, keeping the event and fraction, and a position at the end moves
+  to the new end. The timeline's `span` is the length the axis shows: while
+  growing it grows by ×1.5 steps when the total reaches it, so the strip
+  and the playhead stay put between steps.
+- **Following** (`rv_set_following`, `rv_live.following`). On at a LIVE
+  open of a growing trace, with Live (rv_set_following 1), rv_jump to the
+  end, play at the end, or playing forward into the end. Off with a pause,
+  any seek or scrub, a step, playing backward, or rv_set_following 0. While
+  following, each frame (`rv_advance`): if the current event's last chunk
+  is more than `RV_FOLLOW_LAG` (2) router seconds older than the newest
+  chunk, jump to the first event within 2 s of it (counted in
+  `rv_live.skips`); otherwise move forward at max(speed, gap / 0.5 s), gap
+  being the playback time left, but stop at 90 % of the first search with
+  time that is not yet shown settled (the current one included): so at most
+  one new search a frame, and none is passed without its wavefront settled
+  unless the viewer is more than 2 router seconds behind. At the end it
+  stays there, playing, while the trace grows; at END following ends and
+  playback pauses.
+- **States and text** (`rv_live_get`, `rv_live_text`): waiting, growing,
+  stalled, complete, stopped (a corrupt chunk header), replaced, failed (not
+  a trace); the text is the indicator's: "Waiting for the file", "Waiting for
+  the recorder to start", "Live: growing, 12.3 MB, 4 012 events[, 3.1 s
+  behind]", "Live: stalled, no new data for 12 s, ...", "Complete: 145.8 MB,
+  8 006 events", "Replaced: the file on disk is another run".
+- **Replacement.** If the file shrank, its header or the last indexed chunk
+  header changed, or the path now names another file (device and inode) or
+  none, the poll fails with `RV_E_REPLACED` and keeps failing; nothing of the
+  new file is mixed in. The client calls `rv_reload`, which opens the path
+  again with the same flags and keeps the camera, the visibility, the
+  pacing, the speed and the selected router net.
+- **The Mac client.** A 250 ms `Timer` on the main run loop calls
+  `rv_poll` until the trace is complete (no file-system events, no threads).
+  A poll that read chunks redraws the timeline (unchanged events are not
+  converted again), the Appearance panel when the board changed, the planes
+  that changed, the transport, and the inspector (the history of the
+  selected net is fetched again). The board is fitted once, when the first
+  board or outline appears; after that the camera is the user's. A scrub
+  that stopped following does not resume playback. `RV_E_REPLACED` reloads
+  in place. `TraceDocument` ignores NSDocument's "file changed on disk"
+  (`presentedItemDidChange`) and keeps `fileModificationDate` in step.
+
+`build/rvdump --follow [--interval MS] [--stall-exit S] [--quiet] FILE`
+follows a file from a terminal (it may not exist yet): it prints each new
+event, reloads on replacement, stops at END and ends with the refresh times.
+`build/rvsynth --drip SRC DST [--rate BYTES_PER_S] [--piece N] [--seed S]`
+writes a copy of SRC into DST in pseudo-random pieces of 1 to N bytes (so
+chunk headers and payloads are split anywhere) at RATE, flushing each.
+`.build/release/rvrender --bench-live SRC DIR [--size WxH]` times following
+SRC written into DIR at 5 MB/s (simulated time: 0.25 s polls, 15 frames of
+1/60 s between them), as the app does it.
+
+Measured on the dongle trace (145.8 MB, 9 464 chunks, 8 006 events) on an
+18-core M5 Pro, written at 5 MB/s and polled every 0.25 s
+(`rvrender --bench-live ... --size 3200x2000`, release build, 117 polls):
+
+| | median | p90 | p99 | worst | sum |
+|---|---|---|---|---|---|
+| `rv_poll` (the core's whole refresh) | 0.13 ms | 0.43 ms | 0.84 ms | 0.93 ms | 24.4 ms |
+| the client's share of a poll that read chunks | 0.12 ms | 0.15 ms | 1.72 ms | 17.8 ms | 33.3 ms |
+| a frame while following (1 742 frames) | 1.44 ms | 1.92 ms | 2.54 ms | 11.1 ms | |
+
+The slowest `rv_poll` read 911 chunks (1.17 MB, 790 events) in 0.93 ms; the
+slowest client share is the poll that brings the first board (its first full
+redraw). Following jumped ahead 16 times: written at 5 MB/s the dongle run
+lasts 29 s and holds 2 320 searches, more than following can show settled
+at one a frame. Peak resident memory 372 MB against 358 MB for opening the
+complete file and playing it (`rvrender --bench-playback`, same size;
++4 %). Written by `rvsynth --drip` in real time (967 random pieces of up to
+300 kB, 29.2 s) and followed by `rvdump --follow` (built `-O1`): 115 polls,
+refresh 0.52 ms median, 2.10 ms p99, 4.37 ms worst (29 chunks, 1.14 MB),
+70 ms in all. In the app's self-test on the dongle (pieces of 2.4 MB, with
+the views): 0.40 ms median per poll, 40 ms for the poll that brings the
+board, 58 ms to reload the replaced half-size file.
+
+A real recording: `examples/record_bench.py` (the bench board, 21.8 MB,
+routed and recorded in 1.3 s) followed by `rvdump --follow`: "Waiting for
+the file", then 6 of 7 polls read data (refresh 0.28 ms median, 0.69 ms
+worst), "Complete: 21.8 MB, 524 events"; the app's self-test on that file
+passes, live phase included.
+
+**To follow a dongle run live:**
+
+1. `make -C viewer app` (once).
+2. Start the app on the trace path the generator will write, before or
+   after the run starts:
+   `"viewer/build/Visual Gridrouter.app/Contents/MacOS/RouteViewer" /path/to/run.grtrace`
+   (or File > Open once the file exists, or Open Recent).
+3. In the dongle repository, run the board generator with
+   `GEN_PCB_TRACE_FILE=/path/to/run.grtrace` (its `visual-router` branch).
+4. The window says "Waiting for the file", then shows the placed board and
+   follows the routing as it is written. Scrub or step to look back (that
+   stops following); press Live, L or End to follow again. When the
+   generator writes END the indicator says "Complete" and the whole run is
+   refitted to 3 minutes. If the generator is run again into the same path,
+   the window reloads the new run in place.
 
 ## Inspecting (M5)
 
@@ -442,7 +606,9 @@ theme file loader yet; the theme is built into the core (`core/src/theme.cpp`).
 .build/release/rvrender --compare GOLDEN.png NEW.png [--tolerance T] [--max-fraction F]
 .build/release/rvrender --bench FILE [--size WxH] [--frames N]
 .build/release/rvrender --bench-playback FILE [--size WxH] [--speed S] [--frames N] [--pacing PACING]
-                                            [--select NET]
+                                            [--select NET] [--crop-grid G]
+.build/release/rvrender --bench-live SRC DIR [--size WxH] [--rate BYTES_PER_S]   # M6
+.build/release/rvrender --crops FILE [--size WxH] [--at F] [--frames TRIALS]     # M6, see "Bands"
 .build/release/rvrender --selftest FILE [--size WxH]
 .build/release/rvrender --repeat FILE [--size WxH] [--at FRACTION]
 ```
@@ -521,6 +687,34 @@ redrawn: a possible faint flicker. Removing it would take bitmap contexts
 fixed to the view (tiles at fixed view positions, crops in whole tiles);
 not done in M5.
 
+M6 measured it (`rvrender --crops FILE --size 3200x2000 --frames 4`: each
+slot plane with batches, at five positions of the dongle run, drawn at its
+own crop and at four crops grown by 0 to 48 pixels per side, the overlap
+compared; about 190 million pixels):
+
+| slot planes drawn | pixels that change | by more than 48 | largest |
+|---|---|---|---|
+| M5: default bands, crop as is | 0.030–0.033 % | 0 to 343 (varies by run) | 48–131 |
+| one band, crop as is | 0.0059 % | 0 | 17 |
+| one band, crop widened to a 64-px view grid | 0.0012 % | 0 | 5 |
+| one band, 128-px grid | 0.0003 % | 0 | 3 |
+| one band, 256-px or 512-px grid | 0 | 0 | 0 |
+
+So Core Graphics' anti-aliasing depends on where the context's origin
+falls modulo 256 pixels, and with bands it also varies from run to run (the
+same crops in two processes: 0 and 343 pixels off by more than 48). One
+context anchored to a 256-pixel view grid makes a slot plane exactly
+repeatable whatever its crop (`LayeredRenderer.cropGrid = 256`), but
+playback then costs 16.2 ms a frame median and 22.8 ms at the 99th
+percentile at 3200 × 2000 (`--bench-playback ... --crop-grid 256`), against
+1.5 and 2.5 ms with bands: it fails the 8 ms frame gate, so it stays off
+(`cropGrid` 0, M5's behaviour). A tried and dropped variant: parallel bands
+of one row of grid tiles each (every band context view-anchored) left 504
+pixels changing by at most 3 levels with 64-px tiles, but up to 155 levels
+with 128-px and 119 with 256-px tiles; its frame time was not measured. The
+flicker, where it shows, is a few thin edge pixels of a slot plane redrawn
+with another crop.
+
 `rvdump` reads a trace through `rv.h`, like a client:
 
 ```sh
@@ -542,6 +736,10 @@ build/rvdump --net NAME [--at AT] FILE
 build/rvdump --hit X,Y [--at AT] [--bench N] FILE
                                # what is under board point (X, Y) mm in a fitted 1600 x 1000 view,
                                # the hover text, and the time of N hit tests at random points
+build/rvdump --follow [--interval MS] [--stall-exit S] [--quiet] FILE
+                               # M6: follow a file being written (it may not exist yet)
+build/rvsynth --drip SRC DST [--rate BYTES_PER_S] [--piece N] [--seed S]
+                               # M6: write SRC into DST in random pieces, as a recorder would
 ```
 
 It exits 0 for a readable trace without errors, including a file that is

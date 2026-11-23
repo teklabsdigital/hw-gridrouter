@@ -88,6 +88,8 @@ CopperGeom commit_geometry(const Run &run, const Commit &c);
 CopperGeom via_geometry(const Run &run, const Via &v);
 // Geometry of every copper item of the trace, indexed like Trace::copper().
 std::vector<CopperGeom> build_copper_geometry(const Trace &t);
+// M6: the geometry of the copper items added since out was built.
+void append_copper_geometry(const Trace &t, std::vector<CopperGeom> &out);
 
 // The list drawn with no board: layers are the session's two router layers
 // (indices 0 and 1, or one if both have the same name) and "Edge.Cuts" for
