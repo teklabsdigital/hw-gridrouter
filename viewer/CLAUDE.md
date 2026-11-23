@@ -29,6 +29,9 @@ contract between recorder and viewer).
 5. **Every change to the core needs a test** in `core/tests/` (plain
    `TEST`/`CHECK` from `check.hpp`, no framework). `make test` and
    `make asan` must pass. Bump `RV_API_VERSION` on any change to `rv.h`.
+   `make test` also compares the golden images (`mac/Tests/golden/`). Run
+   `make golden-update` only for an intended change to the drawing, and
+   look at every regenerated PNG before keeping it.
 6. **Swift:** Swift 6 language mode, strict concurrency clean, all UI and all
    core calls on `@MainActor`. `make app` builds with warnings as errors.
 7. **Additive only.** The viewer must not change how the router behaves for

@@ -39,6 +39,8 @@
 			<string>Viewer</string>
 			<key>LSHandlerRank</key>
 			<string>Owner</string>
+			<key>NSDocumentClass</key>
+			<string>TraceDocument</string>
 			<key>LSItemContentTypes</key>
 			<array>
 				<string>local.visual-gridrouter.grtrace</string>

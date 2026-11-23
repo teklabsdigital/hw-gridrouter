@@ -328,6 +328,30 @@ struct Sample {
 
 Sample build_sample(bool with_end = true);
 
+// --- the M2 stress board ---------------------------------------------------------
+//
+// A synthetic board at least as heavy as the dongle's, for the drawing
+// performance gate and the golden images: 100 x 72 mm, 4 copper layers,
+// 120 footprints with 450 pads (shapes on copper, mask and paste), two
+// full-board zone fills (In1.Cu, B.Cu) with 400 clearance holes each,
+// about 1500 track segments, 80 vias, 152 texts as glyph outline polygons,
+// silkscreen, fab and courtyard graphics, mounting holes and a keep-out.
+// Deterministic.  routed = false leaves out zones, tracks and vias (the
+// "placed" board).
+WBrd stress_board(const std::string &label, bool routed);
+
+// A complete trace with the stress board twice: BRD "placed", BRD "final",
+// then END.
+std::vector<unsigned char> build_stress_trace();
+
+// Glyph outline polygons of a text in a small stroke font, as KiCad's
+// TransformTextToPolySet gives them: one stadium polygon per stroke.
+// (x, y) is the centre of the text, height the cap height, angle counter-
+// clockwise on screen in degrees; mirror for back-side text.  Appended to
+// polys.
+void text_polygons(const std::string &text, double x_nm, double y_nm, double height_nm, double angle_deg,
+                   bool mirror, std::vector<std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>>> &polys);
+
 // Writes bytes to a file; returns false on failure.
 bool write_file(const std::string &path, const std::vector<unsigned char> &bytes);
 

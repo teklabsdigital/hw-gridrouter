@@ -12,13 +12,18 @@
  *   - No function aborts or lets a C++ exception escape.
  *   - Pointers returned by the core are borrowed: they stay valid until the
  *     next call that changes the same session, or until rv_destroy().  The
- *     calls that change a session are rv_open, rv_close, rv_refresh, and the
- *     calls that return a borrowed buffer (rv_chunk_text, rv_wavefront),
- *     each of which replaces the buffer it returned before.
+ *     calls that change a session are rv_open, rv_close, rv_refresh,
+ *     rv_board_select, rv_layer_set_visible, rv_class_set_visible, and the
+ *     calls that return a borrowed buffer (rv_chunk_text, rv_wavefront,
+ *     rv_view_status), each of which replaces only the buffer it returned
+ *     before.  The camera calls (rv_view_*) never invalidate the display
+ *     list.
  *
  * Milestone M1: the session lifecycle and the trace reader (open, close,
- * refresh and read-only facts about the file).  Later milestones add the
- * timeline, display list and wavefront images.
+ * refresh and read-only facts about the file).  Milestone M2: the board
+ * display list in KiCad's default colours, layer and object visibility, and
+ * the camera.  Later milestones add the timeline, router copper and
+ * wavefront images.
  *
  * The trace file format is docs/TRACE_FORMAT.md in the router repository.
  */
@@ -36,7 +41,7 @@ extern "C" {
  * compares this compile-time value with rv_api_version() at run time to make
  * sure it was linked against the core it was compiled for.
  */
-#define RV_API_VERSION 2u
+#define RV_API_VERSION 3u
 
 /* "No id": an absent search, route, copper or session index. */
 #define RV_NONE 0xFFFFFFFFu
@@ -283,6 +288,271 @@ rv_status rv_search_cells(rv_session *session, uint32_t search_id, uint32_t whic
  */
 rv_status rv_wavefront(rv_session *session, uint32_t search_id, const uint32_t **cells,
                        const int32_t **costs, uint32_t *count);
+
+/* ==== M2: the board ========================================================
+ *
+ * The board drawn is a BRD chunk (TRACE_FORMAT.md 7.18): by default the
+ * latest one in the file (a refresh that reads a newer BRD switches to it),
+ * or one chosen with rv_board_select.  The calls below also work with no
+ * trace open or a trace without a BRD chunk: there is then no board, no
+ * layers and an empty display list, and the camera still works.
+ */
+
+/* ---- boards (BRD chunks) -------------------------------------------------- */
+
+typedef struct rv_board_info {
+    double thickness_mm;
+    double origin_x_mm;      /* BRD origin_x_nm, in mm */
+    double origin_y_mm;
+    const char *label;       /* "placed", "final", ...; borrowed */
+    uint32_t chunk;          /* index of the BRD chunk */
+    uint32_t layer_count;
+    uint32_t net_count;
+    uint32_t footprint_count;
+    uint32_t record_count;
+    uint32_t reserved;       /* 0 */
+} rv_board_info;
+
+/* Number of readable BRD chunks (0 with no trace open). */
+rv_status rv_board_count(rv_session *session, uint32_t *count);
+rv_status rv_board(rv_session *session, uint32_t index, rv_board_info *out);
+
+/* Draw BRD number index, or the latest one with RV_NONE (the default, and
+ * the state after every rv_open).  An index beyond the boards read so far
+ * is accepted and shows no board until a refresh reads it. */
+rv_status rv_board_select(rv_session *session, uint32_t index);
+
+/* The BRD index being drawn, RV_NONE if there is none. */
+rv_status rv_board_selected(rv_session *session, uint32_t *index);
+
+/* ---- layers of the board drawn ------------------------------------------------ */
+
+/* Layer kinds (rv_layer_info.kind). */
+#define RV_LAYER_OTHER 0u
+#define RV_LAYER_COPPER 1u
+#define RV_LAYER_ADHESIVE 2u
+#define RV_LAYER_PASTE 3u
+#define RV_LAYER_SILK 4u
+#define RV_LAYER_MASK 5u
+#define RV_LAYER_COURTYARD 6u
+#define RV_LAYER_FAB 7u
+#define RV_LAYER_EDGE_CUTS 8u
+#define RV_LAYER_MARGIN 9u
+#define RV_LAYER_USER 10u
+
+/* Board sides (rv_layer_info.side). */
+#define RV_SIDE_NONE 0u
+#define RV_SIDE_FRONT 1u
+#define RV_SIDE_BACK 2u
+#define RV_SIDE_INNER 3u
+
+typedef struct rv_layer_info {
+    const char *name;    /* canonical KiCad name from the BRD layer table; borrowed */
+    uint32_t index;      /* position in the BRD layer table (records' layer_index) */
+    uint32_t kind;       /* RV_LAYER_* */
+    uint32_t side;       /* RV_SIDE_* */
+    uint32_t rgba;       /* theme colour, 0xRRGGBBAA, straight alpha */
+    uint32_t visible;    /* 1 if shown */
+    uint32_t draw_rank;  /* larger is drawn above; see rv_order_key */
+    uint32_t items;      /* records of the board drawn on this layer */
+    int32_t kicad_id;    /* informational (KiCad renumbers ids) */
+    int32_t type;        /* copper LAYER_T, -1 for non-copper */
+    uint32_t reserved;   /* 0 */
+} rv_layer_info;
+
+/* Layers of the board drawn, in the order of KiCad's Appearance panel
+ * (copper front to back, then the technical layers).  0 without a board. */
+rv_status rv_layer_count(rv_session *session, uint32_t *count);
+rv_status rv_layer(rv_session *session, uint32_t position, rv_layer_info *out);
+
+/*
+ * Show or hide a layer by canonical name.  The setting is kept per name for
+ * the life of the session, across boards and traces, and may name a layer
+ * the board does not have.  Defaults: every layer shown except masks, paste
+ * and courtyards.  Both KiCad's long ("F.Silkscreen") and short ("F.SilkS")
+ * names are recognised for colours and defaults, but visibility is keyed by
+ * the exact name the board uses.
+ */
+rv_status rv_layer_set_visible(rv_session *session, const char *name, uint32_t visible);
+
+/* ---- object classes ------------------------------------------------------------ */
+
+typedef enum rv_object_class {
+    RV_OBJ_ZONES = 0,        /* zone fills and zone outlines */
+    RV_OBJ_TRACKS = 1,
+    RV_OBJ_PADS = 2,         /* pad shapes on every layer (copper, mask, paste) */
+    RV_OBJ_VIAS = 3,
+    RV_OBJ_HOLES = 4,        /* drills of pads, vias and mounting holes */
+    RV_OBJ_TEXT = 5,         /* text glyph outlines, board and footprint */
+    RV_OBJ_FP_GRAPHICS = 6,  /* footprint graphics (silk, fab, courtyard lines) */
+    RV_OBJ_GRAPHICS = 7,     /* board graphics outside footprints */
+    RV_OBJ_RULE_AREAS = 8,   /* keep-outs */
+    RV_OBJ_OUTLINE = 9       /* board outline (Edge.Cuts) */
+    /* Reserved for later milestones, not produced by this version:
+     * 10 router copper (M3), 11 wavefront (M4), 12 net highlight (M5). */
+} rv_object_class;
+
+/* Number of object classes this core produces (10). */
+rv_status rv_class_count(rv_session *session, uint32_t *count);
+/* Name for the Appearance panel ("Zones", ...), static; and visibility. */
+rv_status rv_class(rv_session *session, uint32_t cls, const char **name, uint32_t *visible);
+/* Default: all shown.  A via's hole needs Vias and Holes shown, a pad's
+ * hole Pads and Holes. */
+rv_status rv_class_set_visible(rv_session *session, uint32_t cls, uint32_t visible);
+
+/* ---- the display list ----------------------------------------------------------- */
+
+/*
+ * The board as batches of five primitives, in board millimetres (x right,
+ * y down, as KiCad), sorted bottom to top: draw the batches in array order
+ * over the background colour.  Each batch has one colour and one primitive:
+ *
+ *   RV_FILL    filled polygons.  Item k is polygon first + k: polys[2p] is
+ *              its first contour, polys[2p + 1] its number of contours.
+ *              Contour c has contours[2c + 1] points starting at point
+ *              contours[2c] (xy[2i], xy[2i + 1]); contours are closed
+ *              implicitly.  Each polygon is filled even-odd over its own
+ *              contours (the first is the outline, the others holes);
+ *              polygons in a batch are unioned.  The core orients every
+ *              outline with positive signed area (sum of x_i*y_(i+1) -
+ *              x_(i+1)*y_i > 0) and every hole negative, so filling the
+ *              whole batch as one path with the NON-ZERO rule gives the
+ *              same result (it differs only where three holes of one
+ *              polygon overlap); a client may fill per polygon instead.
+ *   RV_STROKE  open polylines, round caps and joins, line width `width`.
+ *              Item k is contour first + k (as above).
+ *   RV_SEGS    straight segments with round caps, width `width`.  Item k is
+ *              segs[4(first + k) .. + 3] = x0, y0, x1, y1.
+ *   RV_DISC    filled circles.  Item k is circles[3(first + k) .. + 2] =
+ *              x, y, r.
+ *   RV_RING    circle outlines of radius r drawn with line width `width`,
+ *              items as RV_DISC.
+ *
+ * Only visible batches are listed.  Batches of one layer are contiguous
+ * except where another layer's batches interleave by `order`.
+ *
+ * Caching: geometry_generation changes only when the geometry may have
+ * changed (another board or trace); within one geometry_generation a
+ * batch's `key` always names the same geometry, so a client may keep
+ * prepared paths keyed by `key` across visibility changes.  `generation`
+ * changes whenever the list may differ.
+ */
+typedef enum rv_prim {
+    RV_FILL = 1,
+    RV_STROKE = 2,
+    RV_SEGS = 3,
+    RV_DISC = 4,
+    RV_RING = 5
+} rv_prim;
+
+/* Sub-slots inside a layer's draw rank (the low 8 bits of `order`).
+ * Slots marked "reserved" are not produced by this version; they fix where
+ * later milestones' dynamic content goes. */
+#define RV_SUB_WAVEFRONT 0x08u    /* reserved (M4): wavefront image, under the copper */
+#define RV_SUB_ZONE 0x10u
+#define RV_SUB_ZONE_OUTLINE 0x14u
+#define RV_SUB_RULE_AREA 0x18u
+#define RV_SUB_GRAPHIC 0x20u
+#define RV_SUB_TEXT 0x28u
+#define RV_SUB_TRACK 0x30u
+#define RV_SUB_ROUTED 0x38u       /* reserved (M3): router copper, above board tracks */
+#define RV_SUB_PAD 0x40u
+#define RV_SUB_VIA 0x50u
+#define RV_SUB_OUTLINE 0x60u
+/* In the hole slot (layer RV_NONE): */
+#define RV_SUB_HOLE_WALL 0x10u
+#define RV_SUB_PAD_HOLE 0x20u
+#define RV_SUB_VIA_HOLE 0x28u
+#define RV_SUB_NON_PLATED 0x30u
+
+typedef struct rv_batch {
+    uint32_t prim;     /* rv_prim */
+    uint32_t cls;      /* rv_object_class */
+    uint32_t layer;    /* BRD layer index; RV_NONE for holes */
+    uint32_t order;    /* draw_rank * 256 + RV_SUB_*; ascending */
+    uint32_t rgba;     /* 0xRRGGBBAA, straight alpha (opacity applied) */
+    uint32_t key;      /* stable within one geometry_generation */
+    float width;       /* RV_STROKE, RV_SEGS, RV_RING: line width in mm; else 0 */
+    uint32_t first;    /* first item (meaning depends on prim, see above) */
+    uint32_t count;    /* number of items */
+    float bbox[4];     /* min x, min y, max x, max y in mm, line width included */
+} rv_batch;
+
+typedef struct rv_display_list {
+    const rv_batch *batches;
+    const float *xy;          /* 2 per point */
+    const uint32_t *contours; /* 2 per contour: first point, number of points */
+    const uint32_t *polys;    /* 2 per polygon: first contour, number of contours */
+    const float *segs;        /* 4 per segment */
+    const float *circles;     /* 3 per circle */
+    uint32_t batch_count;
+    uint32_t point_count;
+    uint32_t contour_count;
+    uint32_t poly_count;
+    uint32_t seg_count;
+    uint32_t circle_count;
+    uint32_t background;          /* theme background, 0xRRGGBBAA */
+    uint32_t board;               /* BRD index drawn, RV_NONE if none */
+    uint32_t has_extent;          /* 0 if the board draws nothing */
+    uint32_t geometry_generation;
+    uint32_t generation;
+    uint32_t reserved;            /* 0 */
+    float extent[4];   /* board outline bounds (else all content), mm */
+} rv_display_list;
+
+/* The display list of the board drawn.  The arrays are borrowed (see the
+ * rules at the top).  Built on first use after a change. */
+rv_status rv_get_display_list(rv_session *session, rv_display_list *out);
+
+/* The order key of a sub-slot of a layer (layer = BRD layer index), or of
+ * the hole slot (layer = RV_NONE): where a client inserts content of its
+ * own, such as the wavefront image (RV_SUB_WAVEFRONT), between batches. */
+rv_status rv_order_key(rv_session *session, uint32_t layer, uint32_t sub, uint32_t *key);
+
+/* ---- the camera ------------------------------------------------------------------ */
+
+/*
+ * View coordinates are the client's points: origin at the top-left corner
+ * of the view, y down.  view = board_mm * scale + (tx, ty).  A client
+ * drawing into pixels multiplies by backing (pixels per point).
+ */
+typedef struct rv_view {
+    double scale;        /* view points per board mm */
+    double tx;           /* translation, points */
+    double ty;
+    double width;        /* view size, points */
+    double height;
+    double backing;      /* pixels per point */
+    double fit_scale;    /* the scale "zoom to fit" gives now */
+    double zoom_percent; /* 100 * scale / fit_scale */
+    double min_scale;    /* zoom limits */
+    double max_scale;
+} rv_view;
+
+/* Size of the view in points and its backing scale.  The board point at
+ * the top-left corner stays fixed.  A fit asked for before the view had a
+ * size is done now. */
+rv_status rv_view_set_size(rv_session *session, double width, double height, double backing);
+
+/* Zoom to fit the board drawn (its outline, else all content) with a small
+ * margin, centred.  Without a board: 10 points per mm about the origin. */
+rv_status rv_view_fit(rv_session *session);
+
+/* Multiply the scale by factor (> 1 zooms in) about view point (vx, vy),
+ * which keeps showing the same board point.  Clamped to the limits. */
+rv_status rv_view_zoom(rv_session *session, double factor, double vx, double vy);
+
+/* Move the content by (dx, dy) points, as a drag does. */
+rv_status rv_view_pan(rv_session *session, double dx, double dy);
+
+rv_status rv_view_get(rv_session *session, rv_view *out);
+rv_status rv_view_to_board(rv_session *session, double vx, double vy, double *bx, double *by);
+rv_status rv_board_to_view(rv_session *session, double bx, double by, double *vx, double *vy);
+
+/* Status-line text for the cursor at view point (vx, vy): board position
+ * in mm and the zoom.  Borrowed until the next rv_view_status call or any
+ * call that changes the session. */
+rv_status rv_view_status(rv_session *session, double vx, double vy, const char **text);
 
 #ifdef __cplusplus
 } /* extern "C" */

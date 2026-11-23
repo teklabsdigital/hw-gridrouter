@@ -10,6 +10,7 @@
 #include "errors.hpp"
 #include "session.hpp"
 
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <iterator>
@@ -70,6 +71,11 @@ rv_status guarded(rv_session *session, F &&f) noexcept {
     } catch (...) {
         return status_from_current_exception(&session->impl);
     }
+}
+
+// The display list whose extent zoom-to-fit uses.
+const rv::DisplayList &fit_list(rv::Session &s) {
+    return s.scene.full(s.trace_or_null());
 }
 
 template <class T>
@@ -354,6 +360,259 @@ rv_status rv_wavefront(rv_session *session, uint32_t search_id, const uint32_t *
         *cells = w->cells.data();
         *costs = w->has_costs ? w->costs.data() : nullptr;
         *count = static_cast<uint32_t>(w->cells.size());
+    });
+}
+
+// --- M2: boards, layers, classes, display list, camera ----------------------------
+
+rv_status rv_board_count(rv_session *session, uint32_t *count) {
+    if (count != nullptr) *count = 0;
+    return guarded(session, [&](rv::Session &s) {
+        require_out(count, "count");
+        const rv::Trace *t = s.trace_or_null();
+        *count = t == nullptr ? 0u : static_cast<uint32_t>(t->boards().size());
+    });
+}
+
+rv_status rv_board(rv_session *session, uint32_t index, rv_board_info *out) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        const rv::Trace *t = s.trace_or_null();
+        require_index(index, t == nullptr ? 0 : t->boards().size(), "board");
+        const rv::BoardInfo &b = t->boards()[index];
+        rv_board_info i;
+        std::memset(&i, 0, sizeof i);
+        i.thickness_mm = b.thickness_mm;
+        i.origin_x_mm = b.origin_x_nm * 1e-6;
+        i.origin_y_mm = b.origin_y_nm * 1e-6;
+        i.label = b.label.c_str();
+        i.chunk = b.chunk;
+        i.layer_count = static_cast<uint32_t>(b.layers.size());
+        i.net_count = static_cast<uint32_t>(b.nets.size());
+        i.footprint_count = static_cast<uint32_t>(b.footprints.size());
+        i.record_count = b.nrecords;
+        *out = i;
+    });
+}
+
+rv_status rv_board_select(rv_session *session, uint32_t index) {
+    return guarded(session, [&](rv::Session &s) {
+        s.drop_borrowed();
+        s.scene.select(index);
+    });
+}
+
+rv_status rv_board_selected(rv_session *session, uint32_t *index) {
+    if (index != nullptr) *index = RV_NONE;
+    return guarded(session, [&](rv::Session &s) {
+        require_out(index, "index");
+        *index = s.scene.effective_board(s.trace_or_null());
+    });
+}
+
+rv_status rv_layer_count(rv_session *session, uint32_t *count) {
+    if (count != nullptr) *count = 0;
+    return guarded(session, [&](rv::Session &s) {
+        require_out(count, "count");
+        *count = static_cast<uint32_t>(s.scene.full(s.trace_or_null()).layers.size());
+    });
+}
+
+rv_status rv_layer(rv_session *session, uint32_t position, rv_layer_info *out) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        const rv::DisplayList &dl = s.scene.full(s.trace_or_null());
+        require_index(position, dl.layers.size(), "layer");
+        const rv::LayerEntry &e = dl.layers[position];
+        rv_layer_info i;
+        std::memset(&i, 0, sizeof i);
+        i.name = e.name.c_str();
+        i.index = e.index;
+        i.kind = static_cast<uint32_t>(e.cls.kind);
+        i.side = static_cast<uint32_t>(e.cls.side);
+        i.rgba = e.color;
+        i.visible = s.scene.layer_visible(e.name) ? 1u : 0u;
+        i.draw_rank = e.rank;
+        i.items = e.items;
+        i.kicad_id = e.kicad_id;
+        i.type = e.type;
+        *out = i;
+    });
+}
+
+rv_status rv_layer_set_visible(rv_session *session, const char *name, uint32_t visible) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(name, "name");
+        s.drop_borrowed();
+        s.scene.set_layer_visible(name, visible != 0);
+    });
+}
+
+rv_status rv_class_count(rv_session *session, uint32_t *count) {
+    if (count != nullptr) *count = 0;
+    return guarded(session, [&](rv::Session &) {
+        require_out(count, "count");
+        *count = rv::kClassCount;
+    });
+}
+
+rv_status rv_class(rv_session *session, uint32_t cls, const char **name, uint32_t *visible) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(name, "name");
+        require_out(visible, "visible");
+        require_index(cls, rv::kClassCount, "object class");
+        *name = rv::class_name(cls);
+        *visible = s.scene.class_visible(cls) ? 1u : 0u;
+    });
+}
+
+rv_status rv_class_set_visible(rv_session *session, uint32_t cls, uint32_t visible) {
+    return guarded(session, [&](rv::Session &s) {
+        require_index(cls, rv::kClassCount, "object class");
+        s.drop_borrowed();
+        s.scene.set_class_visible(cls, visible != 0);
+    });
+}
+
+rv_status rv_get_display_list(rv_session *session, rv_display_list *out) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        rv::Scene &sc = s.scene;
+        const rv::DisplayList &dl = sc.full(s.trace_or_null());
+        const std::vector<rv::Batch> &vis = sc.visible(s.trace_or_null());
+        // rv_batch is the public mirror of rv::Batch's leading fields; copy
+        // into the session's buffer of C structs.
+        std::vector<rv_batch> &cb = s.c_batches;
+        if (s.c_batches_generation != sc.generation() || cb.size() != vis.size()) {
+            cb.resize(vis.size());
+            for (std::size_t k = 0; k < vis.size(); ++k) {
+                const rv::Batch &b = vis[k];
+                rv_batch &c = cb[k];
+                c.prim = static_cast<uint32_t>(b.prim);
+                c.cls = b.cls;
+                c.layer = b.layer;
+                c.order = b.order;
+                c.rgba = b.color;
+                c.key = b.key;
+                c.width = b.width;
+                c.first = b.first;
+                c.count = b.count;
+                for (int i = 0; i < 4; ++i) c.bbox[i] = b.bbox[static_cast<std::size_t>(i)];
+            }
+            s.c_batches_generation = sc.generation();
+        }
+        rv_display_list d;
+        std::memset(&d, 0, sizeof d);
+        d.batches = cb.empty() ? nullptr : cb.data();
+        d.xy = dl.xy.empty() ? nullptr : dl.xy.data();
+        d.contours = dl.contours.empty() ? nullptr : dl.contours.data();
+        d.polys = dl.polys.empty() ? nullptr : dl.polys.data();
+        d.segs = dl.segs.empty() ? nullptr : dl.segs.data();
+        d.circles = dl.circles.empty() ? nullptr : dl.circles.data();
+        d.batch_count = static_cast<uint32_t>(cb.size());
+        d.point_count = static_cast<uint32_t>(dl.xy.size() / 2);
+        d.contour_count = static_cast<uint32_t>(dl.contours.size() / 2);
+        d.poly_count = static_cast<uint32_t>(dl.polys.size() / 2);
+        d.seg_count = static_cast<uint32_t>(dl.segs.size() / 4);
+        d.circle_count = static_cast<uint32_t>(dl.circles.size() / 3);
+        d.background = sc.theme().background;
+        d.board = sc.built_board();
+        d.has_extent = dl.has_extent ? 1u : 0u;
+        d.geometry_generation = sc.geometry_generation();
+        d.generation = sc.generation();
+        for (int i = 0; i < 4; ++i) d.extent[i] = dl.extent[static_cast<std::size_t>(i)];
+        *out = d;
+    });
+}
+
+rv_status rv_order_key(rv_session *session, uint32_t layer, uint32_t sub, uint32_t *key) {
+    if (key != nullptr) *key = 0;
+    return guarded(session, [&](rv::Session &s) {
+        require_out(key, "key");
+        if (sub > 0xFF) throw std::invalid_argument("invalid argument: sub must be below 256");
+        if (layer == RV_NONE) {
+            *key = rv::order_key(rv::kRankHoles, sub);
+            return;
+        }
+        const rv::DisplayList &dl = s.scene.full(s.trace_or_null());
+        for (const rv::LayerEntry &e : dl.layers)
+            if (e.index == layer) {
+                *key = rv::order_key(e.rank, sub);
+                return;
+            }
+        throw std::invalid_argument("invalid argument: the board has no layer " + std::to_string(layer));
+    });
+}
+
+rv_status rv_view_set_size(rv_session *session, double width, double height, double backing) {
+    return guarded(session, [&](rv::Session &s) { s.scene.camera.set_size(width, height, backing); });
+}
+
+rv_status rv_view_fit(rv_session *session) {
+    return guarded(session, [&](rv::Session &s) {
+        const rv::DisplayList &dl = fit_list(s);
+        s.scene.camera.fit(dl.extent, dl.has_extent);
+    });
+}
+
+rv_status rv_view_zoom(rv_session *session, double factor, double vx, double vy) {
+    return guarded(session, [&](rv::Session &s) { s.scene.camera.zoom(factor, vx, vy); });
+}
+
+rv_status rv_view_pan(rv_session *session, double dx, double dy) {
+    return guarded(session, [&](rv::Session &s) { s.scene.camera.pan(dx, dy); });
+}
+
+rv_status rv_view_get(rv_session *session, rv_view *out) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        const rv::Camera &c = s.scene.camera;
+        const rv::DisplayList &dl = fit_list(s);
+        rv_view v;
+        std::memset(&v, 0, sizeof v);
+        v.scale = c.scale();
+        v.tx = c.tx();
+        v.ty = c.ty();
+        v.width = c.width();
+        v.height = c.height();
+        v.backing = c.backing();
+        v.fit_scale = c.fit_scale(dl.extent, dl.has_extent);
+        v.zoom_percent = 100.0 * c.scale() / v.fit_scale;
+        v.min_scale = rv::Camera::kMinScale;
+        v.max_scale = rv::Camera::kMaxScale;
+        *out = v;
+    });
+}
+
+rv_status rv_view_to_board(rv_session *session, double vx, double vy, double *bx, double *by) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(bx, "bx");
+        require_out(by, "by");
+        s.scene.camera.to_board(vx, vy, *bx, *by);
+    });
+}
+
+rv_status rv_board_to_view(rv_session *session, double bx, double by, double *vx, double *vy) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(vx, "vx");
+        require_out(vy, "vy");
+        s.scene.camera.to_view(bx, by, *vx, *vy);
+    });
+}
+
+rv_status rv_view_status(rv_session *session, double vx, double vy, const char **text) {
+    if (text != nullptr) *text = nullptr;
+    return guarded(session, [&](rv::Session &s) {
+        require_out(text, "text");
+        const rv::Camera &c = s.scene.camera;
+        const rv::DisplayList &dl = fit_list(s);
+        double bx, by;
+        c.to_board(vx, vy, bx, by);
+        const double zoom = 100.0 * c.scale() / c.fit_scale(dl.extent, dl.has_extent);
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "X %.4f mm   Y %.4f mm   zoom %.0f%%", bx, by, zoom);
+        s.status = buf;
+        *text = s.status.c_str();
     });
 }
 

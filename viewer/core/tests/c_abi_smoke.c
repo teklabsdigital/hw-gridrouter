@@ -55,6 +55,38 @@ int main(void) {
     if (rv_wavefront(s, 0, &cells, &costs, &count) != RV_E_INVALID_ARGUMENT) ++failures;
     if (cells != NULL || costs != NULL || count != 0) ++failures;
     if (rv_close(s) != RV_OK) ++failures;
+
+    /* M2, the board and the camera, from C with no trace open. */
+    {
+        rv_display_list list;
+        rv_layer_info layer;
+        rv_board_info board;
+        rv_view view;
+        double bx = 1.0, by = 1.0;
+        uint32_t visible = 0;
+        if (rv_board_count(s, &count) != RV_OK || count != 0) ++failures;
+        if (rv_board(s, 0, &board) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (rv_board_select(s, RV_NONE) != RV_OK) ++failures;
+        if (rv_board_selected(s, &count) != RV_OK || count != RV_NONE) ++failures;
+        if (rv_layer_count(s, &count) != RV_OK || count != 0) ++failures;
+        if (rv_layer(s, 0, &layer) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (rv_layer_set_visible(s, "F.Cu", 1) != RV_OK) ++failures;
+        if (rv_class_count(s, &count) != RV_OK || count != 10) ++failures;
+        if (rv_class(s, RV_OBJ_VIAS, &text, &visible) != RV_OK || strcmp(text, "Vias") != 0) ++failures;
+        if (rv_class_set_visible(s, RV_OBJ_TEXT, 0) != RV_OK) ++failures;
+        if (rv_get_display_list(s, &list) != RV_OK || list.batch_count != 0) ++failures;
+        if (list.background != 0x001023FFu) ++failures;
+        if (rv_order_key(s, RV_NONE, RV_SUB_PAD_HOLE, &count) != RV_OK) ++failures;
+        if (rv_view_set_size(s, 640.0, 480.0, 2.0) != RV_OK) ++failures;
+        if (rv_view_fit(s) != RV_OK || rv_view_zoom(s, 2.0, 0.0, 0.0) != RV_OK) ++failures;
+        if (rv_view_pan(s, 5.0, 5.0) != RV_OK || rv_view_get(s, &view) != RV_OK) ++failures;
+        if (view.scale != 20.0 || view.backing != 2.0) ++failures;
+        if (rv_view_to_board(s, 5.0, 5.0, &bx, &by) != RV_OK) ++failures;
+        if (rv_board_to_view(s, bx, by, &bx, &by) != RV_OK || bx != 5.0 || by != 5.0) ++failures;
+        if (rv_view_status(s, 0.0, 0.0, &text) != RV_OK || text == NULL) ++failures;
+        if (rv_view_zoom(s, 0.0, 0.0, 0.0) != RV_E_INVALID_ARGUMENT) ++failures;
+    }
+
     if (strcmp(rv_kind_tag(RV_CHUNK_BRD), "BRD ") != 0) ++failures;
     if (strcmp(rv_kind_tag(RV_CHUNK_KIND_COUNT), "????") != 0) ++failures;
     if (RV_NONE != 0xFFFFFFFFu || (RV_SRCH_HAS_TRACE >> 9) != 1u) ++failures;

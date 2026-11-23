@@ -3,6 +3,7 @@
 //   rvdump FILE              summary
 //   rvdump --chunks FILE     one line per chunk
 //   rvdump --search N FILE   one search in detail, with its first trace entries
+//   rvdump --board N FILE    board N (or "latest"): layers and display list
 //
 // Exit status: 0 for a readable trace with no errors (complete, or a valid
 // file that is still being written: "incomplete"); 1 if the file cannot be
@@ -27,7 +28,8 @@ int usage() {
     std::fprintf(stderr,
                  "usage: rvdump FILE\n"
                  "       rvdump --chunks FILE\n"
-                 "       rvdump --search N FILE\n");
+                 "       rvdump --search N FILE\n"
+                 "       rvdump --board N|latest FILE\n");
     return 2;
 }
 
@@ -248,10 +250,111 @@ int search(rv_session *s, uint32_t id) {
     return 0;
 }
 
+const char *prim_name(uint32_t p) {
+    switch (p) {
+    case RV_FILL: return "fill";
+    case RV_STROKE: return "stroke";
+    case RV_SEGS: return "segs";
+    case RV_DISC: return "disc";
+    case RV_RING: return "ring";
+    default: return "?";
+    }
+}
+
+// Points (for fills and strokes) or items behind one batch.
+uint64_t batch_points(const rv_display_list &d, const rv_batch &b) {
+    uint64_t n = 0;
+    if (b.prim == RV_FILL) {
+        for (uint32_t p = b.first; p < b.first + b.count; ++p)
+            for (uint32_t c = d.polys[2 * p]; c < d.polys[2 * p] + d.polys[2 * p + 1]; ++c) n += d.contours[2 * c + 1];
+    } else if (b.prim == RV_STROKE) {
+        for (uint32_t c = b.first; c < b.first + b.count; ++c) n += d.contours[2 * c + 1];
+    }
+    return n;
+}
+
+void print_list_totals(const char *label, const rv_display_list &d) {
+    uint64_t items[6] = {0, 0, 0, 0, 0, 0}, points = 0, contours = 0;
+    for (uint32_t k = 0; k < d.batch_count; ++k) {
+        const rv_batch &b = d.batches[k];
+        items[b.prim < 6 ? b.prim : 0] += b.count;
+        points += batch_points(d, b);
+        if (b.prim == RV_FILL)
+            for (uint32_t p = b.first; p < b.first + b.count; ++p) contours += d.polys[2 * p + 1];
+        if (b.prim == RV_STROKE) contours += b.count;
+    }
+    std::printf("%s: %u batches; %" PRIu64 " polygons, %" PRIu64 " polylines, %" PRIu64 " segments, %" PRIu64
+                " discs, %" PRIu64 " rings; %" PRIu64 " contours, %" PRIu64 " points\n",
+                label, d.batch_count, items[RV_FILL], items[RV_STROKE], items[RV_SEGS], items[RV_DISC], items[RV_RING],
+                contours, points);
+}
+
+int board(rv_session *s, uint32_t which) {
+    uint32_t n = 0;
+    rv_board_count(s, &n);
+    std::printf("boards:    %u\n", n);
+    for (uint32_t k = 0; k < n; ++k) {
+        rv_board_info b;
+        if (rv_board(s, k, &b) != RV_OK) continue;
+        std::printf("  %u: \"%s\" chunk %u, %u layers, %u nets, %u footprints, %u records, thickness %g mm, "
+                    "origin (%g, %g) mm\n",
+                    k, b.label, b.chunk, b.layer_count, b.net_count, b.footprint_count, b.record_count, b.thickness_mm,
+                    b.origin_x_mm, b.origin_y_mm);
+    }
+    if (rv_board_select(s, which) != RV_OK) {
+        std::fprintf(stderr, "rvdump: %s\n", rv_last_error(s));
+        return 1;
+    }
+    uint32_t sel = RV_NONE;
+    rv_board_selected(s, &sel);
+    if (sel == RV_NONE) {
+        std::printf("no board to draw\n");
+        return n == 0 ? 0 : 1;
+    }
+    uint32_t nl = 0;
+    if (rv_layer_count(s, &nl) != RV_OK) {
+        std::fprintf(stderr, "rvdump: %s\n", rv_last_error(s));
+        return 1;
+    }
+    std::printf("drawing board %u; layers in Appearance order:\n", sel);
+    std::vector<std::string> names;
+    for (uint32_t k = 0; k < nl; ++k) {
+        rv_layer_info l;
+        if (rv_layer(s, k, &l) != RV_OK) continue;
+        names.push_back(l.name);
+        std::printf("  %-16s index %-3u kind %-2u side %u rank %-4u #%08x %s, %u items\n", l.name, l.index, l.kind,
+                    l.side, l.draw_rank, l.rgba, l.visible ? "shown " : "hidden", l.items);
+    }
+    rv_display_list d;
+    if (rv_get_display_list(s, &d) != RV_OK) {
+        std::fprintf(stderr, "rvdump: %s\n", rv_last_error(s));
+        return 1;
+    }
+    std::printf("extent: (%.4f, %.4f) - (%.4f, %.4f) mm; background #%08x\n", d.extent[0], d.extent[1], d.extent[2],
+                d.extent[3], d.background);
+    std::printf("%-5s %-6s %-8s %-16s %-6s %-9s %-7s %-6s %-8s %s\n", "key", "prim", "order", "layer", "class",
+                "rgba", "width", "items", "points", "bbox");
+    for (uint32_t k = 0; k < d.batch_count; ++k) {
+        const rv_batch &b = d.batches[k];
+        std::string layer = "(holes)";
+        for (uint32_t j = 0; j < nl; ++j) {
+            rv_layer_info l;
+            if (rv_layer(s, j, &l) == RV_OK && l.index == b.layer) layer = l.name;
+        }
+        std::printf("%-5u %-6s 0x%-6x %-16s %-6u %08x  %-7.3f %-6u %-8" PRIu64 " (%.2f, %.2f)-(%.2f, %.2f)\n", b.key,
+                    prim_name(b.prim), b.order, layer.c_str(), b.cls, b.rgba, b.width, b.count, batch_points(d, b),
+                    b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3]);
+    }
+    print_list_totals("visible (default layers)", d);
+    for (const std::string &name : names) rv_layer_set_visible(s, name.c_str(), 1);
+    if (rv_get_display_list(s, &d) == RV_OK) print_list_totals("everything shown", d);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
-    enum { Summary, Chunks, Search } mode = Summary;
+    enum { Summary, Chunks, Search, Board } mode = Summary;
     uint32_t search_id = 0;
     const char *path = nullptr;
     if (argc == 2 && argv[1][0] != '-') {
@@ -265,6 +368,16 @@ int main(int argc, char **argv) {
         const unsigned long v = std::strtoul(argv[2], &end, 10);
         if (end == argv[2] || *end != '\0' || v > 0xFFFFFFFEul) return usage();
         search_id = static_cast<uint32_t>(v);
+        path = argv[3];
+    } else if (argc == 4 && std::strcmp(argv[1], "--board") == 0) {
+        mode = Board;
+        search_id = RV_NONE;
+        if (std::strcmp(argv[2], "latest") != 0) {
+            char *end = nullptr;
+            const unsigned long v = std::strtoul(argv[2], &end, 10);
+            if (end == argv[2] || *end != '\0' || v > 0xFFFFFFFEul) return usage();
+            search_id = static_cast<uint32_t>(v);
+        }
         path = argv[3];
     } else {
         return usage();
@@ -286,6 +399,8 @@ int main(int argc, char **argv) {
             rc = summary(s, path, info);
         } else if (mode == Chunks) {
             rc = chunks(s, info);
+        } else if (mode == Board) {
+            rc = board(s, search_id);
         } else {
             rc = search(s, search_id);
         }
