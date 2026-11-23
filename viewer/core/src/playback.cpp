@@ -35,13 +35,14 @@ std::uint32_t step_target(const Timeline &tl, double t, StepKind kind, int direc
     if (n == 0) return kNone32;
     const std::uint32_t cur = tl.event_at(t);
     const std::vector<Event> &ev = tl.events();
+    // Events without time are never shown as the current event: not targets.
     if (direction > 0) {
         for (std::uint32_t e = cur; e < n; ++e)
-            if (ev[e].start > t && step_matches(ev[e], kind)) return e;
+            if (ev[e].start > t && ev[e].duration > 0 && step_matches(ev[e], kind)) return e;
         return kNone32;
     }
     for (std::uint32_t e = cur + 1; e-- > 0;)
-        if (ev[e].start < t && step_matches(ev[e], kind)) return e;
+        if (ev[e].start < t && ev[e].duration > 0 && step_matches(ev[e], kind)) return e;
     return kNone32;
 }
 
@@ -52,14 +53,31 @@ double event_fraction(const Timeline &tl, std::uint32_t e, double t) {
     return std::max(0.0, std::min(1.0, (t - ev.start) / ev.duration));
 }
 
-std::uint32_t cells_revealed(const Trace &tr, const Timeline &tl, std::uint32_t e, double t) {
-    if (e >= tl.size()) return 0;
+std::uint32_t revealed_count(std::uint32_t n, double fraction) {
+    if (!(fraction > 0)) return 0; // also NaN
+    if (!(fraction < kRevealEnd)) return n;
+    const double v = std::floor(static_cast<double>(n) * fraction / kRevealEnd);
+    return v >= n ? n : static_cast<std::uint32_t>(v);
+}
+
+std::uint32_t wavefront_source(const Trace &tr, const Timeline &tl, std::uint32_t e) {
+    if (e >= tl.size()) return kNone32;
     const Event &ev = tl.events()[e];
-    if (ev.kind != EvKind::Search) return 0;
+    if (ev.kind != EvKind::Search || ev.record >= tr.searches().size()) return kNone32;
     const Search &s = tr.searches()[ev.record];
-    if (s.trace_source == kNone32) return 0;
-    const std::uint32_t n = tr.searches()[s.trace_source].ntrace;
-    return static_cast<std::uint32_t>(std::floor(event_fraction(tl, e, t) * n));
+    if (s.trace_source == kNone32 || s.trace_source >= tr.searches().size()) return kNone32;
+    return tr.searches()[s.trace_source].ntrace > 0 ? s.trace_source : kNone32;
+}
+
+std::uint32_t cells_revealed(const Trace &tr, const Timeline &tl, std::uint32_t e, double t) {
+    const std::uint32_t src = wavefront_source(tr, tl, e);
+    if (src == kNone32) return 0;
+    return revealed_count(tr.searches()[src].ntrace, event_fraction(tl, e, t));
+}
+
+bool search_settled(const Timeline &tl, std::uint32_t e, double t) {
+    if (e >= tl.size() || tl.events()[e].kind != EvKind::Search) return false;
+    return !(event_fraction(tl, e, t) < kRevealEnd);
 }
 
 namespace {
@@ -196,6 +214,25 @@ std::string position_text(const Timeline &tl, std::uint32_t e, double t) {
 
 std::string speed_text(double speed) {
     return fmt("%g×", speed);
+}
+
+std::string pacing_text(const PacingSettings &p, const Trace *tr, double total) {
+    auto clock = [](double s) {
+        const double v = std::max(0.0, s);
+        const int m = static_cast<int>(v / 60);
+        return fmt("%d:%02.0f", m, std::floor(v - 60.0 * m));
+    };
+    switch (p.mode) {
+    case PacingMode::Fit: return "fit length " + clock(total);
+    case PacingMode::NetsOnly: return "nets only, " + clock(total);
+    case PacingMode::OneNet: {
+        std::string name = tr != nullptr ? net_name(*tr, p.net) : fmt("net %d", p.net);
+        return "one net: " + name + ", " + clock(total);
+    }
+    case PacingMode::SkipFailed: return "skip failed searches, " + clock(total);
+    case PacingMode::RealTime: return fmt("real time ×%g, ", p.slowdown) + clock(total);
+    }
+    return "";
 }
 
 } // namespace rv

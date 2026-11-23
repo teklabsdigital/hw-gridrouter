@@ -91,14 +91,14 @@ public final class DisplayListRenderer {
     }
 
     /// Draw `items` over `area` (view points): the background first, or with
-    /// nil a transparent clear.
-    nonisolated static func draw(_ items: ArraySlice<Prepared>, background: CGColor?, in ctx: CGContext,
-                                 view: ViewTransform, area: CGRect) {
+    /// nil a transparent clear (with `clear` false: over what is there).
+    nonisolated static func draw(_ items: ArraySlice<Prepared>, background: CGColor?, clear: Bool = true,
+                                 in ctx: CGContext, view: ViewTransform, area: CGRect) {
         ctx.saveGState()
         if let background {
             ctx.setFillColor(background)
             ctx.fill(area)
-        } else {
+        } else if clear {
             ctx.clear(area)
         }
         ctx.setShouldAntialias(true)
@@ -151,10 +151,11 @@ public final class DisplayListRenderer {
 
     /// Rasterise `items` into `buffer`, whose pixel (0, 0) is view pixel
     /// (originX, originY) (view points x backing), in parallel bands.
-    nonisolated static func rasterize(_ items: ArraySlice<Prepared>, background: CGColor?, view: ViewTransform,
-                                      originX: Int, originY: Int, into buffer: PixelBuffer, bands: Int) {
+    nonisolated static func rasterize(_ items: ArraySlice<Prepared>, background: CGColor?, clear: Bool = true,
+                                      view: ViewTransform, originX: Int, originY: Int, into buffer: PixelBuffer,
+                                      bands: Int) {
         let n = max(1, min(buffer.height, bands > 0 ? bands : ProcessInfo.processInfo.activeProcessorCount))
-        let job = BandJob(items: items, background: background, view: view, buffer: buffer, bands: n,
+        let job = BandJob(items: items, background: background, clear: clear, view: view, buffer: buffer, bands: n,
                           originX: originX, originY: originY)
         DispatchQueue.concurrentPerform(iterations: n) { i in job.run(band: i) }
     }
@@ -162,16 +163,18 @@ public final class DisplayListRenderer {
     fileprivate final class BandJob: @unchecked Sendable {
         let items: ArraySlice<Prepared>
         let background: CGColor?
+        let clear: Bool
         let view: ViewTransform
         let buffer: PixelBuffer
         let bands: Int
         let originX: Int
         let originY: Int
 
-        init(items: ArraySlice<Prepared>, background: CGColor?, view: ViewTransform, buffer: PixelBuffer,
-             bands: Int, originX: Int, originY: Int) {
+        init(items: ArraySlice<Prepared>, background: CGColor?, clear: Bool, view: ViewTransform,
+             buffer: PixelBuffer, bands: Int, originX: Int, originY: Int) {
             self.items = items
             self.background = background
+            self.clear = clear
             self.view = view
             self.buffer = buffer
             self.bands = bands
@@ -192,7 +195,7 @@ public final class DisplayListRenderer {
             let area = CGRect(x: CGFloat(originX) / view.backing, y: CGFloat(originY + y0) / view.backing,
                               width: CGFloat(buffer.width) / view.backing,
                               height: CGFloat(y1 - y0) / view.backing)
-            DisplayListRenderer.draw(items, background: background, in: ctx, view: view, area: area)
+            DisplayListRenderer.draw(items, background: background, clear: clear, in: ctx, view: view, area: area)
         }
     }
 

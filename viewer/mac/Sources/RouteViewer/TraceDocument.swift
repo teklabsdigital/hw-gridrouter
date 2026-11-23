@@ -68,6 +68,7 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
     let positionLabel = NSTextField(labelWithString: "")
     private let speedLabel = NSTextField(labelWithString: "")
     private let stepPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let pacingPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private var playButton: NSButton!
 
     /// The kind ←/→ and the step buttons step by.
@@ -206,6 +207,14 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         stepPopup.target = self
         stepPopup.action = #selector(stepKindChosen(_:))
         stepPopup.toolTip = "What ← and → step to"
+        for mode in PacingMode.allCases {
+            pacingPopup.addItem(withTitle: BoardWindowController.pacingTitle(mode))
+            pacingPopup.lastItem?.tag = Int(mode.rawValue)
+        }
+        pacingPopup.controlSize = .small
+        pacingPopup.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        pacingPopup.target = self
+        pacingPopup.action = #selector(setPacingMode(_:))
         let slower = button("tortoise.fill", "Slower (⌘[)", #selector(slower(_:)))
         let faster = button("hare.fill", "Faster (⌘])", #selector(faster(_:)))
         speedLabel.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
@@ -219,11 +228,13 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         positionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        let stack = NSStackView(views: buttons + [stepPopup, slower, speedLabel, faster, spacer, positionLabel])
+        let stack = NSStackView(views: buttons + [stepPopup, slower, speedLabel, faster, pacingPopup, spacer,
+                                                  positionLabel])
         stack.orientation = .horizontal
         stack.spacing = 4
         stack.setCustomSpacing(12, after: buttons.last!)
         stack.setCustomSpacing(12, after: stepPopup)
+        stack.setCustomSpacing(12, after: faster)
         return stack
     }
 
@@ -240,7 +251,7 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
     /// Bring the views up to date after a playback call.
     func apply(_ changed: PlaybackChange) {
         if changed.contains(.board) { panel.reload() }
-        if changed.contains(.board) || changed.contains(.overlay) { boardView.refresh() }
+        if !changed.intersection([.board, .overlay, .wavefront]).isEmpty { boardView.refresh() }
         updateTransport()
     }
 
@@ -254,6 +265,10 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         set(caption, try? session.text(.caption))
         set(positionLabel, try? session.text(.position))
         set(speedLabel, try? session.text(.speed))
+        if let mode = try? session.pacing().mode, pacingPopup.selectedTag() != Int(mode.rawValue) {
+            pacingPopup.selectItem(withTag: Int(mode.rawValue))
+        }
+        pacingPopup.toolTip = (try? session.text(.pacing)).map { "Pacing: \($0)" } ?? "Pacing"
         let symbol = p.playing ? "pause.fill" : "play.fill"
         if playButton.image?.accessibilityDescription != symbol {
             playButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: symbol)
@@ -351,6 +366,46 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         stepKind = StepKind(rawValue: UInt32(max(0, sender.selectedTag()))) ?? .event
     }
 
+    // MARK: - Pacing (M4)
+
+    static func pacingTitle(_ mode: PacingMode) -> String {
+        switch mode {
+        case .fit: return "Fit length"
+        case .netsOnly: return "Nets only"
+        case .oneNet: return "One net"
+        case .skipFailed: return "Skip failed"
+        case .realTime: return "Real time"
+        }
+    }
+
+    /// The net "One net" would follow: the current event's (or the
+    /// route_net in progress).
+    var currentNet: Int32? { (try? session.position())?.net }
+
+    /// Menu items and the transport popup carry the mode in their tag.
+    @objc func setPacingMode(_ sender: Any?) {
+        let tag = (sender as? NSMenuItem)?.tag ?? (sender as? NSPopUpButton)?.selectedTag() ?? 0
+        guard let mode = PacingMode(rawValue: UInt32(max(0, tag))) else { return }
+        if !setPacing(mode) { NSSound.beep() }
+        updateTransport()
+    }
+
+    /// Change the pacing, keeping the event and the fraction of it; false
+    /// if it could not be (One net with no net here).
+    @discardableResult
+    func setPacing(_ mode: PacingMode) -> Bool {
+        guard var p = try? session.pacing() else { return false }
+        if mode == .oneNet {
+            guard let net = currentNet else { return false }
+            p.net = net
+        }
+        p.mode = mode
+        guard let changed = try? session.setPacing(p) else { return false }
+        timelineView.reload()
+        apply(changed)
+        return true
+    }
+
     /// Seek to a fraction of the run (the self-test).
     func seek(fraction: Double) {
         apply((try? session.seek(fraction: fraction)) ?? [])
@@ -368,6 +423,16 @@ final class BoardWindowController: NSWindowController, NSWindowDelegate, NSMenuI
         case #selector(setStepKind(_:))?:
             menuItem.state = menuItem.tag == Int(stepKind.rawValue) ? .on : .off
             return true
+        case #selector(setPacingMode(_:))?:
+            let p = try? session.pacing()
+            let on = p.map { menuItem.tag == Int($0.mode.rawValue) } ?? false
+            menuItem.state = on ? .on : .off
+            if menuItem.tag == Int(PacingMode.oneNet.rawValue) {
+                let net = on ? p?.net : currentNet
+                menuItem.title = net.map { "One Net (\($0))" } ?? "One Net"
+                return hasEvents && (on || net != nil)
+            }
+            return hasEvents
         case #selector(stepForward(_:))?, #selector(stepBackward(_:))?, #selector(nextNet(_:))?,
              #selector(previousNet(_:))?, #selector(goToStart(_:))?, #selector(goToEnd(_:))?:
             return hasEvents

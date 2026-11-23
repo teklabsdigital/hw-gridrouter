@@ -7,6 +7,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <functional>
+#include <queue>
+#include <tuple>
 
 namespace synth {
 
@@ -138,7 +142,82 @@ std::uint32_t TimelineWriter::srch(std::int32_t net, const std::vector<Cell> &sr
     for (const Cell &c : src) s.src.push_back(cell(c));
     for (const Cell &c : tgt) s.tgt.push_back(cell(c));
     for (const Cell &c : path) s.path.push_back(cell(c));
+    if (wavefronts) {
+        s.flags |= (1u << 7) | (1u << 9); // has_costs, has_trace
+        const std::uint32_t nc = static_cast<std::uint32_t>(run.nx * run.ny);
+        const std::int64_t budget = std::min<std::int64_t>(expanded, 2 * static_cast<std::int64_t>(nc));
+        std::vector<std::int32_t> g(2 * nc, -1);
+        std::vector<char> done(2 * nc, 0), is_tgt(2 * nc, 0);
+        for (const Cell &c : tgt) is_tgt[cell(c)] = 1;
+        auto h = [&](std::uint32_t id) {
+            const std::int32_t i = static_cast<std::int32_t>(id % nc) % run.nx;
+            const std::int32_t j = static_cast<std::int32_t>(id % nc) / run.nx;
+            std::int32_t best = -1;
+            for (const Cell &t : tgt) {
+                const std::int32_t dx = std::abs(t.i - i), dy = std::abs(t.j - j);
+                const std::int32_t d = 10 * std::max(dx, dy) + 4 * std::min(dx, dy);
+                if (best < 0 || d < best) best = d;
+            }
+            return best < 0 ? 0 : static_cast<std::int32_t>(0.6 * best);
+        };
+        // (f, sequence, cell): ties pop first-pushed first.
+        using Item = std::tuple<std::int32_t, std::uint32_t, std::uint32_t>;
+        std::priority_queue<Item, std::vector<Item>, std::greater<Item>> open;
+        std::uint32_t seq = 0;
+        for (const Cell &c : src) {
+            const std::uint32_t id = cell(c);
+            if (g[id] < 0) {
+                g[id] = 0;
+                open.emplace(h(id), seq++, id);
+            }
+        }
+        const bool found = !path.empty();
+        while (!open.empty() && static_cast<std::int64_t>(s.trace_cell.size()) < budget) {
+            const std::uint32_t id = std::get<2>(open.top());
+            open.pop();
+            if (done[id]) continue;
+            done[id] = 1;
+            s.trace_cell.push_back(id);
+            s.trace_d.push_back(g[id]);
+            if (found && is_tgt[id]) break;
+            const std::uint32_t l = id / nc;
+            const std::int32_t i = static_cast<std::int32_t>(id % nc) % run.nx;
+            const std::int32_t j = static_cast<std::int32_t>(id % nc) / run.nx;
+            auto relax = [&](std::uint32_t to, std::int32_t step) {
+                if (done[to] || (!found && is_tgt[to])) return;
+                const std::int32_t d = g[id] + step;
+                if (g[to] >= 0 && g[to] <= d) return;
+                g[to] = d;
+                open.emplace(d + h(to), seq++, to);
+            };
+            for (std::int32_t dj = -1; dj <= 1; ++dj)
+                for (std::int32_t di = -1; di <= 1; ++di) {
+                    if (di == 0 && dj == 0) continue;
+                    const std::int32_t ni = i + di, nj = j + dj;
+                    if (ni < 0 || nj < 0 || ni >= run.nx || nj >= run.ny) continue;
+                    relax(l * nc + static_cast<std::uint32_t>(nj * run.nx + ni), di != 0 && dj != 0 ? 14 : 10);
+                }
+            relax((1 - l) * nc + id % nc, 50);
+        }
+        s.ntrace_total = static_cast<std::uint32_t>(s.trace_cell.size());
+        trace_entries += static_cast<std::int64_t>(s.trace_cell.size());
+    }
     w.chunk("SRCH", encode(s));
+    written.push_back(s);
+    return next_search++;
+}
+
+std::uint32_t TimelineWriter::srch_repeat(std::uint32_t of, std::uint32_t ctx, std::uint32_t route) {
+    WSrch s = written.at(of);
+    s.search_id = next_search;
+    s.ctx = ctx;
+    s.route_id = route;
+    s.repeat_of = of;
+    s.trace_cell.clear();
+    s.trace_d.clear();
+    expanded_total += s.expanded;
+    w.chunk("SRCH", encode(s));
+    written.push_back(s);
     return next_search++;
 }
 
@@ -233,6 +312,7 @@ void TimelineWriter::end(const std::vector<std::pair<std::string, std::string>> 
     e.searches = next_search;
     e.routes = next_route;
     e.expanded_total = expanded_total;
+    e.trace_entries = trace_entries;
     e.failed = failed;
     e.nfailed = static_cast<std::uint32_t>(failed.size());
     w.chunk("END ", encode(e));
@@ -312,6 +392,7 @@ WBrd TimelineWriter::board(const std::string &label, bool routed) const {
 
 std::vector<unsigned char> build_timeline_sample() {
     TimelineWriter tw;
+    tw.wavefronts = true; // M4: every search stores a wavefront
     auto C = [](std::uint32_t l, std::int32_t i, std::int32_t j) {
         Cell c;
         c.layer = l;

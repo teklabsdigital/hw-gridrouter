@@ -15,18 +15,21 @@
  *     calls that change a session are rv_open, rv_close, rv_refresh,
  *     rv_board_select, rv_layer_set_visible, rv_class_set_visible, the
  *     playback calls (rv_advance, rv_play, rv_set_direction, rv_set_speed,
- *     rv_speed_step, rv_seek_*, rv_step, rv_jump), and the calls that return
- *     a borrowed buffer (rv_chunk_text, rv_wavefront, rv_view_status,
- *     rv_text, rv_get_display_list, rv_get_overlay), each of which replaces
- *     only the buffer it returned before.  The camera calls (rv_view_*)
- *     never invalidate a display list.
+ *     rv_speed_step, rv_seek_*, rv_step, rv_jump, rv_set_pacing), and the
+ *     calls that return a borrowed buffer (rv_chunk_text, rv_wavefront,
+ *     rv_view_status, rv_text, rv_get_display_list, rv_get_overlay), each
+ *     of which replaces only the buffer it returned before;
+ *     rv_get_wavefront_image may change the pixels of every wavefront image
+ *     (not their addresses within one image size).  The camera calls
+ *     (rv_view_*) never invalidate a display list.
  *
  * Milestone M1: the session lifecycle and the trace reader (open, close,
  * refresh and read-only facts about the file).  Milestone M2: the board
  * display list in KiCad's default colours, layer and object visibility, and
  * the camera.  Milestone M3: the timeline, the playback clock, and the
  * overlay of router copper, rip-up ghosts, failure markers and the current
- * event.  Later milestones add wavefront images.
+ * event.  Milestone M4: the wavefront of each search as images, and pacing
+ * modes.
  *
  * The trace file format is docs/TRACE_FORMAT.md in the router repository.
  */
@@ -44,7 +47,7 @@ extern "C" {
  * compares this compile-time value with rv_api_version() at run time to make
  * sure it was linked against the core it was compiled for.
  */
-#define RV_API_VERSION 4u
+#define RV_API_VERSION 5u
 
 /* "No id": an absent search, route, copper or session index. */
 #define RV_NONE 0xFFFFFFFFu
@@ -399,12 +402,13 @@ typedef enum rv_object_class {
     RV_OBJ_GRAPHICS = 7,     /* board graphics outside footprints */
     RV_OBJ_RULE_AREAS = 8,   /* keep-outs */
     RV_OBJ_OUTLINE = 9,      /* board outline (Edge.Cuts) */
-    RV_OBJ_ROUTED = 10       /* router copper and rip-up ghosts (overlay, M3) */
-    /* Reserved for later milestones, not produced by this version:
-     * 11 wavefront (M4), 12 net highlight (M5). */
+    RV_OBJ_ROUTED = 10,      /* router copper and rip-up ghosts (overlay, M3) */
+    RV_OBJ_WAVEFRONT = 11    /* the wavefront images (M4) */
+    /* Reserved for a later milestone, not produced by this version:
+     * 12 net highlight (M5). */
 } rv_object_class;
 
-/* Number of object classes this core produces (11). */
+/* Number of object classes this core produces (12). */
 rv_status rv_class_count(rv_session *session, uint32_t *count);
 /* Name for the Appearance panel ("Zones", ...), static; and visibility. */
 rv_status rv_class(rv_session *session, uint32_t cls, const char **name, uint32_t *visible);
@@ -463,7 +467,7 @@ typedef enum rv_prim {
 /* Sub-slots inside a layer's draw rank (the low 8 bits of `order`).
  * Slots marked "reserved" are not produced by this version; they fix where
  * later milestones' dynamic content goes. */
-#define RV_SUB_WAVEFRONT 0x08u    /* reserved (M4): wavefront image, under the copper */
+#define RV_SUB_WAVEFRONT 0x08u    /* M4: wavefront image (rv_get_wavefront_image), under the copper */
 #define RV_SUB_ZONE 0x10u
 #define RV_SUB_ZONE_OUTLINE 0x14u
 #define RV_SUB_RULE_AREA 0x18u
@@ -586,17 +590,23 @@ rv_status rv_view_status(rv_session *session, double vx, double vy, const char *
  * Position.  The playback position is a time t in [0, total] seconds of
  * playback at 1x.  Event k occupies [start, start + duration); its chunks
  * take effect at its start, and the fraction played inside it only animates
- * (the wavefront cells revealed, M4).  The state shown at a position is a
- * function of t alone: playing, stepping and seeking in either direction to
- * the same t give the same overlay and board.  After rv_open the position
- * is the end (t = total), paused; a refresh keeps the position (and stays at
- * the end if it was there).
+ * (the wavefront cells revealed, M4).  The current event at t is the last
+ * event starting at or before t.  An event the pacing gives no time
+ * (duration 0) therefore takes effect together with the next event that has
+ * time and is never current itself (unless it is the last event); stepping
+ * skips it, and seeking to it shows that next event.  The state shown at a
+ * position is a function of t alone: playing, stepping and seeking in either
+ * direction to the same t give the same overlay, board and wavefront.
+ * After rv_open the position is the end (t = total), paused; a refresh
+ * keeps the position (and stays at the end if it was there).
  *
- * Pacing ("fit length"): the whole run lasts 180 s at 1x.  Each event gets
- * a share proportional to a weight: a search 1 + ln(1 + size) (size =
- * expanded states, else wavefront entries), a commit 2, a via 1, a rip-up
- * 3, route_net begins 0.5, route_net ends 0.5 (2 if pads failed), a drop 1,
- * a phase 4, a snapshot 0.5, a session 1, a board 2, the end 1.
+ * Pacing: see rv_set_pacing (M4).  The default, "fit length", makes the
+ * whole run last 180 s at 1x; each event gets a share proportional to a
+ * weight: a search 1 + ln(1 + size) (size = expanded states, else wavefront
+ * entries; for a search that found nothing at most 1000), a commit 2, a via
+ * 1, a rip-up 3, route_net begins 0.5, route_net ends 0.5 (2 if pads
+ * failed), a drop 1, a phase 4, a snapshot 0.5, a session 1, a board 2, the
+ * end 1.
  *
  * State at an event (TRACE_FORMAT.md 8):
  *   - router copper: every copper item created at or before the event and
@@ -647,7 +657,7 @@ const char *rv_event_kind_name(uint32_t kind);
 
 typedef struct rv_event {
     double start;        /* playback seconds */
-    double duration;     /* > 0 */
+    double duration;     /* >= 0; 0 when the pacing gives the event no time */
     float size;          /* searches: ln(1 + size) / ln(1 + largest size), 0..1; else 0 */
     uint32_t kind;       /* rv_event_kind */
     uint32_t flags;      /* RV_EVF_* */
@@ -668,13 +678,14 @@ typedef struct rv_timeline {
     const rv_event *events;      /* borrowed */
     const double *rip_ticks;     /* start of each rip-up event, ascending; borrowed */
     const double *failure_ticks; /* start of each event with failed pads; borrowed */
-    double total;                /* playback seconds of the whole run at 1x */
+    double total;                /* playback seconds of the whole run at 1x (0 if no event has time) */
     double router_seconds;       /* t of the last chunk */
     uint32_t event_count;
     uint32_t rip_tick_count;
     uint32_t failure_tick_count;
     uint32_t phase_count;
-    uint32_t generation;         /* changes when the timeline is rebuilt (open, refresh) */
+    uint32_t generation;         /* changes when the timeline is rebuilt or repaced
+                                    (open, refresh, rv_set_pacing) */
     uint32_t reserved;           /* 0 */
 } rv_timeline;
 
@@ -703,12 +714,16 @@ typedef struct rv_position {
     uint32_t playing;       /* 1 while playing */
     int32_t direction;      /* +1 forward, -1 backward */
     uint32_t at_end;        /* 1 when t = total */
-    uint32_t cells_revealed;/* searches: wavefront entries shown at this fraction */
+    uint32_t cells_revealed;/* searches: wavefront entries shown at this fraction (M4: see
+                               rv_get_wavefront_image; counted whether or not the class is shown) */
     uint32_t copper_alive;  /* router copper items present (drawn unless routed_hidden) */
     uint32_t ghosts;        /* ghosts at this position (drawn unless routed_hidden) */
     uint32_t failures;      /* failed pads at this position (placed or not) */
     uint32_t routed_hidden; /* 1 when the board underneath holds the routing */
-    uint32_t reserved;      /* 0 */
+    int32_t net;            /* the current event's router net, else that of the route_net in
+                               progress (M4, for "one net" pacing); valid if has_net */
+    uint32_t has_net;       /* 1 if net is meaningful */
+    uint32_t settled;       /* 1 in the settled part of a search event (M4) */
 } rv_position;
 
 rv_status rv_position_get(rv_session *session, rv_position *out);
@@ -717,6 +732,10 @@ rv_status rv_position_get(rv_session *session, rv_position *out);
 #define RV_CHANGED_POSITION 1u /* t changed: redraw the playhead and the texts */
 #define RV_CHANGED_OVERLAY 2u  /* rv_get_overlay gives a different list */
 #define RV_CHANGED_BOARD 4u    /* the static display list (board or outline) changed */
+#define RV_CHANGED_WAVEFRONT 8u /* M4: what the wavefront images show changed (search, cells
+                                   revealed, visibility): fetch them again and compare each
+                                   image's generation.  RV_CHANGED_OVERLAY or BOARD may also
+                                   change an image's order or layer. */
 
 /*
  * The clock.  rv_advance moves t by dt * speed * direction seconds of wall
@@ -768,6 +787,7 @@ rv_status rv_step(rv_session *session, uint32_t kind, int32_t direction, uint32_
 #define RV_TEXT_CAPTION 0u  /* phase, route_net, what the event does, counts, router time */
 #define RV_TEXT_POSITION 1u /* "event 1234 of 9000 · 1:23.4 / 3:00.0" */
 #define RV_TEXT_SPEED 2u    /* "1×" */
+#define RV_TEXT_PACING 3u   /* M4: the pacing: "fit length 3:00", "one net: /CLK", "real time ×10" */
 rv_status rv_text(rv_session *session, uint32_t which, const char **text);
 
 /*
@@ -783,8 +803,10 @@ rv_status rv_text(rv_session *session, uint32_t which, const char **text);
  *   - markers and highlights in the overlay rank (rv_order_key with
  *     RV_OVERLAY_LAYER), always shown: failed pads (red ring and cross),
  *     the commit just made (lightened), the current search's sources
- *     (green), targets (orange) and path (white), the pads of the
- *     route_net in progress (white rings), a new via (white ring).
+ *     (green), targets (orange; red once a search that found nothing is
+ *     settled) and, once a search that found one is settled, its path
+ *     (white), the pads of the route_net in progress (white rings), a new
+ *     via (white ring).
  * Board layer indices in `layer` refer to the static list's layer table
  * (RV_NONE for content not on a board layer).
  *
@@ -793,7 +815,11 @@ rv_status rv_text(rv_session *session, uint32_t which, const char **text);
  * batch has an order inside a slot.  Slots are sorted and never overlap; the
  * set of slots changes only with the router session or the board.  A
  * client can keep the board batches between two slots as one cached bitmap
- * and redraw a slot only when its generation changes.
+ * and redraw a slot only when its generation changes.  An RV_SLOT_WAVEFRONT
+ * slot (one per router layer, at RV_SUB_WAVEFRONT of its rank) holds no
+ * batches: it is where that layer's wavefront image is drawn (the image
+ * whose `order` equals the slot's order_begin), and its generation never
+ * changes; the image has its own (rv_get_wavefront_image).
  *
  * Keys: an overlay key always names the same geometry for one value of the
  * overlay list's geometry_generation (the key epoch; it changes on rv_open
@@ -809,12 +835,13 @@ rv_status rv_text(rv_session *session, uint32_t which, const char **text);
 #define RV_SLOT_ROUTED 0u  /* one router layer's ghosts, copper and vias */
 #define RV_SLOT_DRILLS 1u  /* router via drills, in the hole slot */
 #define RV_SLOT_MARKERS 2u /* markers and highlights, above everything */
+#define RV_SLOT_WAVEFRONT 3u /* M4: one router layer's wavefront image; no batches */
 
 typedef struct rv_slot {
     uint32_t kind;         /* RV_SLOT_* */
     uint32_t order_begin;  /* the slot holds orders in [order_begin, order_end) */
     uint32_t order_end;
-    uint32_t layer;        /* RV_SLOT_ROUTED: board layer index, or RV_NONE */
+    uint32_t layer;        /* RV_SLOT_ROUTED, RV_SLOT_WAVEFRONT: board layer index, or RV_NONE */
     uint32_t first_batch;  /* in the overlay list */
     uint32_t batch_count;
     uint32_t generation;   /* changes whenever this slot's batches change */
@@ -826,6 +853,119 @@ typedef struct rv_slot {
  * top).  Built on first use after a change. */
 rv_status rv_get_overlay(rv_session *session, rv_display_list *out, const rv_slot **slots,
                          uint32_t *slot_count);
+
+/* ==== M4: the wavefront and pacing ===========================================
+ *
+ * The wavefront.  While a search event plays, the cells its A* search
+ * expanded appear in expansion order (the SRCH trace arrays; a repeat_of
+ * search shows the arrays of the search it repeats).  A search event plays
+ * in two parts: over the first 80 % of its time the first
+ * floor(n * fraction / 0.8) of the n stored entries are shown; for the rest
+ * ("settled") all n, and the overlay draws the path (found) or the targets
+ * in red (not found).  Only the current event's search is shown: when the
+ * event ends its wavefront goes.  rv_position.cells_revealed is the count.
+ *
+ * The images: one per router layer, at grid resolution (nx x ny pixels;
+ * pixel (i, j) is cell (i, j), row 0 the smallest board y), premultiplied
+ * sRGB, 4 bytes per pixel in memory order R, G, B, A.  A client draws each
+ * scaled to its board rectangle with nearest-neighbour sampling, at the
+ * slot of kind RV_SLOT_WAVEFRONT whose order_begin equals the image's
+ * `order`, under the board's copper of that layer.  Colours (the router
+ * layer's theme colour C; r = a cell's cost so far / the largest cost of the
+ * search's stored entries, or its position in the order / (n - 1) when the
+ * search stored no costs):
+ *   colour = lerp(C mixed 55 % toward white, C, r),
+ *   alpha  = lerp(0.60, 0.28, r);
+ *   the frontier, the most recently revealed max(1, ceil(n * 0.04)) cells:
+ *   C mixed 85 % toward white, alpha 0.95.
+ * The images are empty when the class RV_OBJ_WAVEFRONT or the layer is
+ * hidden, and between searches.  They are a pure function of the position,
+ * the visibility and the trace: playing to a position and seeking to it,
+ * from either side, give the same pixels.
+ *
+ * Updating: the core changes only the pixels that differ (when moving within
+ * one search) and reports them.  `generation` changes whenever any pixel
+ * does; `dirty` holds every pixel changed between generation `dirty_from`
+ * and `generation`.  A client that has drawn generation dirty_from may update
+ * only `dirty`; otherwise it takes the whole image (or `bounds`, outside
+ * which every pixel is transparent).
+ */
+
+typedef struct rv_wavefront_image {
+    const uint8_t *pixels;  /* height rows of `stride` bytes; NULL while nothing was ever drawn
+                               (then every pixel is transparent).  Borrowed (see the rules). */
+    uint32_t width;         /* pixels: the grid's nx (0 without a router session) */
+    uint32_t height;        /* the grid's ny */
+    uint32_t stride;        /* bytes per row: width * 4 */
+    uint32_t order;         /* draw order: the order_begin of its RV_SLOT_WAVEFRONT slot */
+    uint32_t layer;         /* board layer index, RV_NONE if the board drawn has no such layer */
+    uint32_t router_layer;  /* 0 or 1 */
+    uint32_t generation;    /* changes whenever a pixel changes (never 0) */
+    uint32_t dirty_from;    /* the generation `dirty` is relative to */
+    int32_t dirty[4];       /* x0, y0, x1, y1 in pixels, ends exclusive; empty if x0 >= x1 */
+    int32_t bounds[4];      /* the same form: every pixel outside is transparent */
+    uint32_t cells;         /* cells drawn in this image */
+    uint32_t search;        /* the search event's search_id, RV_NONE when nothing is shown */
+    double rect[4];         /* the whole image in board mm: x0, y0 (corner of pixel (0, 0)), x1, y1 */
+} rv_wavefront_image;
+
+/* Number of wavefront images: 2, 1 when both router layers have the same
+ * name, 0 without a valid router session at the position. */
+rv_status rv_wavefront_image_count(rv_session *session, uint32_t *count);
+
+/* Wavefront image `index` (router layer 0 or 1) at the current position,
+ * brought up to date.  RV_E_FORMAT if the search's stored arrays cannot be
+ * read (the image is then empty). */
+rv_status rv_get_wavefront_image(rv_session *session, uint32_t index, rv_wavefront_image *out);
+
+/*
+ * Pacing: how long each event lasts.  Changing it keeps the position in the
+ * same event at the same fraction (at the end if it was there; at the
+ * event's start if it gets no time now, which shows the next event with
+ * time), changes the timeline's generation and the times of its events,
+ * ticks and phases.  It is a setting of the session, kept across rv_open.
+ *
+ *   RV_PACING_FIT          "fit length": the run lasts fit_seconds at 1x;
+ *                          each event gets a share proportional to its weight
+ *                          (see M3 above; a search that found nothing weighs
+ *                          as at most 1000 states: its wavefront plays
+ *                          shortened).
+ *   RV_PACING_NETS_ONLY    as fit length, but searches get no time: copper
+ *                          appears commit by commit, no wavefront is shown.
+ *   RV_PACING_ONE_NET      as fit length, but only the events of router net
+ *                          `net` (rv_event.net with RV_EVF_HAS_NET) get time.
+ *   RV_PACING_SKIP_FAILED  as fit length, but searches that found nothing
+ *                          get no time.
+ *   RV_PACING_REAL_TIME    an event lasts the router time from the last chunk
+ *                          of the event before it to its own last chunk (the
+ *                          first event: 0), times `slowdown`; a search that
+ *                          found nothing at most 0.010 s of router time.
+ * When no event gets time the run lasts 0 s and shows its end.
+ */
+typedef enum rv_pacing_mode {
+    RV_PACING_FIT = 0,
+    RV_PACING_NETS_ONLY = 1,
+    RV_PACING_ONE_NET = 2,
+    RV_PACING_SKIP_FAILED = 3,
+    RV_PACING_REAL_TIME = 4,
+    RV_PACING_MODE_COUNT = 5
+} rv_pacing_mode;
+
+typedef struct rv_pacing {
+    uint32_t mode;       /* rv_pacing_mode */
+    int32_t net;         /* RV_PACING_ONE_NET: the router net */
+    double fit_seconds;  /* the fit modes: length of the run at 1x, 1 to 86400 (default 180) */
+    double slowdown;     /* RV_PACING_REAL_TIME: playback seconds per router second,
+                            0.01 to 100000 (default 10) */
+} rv_pacing;
+
+/* Name of a pacing mode ("fit length", ...), "" if out of range.  Static. */
+const char *rv_pacing_mode_name(uint32_t mode);
+
+/* Set every field (RV_E_INVALID_ARGUMENT for a value out of range; then
+ * nothing changes).  `changed` (may be NULL) gets RV_CHANGED_* bits. */
+rv_status rv_set_pacing(rv_session *session, const rv_pacing *pacing, uint32_t *changed);
+rv_status rv_get_pacing(rv_session *session, rv_pacing *out);
 
 #ifdef __cplusplus
 } /* extern "C" */

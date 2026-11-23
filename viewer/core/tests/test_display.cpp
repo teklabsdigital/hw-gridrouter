@@ -529,9 +529,12 @@ TEST(api_board_calls_without_a_trace) {
     CHECK_EQ(d.has_extent, 0u);
     CHECK_EQ(d.background, 0x001023FFu);
     CHECK_EQ(rv_class_count(g.s, &n), RV_OK);
-    CHECK_EQ(n, 11u);
+    CHECK_EQ(n, 12u);
     const char *name = nullptr;
     uint32_t vis = 0;
+    CHECK_EQ(rv_class(g.s, RV_OBJ_WAVEFRONT, &name, &vis), RV_OK);
+    CHECK_STREQ(name, "Wavefront");
+    CHECK_EQ(vis, 1u);
     CHECK_EQ(rv_class(g.s, RV_OBJ_ZONES, &name, &vis), RV_OK);
     CHECK_STREQ(name, "Zones");
     CHECK_EQ(vis, 1u);
@@ -540,8 +543,8 @@ TEST(api_board_calls_without_a_trace) {
     CHECK_EQ(rv_class(g.s, RV_OBJ_ROUTED, &name, &vis), RV_OK);
     CHECK_STREQ(name, "Routed copper");
     CHECK_EQ(vis, 1u);
-    CHECK_EQ(rv_class(g.s, 11, &name, &vis), RV_E_INVALID_ARGUMENT);
-    CHECK_EQ(rv_class_set_visible(g.s, 11, 0), RV_E_INVALID_ARGUMENT);
+    CHECK_EQ(rv_class(g.s, 12, &name, &vis), RV_E_INVALID_ARGUMENT);
+    CHECK_EQ(rv_class_set_visible(g.s, 12, 0), RV_E_INVALID_ARGUMENT);
     CHECK_EQ(rv_layer_set_visible(g.s, nullptr, 0), RV_E_INVALID_ARGUMENT);
     CHECK_EQ(rv_layer_set_visible(g.s, "F.Cu", 0), RV_OK); // kept for later boards
     rv_layer_info li;

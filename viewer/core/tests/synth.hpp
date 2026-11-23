@@ -387,6 +387,17 @@ public:
     std::map<std::uint32_t, Item> alive;
     std::vector<WPad> pads; // of the current session
     std::int64_t expanded_total = 0;
+    // M4: with wavefronts = true, srch() also stores a wavefront (has_trace,
+    // has_costs): an A* expansion over the empty grid (8 directions, cost 10
+    // straight, 14 diagonal, 50 for a via; heuristic 0.6 x octile distance
+    // to the nearest target) in pop order, at most min(expanded, 2 * nc)
+    // cells.  A search with a path stops when it pops a target; one without
+    // never reaches its targets (they count as blocked) and runs to the
+    // budget.  The search's own fields (expanded, path) are unchanged, so the
+    // timeline is the same with or without wavefronts.
+    bool wavefronts = false;
+    std::int64_t trace_entries = 0;
+    std::vector<WSrch> written; // every SRCH of the file, by search_id
 
     void nets(const std::vector<std::pair<std::int32_t, std::string>> &entries);
     // RUN: an nx x ny grid, 8 directions, cell 0.25 mm at (100.5, 50.25).
@@ -405,6 +416,9 @@ public:
     std::uint32_t srch(std::int32_t net, const std::vector<Cell> &src, const std::vector<Cell> &tgt,
                        const std::vector<Cell> &path, std::int64_t expanded, std::uint32_t ctx = 0,
                        std::uint32_t route = NONE32);
+    // A repeat of search `of` (repeat_of, 4.x Repeats): same sources,
+    // targets, path and expanded; no stored arrays.
+    std::uint32_t srch_repeat(std::uint32_t of, std::uint32_t ctx = 0, std::uint32_t route = NONE32);
     void rbld(std::uint32_t route, const std::vector<std::string> &names, const std::vector<std::int32_t> &nets);
     void drop(std::int32_t net, std::uint32_t ok, const std::string &name, const std::string &label);
     void mark(std::uint32_t level, const std::string &text);

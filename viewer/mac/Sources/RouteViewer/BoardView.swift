@@ -25,6 +25,7 @@ final class BoardView: NSView {
     private let root = CALayer()
     private var planeLayers: [CALayer] = []
     private var appliedVersions: [Int] = []
+    private var appliedFlipped: Bool?
     private var structure = -1
     private var refreshScheduled = false
     private var lastDrag: NSPoint?
@@ -37,14 +38,20 @@ final class BoardView: NSView {
     init(session: Session) {
         self.session = session
         super.init(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
-        // Layer-hosting: the tree below is ours, not AppKit's.  The root is
-        // not flipped (y up, as AppKit's own layers): plane frames are
-        // converted from the view's y-down points in apply(), and image
-        // contents then show upright on screen and in render(in:) alike.
+        // Layer-hosting: the tree below is ours, not AppKit's.  AppKit makes
+        // the hosted root geometry-flipped (y down) because the view is
+        // flipped; we ask for the same explicitly, so plane frames are the
+        // view's y-down points as they are.  Image contents still show
+        // upright (Core Animation compensates for the flip).  apply() reads
+        // the flag rather than assuming it: M3 assumed a y-up root and
+        // placed every cropped plane mirrored about the view's middle,
+        // so router copper moved against the board while panning.
         root.backgroundColor = layered.background
         root.actions = BoardView.noActions
+        root.isGeometryFlipped = true
         layer = root
         wantsLayer = true
+        root.isGeometryFlipped = true
         registerForDraggedTypes([.fileURL])
         addTrackingArea(NSTrackingArea(rect: .zero,
                                        options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow,
@@ -85,7 +92,7 @@ final class BoardView: NSView {
         guard !refreshScheduled else { return }
         refreshScheduled = true
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.refreshScheduled else { return }
             self.refreshScheduled = false
             self.refresh()
         }
@@ -93,9 +100,29 @@ final class BoardView: NSView {
 
     /// Bring the camera, the lists and the planes up to date now; redraws
     /// only the planes that changed.
+    /// Self-test: draw at this backing scale instead of the window's.
+    var backingOverride: CGFloat? {
+        didSet {
+            layered.invalidate()
+            setNeedsRefresh()
+        }
+    }
+
+    var backingScale: CGFloat {
+        backingOverride ?? window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+    }
+
+    /// Run a refresh that setNeedsRefresh() scheduled, now (self-test: the
+    /// state the next turn of the run loop would put on screen).
+    func flushRefresh() {
+        guard refreshScheduled else { return }
+        refreshScheduled = false
+        refresh()
+    }
+
     func refresh() {
         guard bounds.width >= 1, bounds.height >= 1 else { return }
-        let backing = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        let backing = backingScale
         do {
             try session.setViewSize(width: Double(bounds.width), height: Double(bounds.height), backing: Double(backing))
             if let list = try session.displayList(ifChangedSince: layered.boardList?.generation) {
@@ -105,6 +132,10 @@ final class BoardView: NSView {
             if let overlay = try session.overlay(ifChangedSince: layered.overlayList?.generation) {
                 layered.update(overlay: overlay)
             }
+            // A search whose arrays cannot be read reports RV_E_FORMAT once
+            // and then shows nothing: draw no wavefront, keep the rest.
+            let waves = (try? session.wavefrontImages(reusing: layered.wavefronts)) ?? []
+            layered.update(wavefront: waves)
             let view = try session.view()
             lastRenderedPlanes = layered.render(view: view)
             lastRenderSeconds = layered.lastRenderSeconds
@@ -133,45 +164,30 @@ final class BoardView: NSView {
             }
             appliedVersions = Array(repeating: -1, count: planeLayers.count)
         }
+        // Frames are placed in the root's actual geometry.
+        let flipped = root.isGeometryFlipped
+        if flipped != appliedFlipped {
+            appliedFlipped = flipped
+            appliedVersions = Array(repeating: -1, count: planeLayers.count)
+        }
         for (i, plane) in layered.planes.enumerated() where appliedVersions[i] != plane.version {
             let l = planeLayers[i]
             l.contents = plane.image
             l.contentsScale = backing
             let f = plane.frame
-            l.frame = CGRect(x: f.minX, y: bounds.height - f.maxY, width: f.width, height: f.height)
+            l.frame = CGRect(x: f.minX, y: flipped ? f.minY : bounds.height - f.maxY, width: f.width, height: f.height)
             l.isHidden = plane.image == nil
             appliedVersions[i] = plane.version
         }
         CATransaction.commit()
     }
 
-    /// The layer tree as handed to Core Animation (the root's background,
-    /// then each visible sublayer's contents at its frame, bottom to top),
-    /// stacked into an image of the view's pixel size (for the self-test).
-    /// Composited here rather than with CALayer.render(in:), which on macOS
-    /// draws image contents upside down relative to the screen; a y-up
-    /// bitmap context shows an image upright, as an unflipped layer does.
-    func captureLayers() -> CGImage? {
-        let backing = window?.backingScaleFactor ?? 2
-        let w = Int((bounds.width * backing).rounded()), h = Int((bounds.height * backing).rounded())
-        guard w > 0, h > 0,
-              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-        else { return nil }
-        ctx.interpolationQuality = .none
-        ctx.scaleBy(x: backing, y: backing)
-        if let bg = root.backgroundColor {
-            ctx.setFillColor(bg)
-            ctx.fill(root.bounds)
-        }
-        for l in root.sublayers ?? [] where !l.isHidden {
-            guard let contents = l.contents else { continue }
-            // Only CGImages are ever set as contents here.
-            let image = contents as! CGImage
-            ctx.draw(image, in: l.frame)
-        }
-        return ctx.makeImage()
+    /// The layer tree rendered by Core Animation itself (LayerSnapshot), at
+    /// the backing scale the planes were made for, for the self-test; nil
+    /// if it cannot be.  (M3 composited the sublayers itself, assuming a
+    /// y-up root: a model sharing apply()'s mistake, so it never saw it.)
+    func snapshotLayers() -> CGImage? {
+        LayerSnapshot.render(root, size: bounds.size, scale: backingScale)
     }
 
     private func updateMessage(_ list: DisplayList) {

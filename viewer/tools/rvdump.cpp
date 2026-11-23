@@ -4,9 +4,11 @@
 //   rvdump --chunks FILE     one line per chunk
 //   rvdump --search N FILE   one search in detail, with its first trace entries
 //   rvdump --board N FILE    board N (or "latest"): layers and display list
-//   rvdump --timeline [--bench SEEKS] FILE
+//   rvdump --timeline [--bench SEEKS] [--pacing PACING] FILE
 //                            the timeline, the state at a few positions, and
 //                            optionally the time of SEEKS random seeks
+//                            (with the wavefront images) and of the worst
+//                            wavefront seek; PACING as in rvrender
 //
 // Exit status: 0 for a readable trace with no errors (complete, or a valid
 // file that is still being written: "incomplete"); 1 if the file cannot be
@@ -35,8 +37,38 @@ int usage() {
                  "       rvdump --chunks FILE\n"
                  "       rvdump --search N FILE\n"
                  "       rvdump --board N|latest FILE\n"
-                 "       rvdump --timeline [--bench SEEKS] FILE\n");
+                 "       rvdump --timeline [--bench SEEKS] [--pacing PACING] FILE\n"
+                 "PACING: fit[:SECONDS], nets, net:NET, skip-failed, real[:SLOWDOWN]\n");
     return 2;
+}
+
+// "fit", "fit:60", "nets", "net:4", "skip-failed", "real", "real:10".
+bool parse_pacing(const char *spec, rv_pacing *p) {
+    const char *colon = std::strchr(spec, ':');
+    const std::string name = colon ? std::string(spec, colon) : std::string(spec);
+    double value = 0;
+    if (colon) {
+        char *end = nullptr;
+        value = std::strtod(colon + 1, &end);
+        if (end == colon + 1 || *end != '\0') return false;
+    }
+    if (name == "fit") {
+        p->mode = RV_PACING_FIT;
+        if (colon) p->fit_seconds = value;
+    } else if (name == "nets" && !colon) {
+        p->mode = RV_PACING_NETS_ONLY;
+    } else if (name == "net" && colon && value == static_cast<double>(static_cast<int32_t>(value))) {
+        p->mode = RV_PACING_ONE_NET;
+        p->net = static_cast<int32_t>(value);
+    } else if (name == "skip-failed" && !colon) {
+        p->mode = RV_PACING_SKIP_FAILED;
+    } else if (name == "real") {
+        p->mode = RV_PACING_REAL_TIME;
+        if (colon) p->slowdown = value;
+    } else {
+        return false;
+    }
+    return true;
 }
 
 struct Grid {
@@ -403,17 +435,15 @@ int timeline(rv_session *s, double open_ms, uint32_t seeks) {
                     p.copper_alive, p.ghosts, p.failures, p.routed_hidden ? " (routing held by the board)" : "",
                     ov.batch_count, nslots, caption.c_str());
     }
+    const char *pacing = "";
+    rv_text(s, RV_TEXT_PACING, &pacing);
+    std::printf("pacing:    %s\n", pacing);
     if (seeks == 0) return 0;
-    std::vector<double> times;
-    uint64_t x = 88172645463325252ull;
-    uint32_t batches = 0;
-    for (uint32_t k = 0; k < seeks; ++k) {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        const double f = static_cast<double>(x % 1000001) / 1000000.0;
+    // One seek as a client does it per frame: position, overlay, static
+    // list and the wavefront images.  Returns ms; *cells gets the cells drawn.
+    auto seek = [&](double t, uint32_t *cells, uint32_t *batches) {
         const double t0 = now_ms();
-        rv_seek_fraction(s, f, nullptr);
+        rv_seek_time(s, t, nullptr);
         rv_position p;
         rv_position_get(s, &p);
         rv_display_list ov, st;
@@ -421,13 +451,73 @@ int timeline(rv_session *s, double open_ms, uint32_t seeks) {
         uint32_t nslots = 0;
         rv_get_overlay(s, &ov, &slots, &nslots);
         rv_get_display_list(s, &st);
-        times.push_back(now_ms() - t0);
-        batches += ov.batch_count;
+        uint32_t n = 0, drawn = 0;
+        rv_wavefront_image_count(s, &n);
+        for (uint32_t k = 0; k < n; ++k) {
+            rv_wavefront_image im;
+            if (rv_get_wavefront_image(s, k, &im) == RV_OK) drawn += im.cells;
+        }
+        const double ms = now_ms() - t0;
+        if (cells) *cells = drawn;
+        if (batches) *batches = ov.batch_count;
+        return ms;
+    };
+    // The worst case: the middle of the reveal of the search with the most
+    // stored entries, from another position: first with its arrays read
+    // from the file (before anything else loads them), then from the cache.
+    uint32_t big = RV_NONE, big_n = 0, big_cells = 0;
+    double cold = 0;
+    for (uint32_t k = 0; k < tl.event_count; ++k) {
+        if (tl.events[k].kind != RV_EV_SEARCH || !(tl.events[k].duration > 0)) continue;
+        rv_search_info si;
+        if (rv_search(s, tl.events[k].record, &si) == RV_OK && si.wavefront_length > big_n) {
+            big_n = si.wavefront_length;
+            big = k;
+        }
+    }
+    const double mid = big != RV_NONE ? tl.events[big].start + 0.4 * tl.events[big].duration : 0; // half the entries
+    if (big != RV_NONE) {
+        seek(0, nullptr, nullptr);
+        cold = seek(mid, &big_cells, nullptr);
+    }
+    std::vector<double> times, wave_times;
+    uint64_t x = 88172645463325252ull;
+    uint64_t batches = 0, cells = 0;
+    for (uint32_t k = 0; k < seeks; ++k) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        const double f = static_cast<double>(x % 1000001) / 1000000.0;
+        uint32_t c = 0, b = 0;
+        const double ms = seek(f * tl.total, &c, &b);
+        times.push_back(ms);
+        if (c > 0) wave_times.push_back(ms);
+        batches += b;
+        cells += c;
     }
     std::sort(times.begin(), times.end());
+    std::sort(wave_times.begin(), wave_times.end());
     std::printf("seek:      %u random seeks: median %.3f ms, 90%% %.3f ms, max %.3f ms (%.0f overlay batches on average)\n",
                 seeks, times[times.size() / 2], times[times.size() * 9 / 10], times.back(),
                 static_cast<double>(batches) / seeks);
+    if (!wave_times.empty())
+        std::printf("           %zu of them into a wavefront: median %.3f ms, 90%% %.3f ms, max %.3f ms "
+                    "(%.0f cells on average)\n",
+                    wave_times.size(), wave_times[wave_times.size() / 2], wave_times[wave_times.size() * 9 / 10],
+                    wave_times.back(), static_cast<double>(cells) / static_cast<double>(wave_times.size()));
+    if (big != RV_NONE) {
+        const rv_event &ev = tl.events[big];
+        std::vector<double> warm;
+        const uint32_t c = big_cells;
+        for (int k = 0; k < 20; ++k) {
+            seek(k % 2 ? 0 : tl.total, nullptr, nullptr);
+            warm.push_back(seek(mid, nullptr, nullptr));
+        }
+        std::sort(warm.begin(), warm.end());
+        std::printf("           largest wavefront (event %u, search %u, %u entries): seek to its middle "
+                    "(%u cells drawn) %.3f ms the first time, then median %.3f ms, max %.3f ms\n",
+                    big, ev.record, big_n, c, cold, warm[warm.size() / 2], warm.back());
+    }
     return 0;
 }
 
@@ -436,6 +526,7 @@ int timeline(rv_session *s, double open_ms, uint32_t seeks) {
 int main(int argc, char **argv) {
     enum { Summary, Chunks, Search, Board, Timeline } mode = Summary;
     uint32_t search_id = 0;
+    rv_pacing pacing = {RV_PACING_FIT, 0, 180.0, 10.0};
     const char *path = nullptr;
     if (argc == 2 && argv[1][0] != '-') {
         path = argv[1];
@@ -459,16 +550,22 @@ int main(int argc, char **argv) {
             search_id = static_cast<uint32_t>(v);
         }
         path = argv[3];
-    } else if ((argc == 3 || argc == 5) && std::strcmp(argv[1], "--timeline") == 0) {
+    } else if (argc >= 3 && std::strcmp(argv[1], "--timeline") == 0) {
         mode = Timeline;
         search_id = 0;
-        if (argc == 5) {
-            if (std::strcmp(argv[2], "--bench") != 0) return usage();
-            char *end = nullptr;
-            const unsigned long v = std::strtoul(argv[3], &end, 10);
-            if (end == argv[3] || *end != '\0' || v > 1000000ul) return usage();
-            search_id = static_cast<uint32_t>(v);
+        for (int a = 2; a + 1 < argc; a += 2) {
+            if (std::strcmp(argv[a], "--bench") == 0) {
+                char *end = nullptr;
+                const unsigned long v = std::strtoul(argv[a + 1], &end, 10);
+                if (end == argv[a + 1] || *end != '\0' || v > 1000000ul) return usage();
+                search_id = static_cast<uint32_t>(v);
+            } else if (std::strcmp(argv[a], "--pacing") == 0) {
+                if (!parse_pacing(argv[a + 1], &pacing)) return usage();
+            } else {
+                return usage();
+            }
         }
+        if (argc % 2 != 1) return usage();
         path = argv[argc - 1];
     } else {
         return usage();
@@ -478,6 +575,11 @@ int main(int argc, char **argv) {
     if (rv_create(&s) != RV_OK) {
         std::fprintf(stderr, "rvdump: cannot create a session\n");
         return 1;
+    }
+    if (rv_set_pacing(s, &pacing, nullptr) != RV_OK) {
+        std::fprintf(stderr, "rvdump: %s\n", rv_last_error(s));
+        rv_destroy(s);
+        return 2;
     }
     int rc = 1;
     const double t_open = now_ms();

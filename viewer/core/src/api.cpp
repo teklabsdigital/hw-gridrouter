@@ -745,6 +745,15 @@ rv_status rv_position_get(rv_session *session, rv_position *out) {
                 p.ghosts = static_cast<uint32_t>(gh.size());
                 p.failures = s.failures_now();
                 p.routed_hidden = s.routed_hidden() ? 1u : 0u;
+                p.settled = rv::search_settled(*t, e, s.player.t) ? 1u : 0u;
+                const rv::Event &ev = t->events()[e];
+                if ((ev.flags & rv::evf::kHasNet) != 0) {
+                    p.net = ev.net;
+                    p.has_net = 1;
+                } else if (ev.route != RV_NONE && ev.route < tr.routes().size()) {
+                    p.net = tr.routes()[ev.route].net;
+                    p.has_net = 1;
+                }
             }
         }
         *out = p;
@@ -832,10 +841,12 @@ rv_status rv_text(rv_session *session, uint32_t which, const char **text) {
     if (text != nullptr) *text = nullptr;
     return guarded(session, [&](rv::Session &s) {
         require_out(text, "text");
-        if (which > RV_TEXT_SPEED) throw std::invalid_argument("invalid argument: no text " + std::to_string(which));
+        if (which > RV_TEXT_PACING) throw std::invalid_argument("invalid argument: no text " + std::to_string(which));
         const rv::Timeline *t = s.timeline();
         if (which == RV_TEXT_SPEED) {
             s.text_out = rv::speed_text(s.player.speed_value());
+        } else if (which == RV_TEXT_PACING) {
+            s.text_out = rv::pacing_text(s.pacing(), s.trace_or_null(), s.total());
         } else if (t == nullptr) {
             s.text_out = "no trace open";
         } else if (which == RV_TEXT_POSITION) {
@@ -915,6 +926,100 @@ rv_status rv_get_overlay(rv_session *session, rv_display_list *out, const rv_slo
         *out = d;
         *slots = s.c_slots.empty() ? nullptr : s.c_slots.data();
         *slot_count = static_cast<uint32_t>(s.c_slots.size());
+    });
+}
+
+// --- M4: wavefront and pacing ------------------------------------------------------
+
+rv_status rv_wavefront_image_count(rv_session *session, uint32_t *count) {
+    if (count != nullptr) *count = 0;
+    return guarded(session, [&](rv::Session &s) {
+        require_out(count, "count");
+        *count = static_cast<uint32_t>(s.wavefront_now().count());
+    });
+}
+
+rv_status rv_get_wavefront_image(rv_session *session, uint32_t index, rv_wavefront_image *out) {
+    if (out != nullptr) std::memset(out, 0, sizeof *out);
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        if (index > 1) throw std::invalid_argument("invalid argument: no wavefront image " + std::to_string(index));
+        const rv::WavefrontImages *w = nullptr;
+        try {
+            w = &s.wavefront_now();
+        } catch (...) {
+            // The images are consistent (empty for the unreadable search):
+            // describe them, then report the error.
+            const rv::WaveImage &im = s.waves.image(static_cast<int>(index));
+            rv_wavefront_image o;
+            std::memset(&o, 0, sizeof o);
+            o.width = im.width;
+            o.height = im.height;
+            o.generation = im.generation;
+            o.search = RV_NONE;
+            o.layer = RV_NONE;
+            *out = o;
+            throw;
+        }
+        if (index >= static_cast<uint32_t>(w->count()) && !(index == 0 && w->count() == 0))
+            throw std::invalid_argument("invalid argument: no wavefront image " + std::to_string(index) + " (there are " +
+                                        std::to_string(w->count()) + ")");
+        const rv::WaveImage &im = w->image(static_cast<int>(index));
+        rv_wavefront_image o;
+        std::memset(&o, 0, sizeof o);
+        o.pixels = im.pixels.empty() ? nullptr : im.pixels.data();
+        o.width = im.width;
+        o.height = im.height;
+        o.stride = im.width * 4;
+        o.order = im.order;
+        o.layer = im.board_layer;
+        o.router_layer = index;
+        o.generation = im.generation;
+        o.dirty_from = im.dirty_from;
+        for (int k = 0; k < 4; ++k) {
+            o.dirty[k] = im.dirty[static_cast<std::size_t>(k)];
+            o.bounds[k] = im.bounds[static_cast<std::size_t>(k)];
+            o.rect[k] = im.rect[static_cast<std::size_t>(k)];
+        }
+        o.cells = im.cells;
+        o.search = w->search();
+        *out = o;
+    });
+}
+
+const char *rv_pacing_mode_name(uint32_t mode) {
+    return rv::pacing_mode_name(mode);
+}
+
+rv_status rv_get_pacing(rv_session *session, rv_pacing *out) {
+    return guarded(session, [&](rv::Session &s) {
+        require_out(out, "out");
+        rv_pacing p;
+        std::memset(&p, 0, sizeof p);
+        p.mode = static_cast<uint32_t>(s.pacing().mode);
+        p.net = s.pacing().net;
+        p.fit_seconds = s.pacing().fit_seconds;
+        p.slowdown = s.pacing().slowdown;
+        *out = p;
+    });
+}
+
+rv_status rv_set_pacing(rv_session *session, const rv_pacing *pacing, uint32_t *changed) {
+    return playback(session, changed, [&](rv::Session &s) {
+        require_out(pacing, "pacing");
+        require_index(pacing->mode, rv::kPacingModeCount, "pacing mode");
+        require_finite(pacing->fit_seconds, "fit_seconds");
+        require_finite(pacing->slowdown, "slowdown");
+        if (pacing->fit_seconds < rv::kFitSecondsMin || pacing->fit_seconds > rv::kFitSecondsMax)
+            throw std::invalid_argument("invalid argument: fit_seconds must be 1 to 86400");
+        if (pacing->slowdown < rv::kSlowdownMin || pacing->slowdown > rv::kSlowdownMax)
+            throw std::invalid_argument("invalid argument: slowdown must be 0.01 to 100000");
+        rv::PacingSettings p;
+        p.mode = static_cast<rv::PacingMode>(pacing->mode);
+        p.net = pacing->net;
+        p.fit_seconds = pacing->fit_seconds;
+        p.slowdown = pacing->slowdown;
+        s.set_pacing(p);
     });
 }
 

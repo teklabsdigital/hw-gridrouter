@@ -11,9 +11,13 @@
 // only when its generation (or the overlay's key epoch) or the camera
 // changes, and only over the bounds of its batches.  Stacking the planes
 // gives the same picture as drawing every batch in order in one pass
-// (renderSinglePass, which the self-tests compare against).  A later
-// milestone's slot kinds (the wavefront) become more planes without changes
-// here.
+// (renderSinglePass, which the self-tests compare against).
+//
+// A wavefront slot (M4) holds no batches: its plane is the core's
+// wavefront image for that order (update(wavefront:)), one pixel per grid
+// cell, placed over its board rectangle and scaled with nearest-neighbour
+// sampling (`nearest`).  It is never rasterised: a camera change only moves
+// its frame, a new generation of the image only swaps its contents.
 
 import CoreGraphics
 import Dispatch
@@ -38,10 +42,15 @@ public final class LayeredRenderer {
         public fileprivate(set) var version = 0
         /// Times this plane was rasterised.
         public fileprivate(set) var renders = 0
+        /// The image is a grid-resolution wavefront: scale it to `frame`
+        /// with nearest-neighbour sampling (frame and pixelRect fractional).
+        public var nearest: Bool { kind == .slot(.wavefront) }
 
         fileprivate var items: [DisplayListRenderer.Prepared] = []
         fileprivate var dirty = true
         fileprivate var slotGeneration: UInt32?
+        fileprivate var wave: WavefrontImage?
+        fileprivate var orderBegin: UInt32 = 0
 
         fileprivate init(kind: Kind) {
             self.kind = kind
@@ -120,6 +129,29 @@ public final class LayeredRenderer {
         needsLayout = true
     }
 
+    /// The wavefront images last given.
+    public private(set) var wavefronts: [WavefrontImage] = []
+    /// Wavefront planes whose image changed in the last render().
+    public private(set) var lastWavefrontChanges = 0
+
+    /// Take the wavefront images (Session.wavefrontImages).
+    public func update(wavefront images: [WavefrontImage]) {
+        let same = images.count == wavefronts.count && zip(images, wavefronts).allSatisfy {
+            $0.generation == $1.generation && $0.order == $1.order && $0.routerLayer == $1.routerLayer
+        }
+        if same { return }
+        wavefronts = images
+        for p in planes where p.nearest { assignWave(p) }
+    }
+
+    private func assignWave(_ plane: Plane) {
+        let w = wavefronts.first { $0.order == plane.orderBegin }
+        if w?.generation != plane.wave?.generation || w?.order != plane.wave?.order || (w == nil) != (plane.wave == nil) {
+            plane.wave = w
+            plane.dirty = true
+        }
+    }
+
     /// Mark every plane for redrawing (after the window's colour space changed, say).
     public func invalidate() {
         for p in planes { p.dirty = true }
@@ -134,12 +166,17 @@ public final class LayeredRenderer {
             var p: [Plane] = []
             for k in 0...slots.count {
                 p.append(Plane(kind: .slab(k)))
-                if k < slots.count { p.append(Plane(kind: .slot(slots[k].kind))) }
+                if k < slots.count {
+                    let plane = Plane(kind: .slot(slots[k].kind))
+                    plane.orderBegin = slots[k].orderBegin
+                    p.append(plane)
+                }
             }
             planes = p
             structure += 1
             boardChanged = true
             epochChanged = true
+            for plane in planes where plane.nearest { assignWave(plane) }
         }
         if boardChanged {
             // Slab k: the board batches below slot k and above slot k - 1.
@@ -185,15 +222,66 @@ public final class LayeredRenderer {
             self.view = view
             for p in planes { p.dirty = true }
         }
-        var count = 0, pixels = 0
+        var count = 0, pixels = 0, waves = 0
         for (i, plane) in planes.enumerated() where plane.dirty {
+            if plane.nearest {
+                if placeWave(plane, view: view) { waves += 1 }
+                continue
+            }
             pixels += renderPlane(plane, bottom: i == 0, view: view, bands: bands)
             count += 1
         }
+        lastWavefrontChanges = waves
         lastRenderSeconds = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9
         lastRenderedPlanes = count
         lastRenderedPixels = pixels
         return count
+    }
+
+    /// Where a wavefront image goes in the view: points and (fractional)
+    /// pixels, exactly over its cells.  Where a cell edge falls on a pixel
+    /// centre, Core Animation (the layers) and Core Graphics (a single-pass
+    /// render) may give that pixel to different cells: the two pictures can
+    /// differ by one pixel at cell edges (the self-test allows that there,
+    /// and only there).  Rounding the frame to whole pixels does not help:
+    /// it makes such ties inside the image more frequent.
+    nonisolated static func waveRects(_ w: WavefrontImage, view: ViewTransform) -> (frame: CGRect, pixels: CGRect) {
+        let r = w.boardRect
+        let frame = CGRect(x: r.minX * view.scale + view.tx, y: r.minY * view.scale + view.ty,
+                           width: r.width * view.scale, height: r.height * view.scale)
+        let b = view.backing
+        return (frame, CGRect(x: frame.minX * b, y: frame.minY * b, width: frame.width * b, height: frame.height * b))
+    }
+
+    /// True if the centre of view pixel (x, y) (y down) lies within `slack`
+    /// pixels of a cell edge of a wavefront image drawn at `view`: where the
+    /// layers and a single-pass render may give the pixel to different cells.
+    public func isWavefrontCellEdge(x: Int, y: Int, view: ViewTransform, slack: Double = 0.02) -> Bool {
+        let cx = Double(x) + 0.5, cy = Double(y) + 0.5
+        for w in wavefronts {
+            guard let image = w.image else { continue }
+            let r = LayeredRenderer.waveRects(w, view: view).pixels
+            guard cx > r.minX - 1, cx < r.maxX + 1, cy > r.minY - 1, cy < r.maxY + 1 else { continue }
+            let cw = r.width / Double(image.width), ch = r.height / Double(image.height)
+            let u = (cx - r.minX) / cw, v = (cy - r.minY) / ch
+            if abs(u - u.rounded()) * cw <= slack || abs(v - v.rounded()) * ch <= slack { return true }
+        }
+        return false
+    }
+
+    /// Bring a wavefront plane to its image and the camera; true if its
+    /// image changed (not only its place).
+    private func placeWave(_ plane: Plane, view: ViewTransform) -> Bool {
+        plane.dirty = false
+        let image = plane.wave?.image
+        let changed = image !== plane.image
+        let rects = plane.wave.map { LayeredRenderer.waveRects($0, view: view) } ?? (CGRect.zero, CGRect.zero)
+        if !changed && rects.0 == plane.frame { return false }
+        plane.image = image
+        plane.frame = image == nil ? .zero : rects.0
+        plane.pixelRect = image == nil ? .zero : rects.1
+        plane.version += 1
+        return changed
     }
 
     private func renderPlane(_ plane: Plane, bottom: Bool, view: ViewTransform, bands: Int) -> Int {
@@ -282,8 +370,23 @@ public final class LayeredRenderer {
             }
         }
         let out = PixelBuffer(width: w, height: h)
-        DisplayListRenderer.rasterize(merged[...], background: board.background, view: view, originX: 0, originY: 0,
-                                      into: out, bands: bands)
+        // The wavefront images go between the batches, at their order.
+        let waves = wavefronts.filter { $0.image != nil }.sorted { $0.order < $1.order }
+        var start = 0
+        for (k, wave) in waves.enumerated() {
+            var end = start
+            while end < merged.count && merged[end].order < wave.order { end += 1 }
+            DisplayListRenderer.rasterize(merged[start..<end], background: k == 0 ? board.background : nil,
+                                          clear: k == 0, view: view, originX: 0, originY: 0, into: out, bands: bands)
+            if let image = wave.image, let ctx = out.context(rows: 0..<h) {
+                ctx.interpolationQuality = .none
+                let r = LayeredRenderer.waveRects(wave, view: view).pixels
+                ctx.draw(image, in: CGRect(x: r.minX, y: CGFloat(h) - r.maxY, width: r.width, height: r.height))
+            }
+            start = end
+        }
+        DisplayListRenderer.rasterize(merged[start...], background: waves.isEmpty ? board.background : nil,
+                                      clear: waves.isEmpty, view: view, originX: 0, originY: 0, into: out, bands: bands)
         return out.takeImage()
     }
 }

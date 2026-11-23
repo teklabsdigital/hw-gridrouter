@@ -86,6 +86,15 @@ golden timeline_failures timeline --size 480x360 --event 30
 # tracks drawn by the board, the new session's copper by the overlay, the
 # commit just made lightened.
 golden timeline_second timeline --size 480x360 --event 40
+# M4 wavefronts (rvsynth --timeline writes the searches' trace arrays).
+# 17, the search for /CLK after the rip-up, 40 % through: part revealed,
+# the frontier lightest, no path yet.
+golden timeline_wave_mid timeline --size 480x360 --event 17 --into 0.4
+# The same search settled (90 %): every state explored and its path.
+golden timeline_wave_found timeline --size 480x360 --event 17 --into 0.9
+# 25, the failed search for GND, settled: every state explored, no path,
+# the target in red.
+golden timeline_wave_failed timeline --size 480x360 --event 25 --into 0.9
 
 if [ "$failures" -ne 0 ]; then
     echo "golden.sh: $failures of $cases cases FAILED"

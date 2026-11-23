@@ -19,7 +19,7 @@ final class TimelineView: NSView {
     /// Called while the user scrubs, with the playback time under the pointer.
     var onScrub: ((Scrub, Double) -> Void)?
 
-    private var timeline: Timeline?
+    private(set) var timeline: Timeline?
     private var columns: [(size: Float, failed: Bool)] = []
     private var columnsWidth: CGFloat = -1
     private var time = 0.0

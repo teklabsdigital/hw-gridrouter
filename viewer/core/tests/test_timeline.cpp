@@ -660,7 +660,8 @@ TEST(commit_geometry_in_board_mm) {
     CHECK_EQ(segs, 1u);
     CHECK_EQ(discs, 4u);
     CHECK_EQ(drills, 2u);
-    CHECK_EQ(ov.slots().size(), std::size_t(4));
+    // Per router layer a wavefront slot and a routed slot, then drills, markers.
+    CHECK_EQ(ov.slots().size(), std::size_t(6));
 }
 
 // --- ghosts, failures, the board ------------------------------------------------------
@@ -881,8 +882,11 @@ TEST(router_outline_without_a_board) {
     const rv_slot *slots = nullptr;
     CHECK_EQ(rv_get_overlay(s.s, &d, &slots, &n), RV_OK);
     CHECK(d.batch_count > 0);
-    CHECK_EQ(n, 4u);
-    CHECK_EQ(slots[0].kind, RV_SLOT_ROUTED);
+    CHECK_EQ(n, 6u);
+    CHECK_EQ(slots[0].kind, RV_SLOT_WAVEFRONT);
+    CHECK_EQ(slots[0].batch_count, 0u);
+    CHECK_EQ(slots[1].kind, RV_SLOT_ROUTED);
+    CHECK(slots[0].order_end <= slots[1].order_begin);
 }
 
 // --- the clock, stepping, seeking -------------------------------------------------------
@@ -1153,7 +1157,9 @@ TEST(generations_and_borrowed_lists) {
     CHECK_EQ(ov.generation, ogen2);
     CHECK_EQ(rv_get_display_list(s.s, &st), RV_OK);
     CHECK_EQ(st.generation, gen);
-    // Inside one search event the overlay does not change: only POSITION.
+    // Inside the reveal part of one search event the overlay does not change:
+    // only POSITION and the wavefront.  Once settled, the overlay changes
+    // (the path), and the wavefront too (all cells).
     const std::uint32_t se = find_event(tl, rv::EvKind::Search, 3);
     CHECK_EQ(rv_seek_time(s.s, tl.events()[se].start + 1e-6, &changed), RV_OK);
     CHECK_EQ(rv_play(s.s, 1, &changed), RV_OK);
@@ -1161,9 +1167,19 @@ TEST(generations_and_borrowed_lists) {
     CHECK_EQ(rv_get_overlay(s.s, &ov, &slots, &ns), RV_OK);
     const uint32_t g3 = ov.generation;
     CHECK_EQ(rv_advance(s.s, tl.events()[se].duration, &changed), RV_OK);
-    CHECK_EQ(changed, RV_CHANGED_POSITION);
+    CHECK_EQ(changed, RV_CHANGED_POSITION | RV_CHANGED_WAVEFRONT);
     CHECK_EQ(rv_get_overlay(s.s, &ov, &slots, &ns), RV_OK);
     CHECK_EQ(ov.generation, g3);
+    CHECK_EQ(rv_advance(s.s, 2.5 * tl.events()[se].duration, &changed), RV_OK); // fraction ~0.875
+    CHECK_EQ(changed, RV_CHANGED_POSITION | RV_CHANGED_WAVEFRONT | RV_CHANGED_OVERLAY);
+    CHECK_EQ(rv_get_overlay(s.s, &ov, &slots, &ns), RV_OK);
+    CHECK(ov.generation != g3);
+    const uint32_t g3s = ov.generation;
+    CHECK_EQ(rv_advance(s.s, 0.2 * tl.events()[se].duration, &changed), RV_OK); // still settled
+    CHECK_EQ(changed, RV_CHANGED_POSITION);
+    CHECK_EQ(rv_get_overlay(s.s, &ov, &slots, &ns), RV_OK);
+    const uint32_t g3b = ov.generation;
+    CHECK_EQ(g3b, g3s);
     // Hiding a router layer changes the overlay, not the board's geometry.
     CHECK_EQ(rv_layer_set_visible(s.s, "B.Cu", 0), RV_OK);
     CHECK_EQ(rv_get_overlay(s.s, &ov, &slots, &ns), RV_OK);
@@ -1221,7 +1237,9 @@ TEST(generations_and_borrowed_lists) {
     CHECK(capt.find("3 commits, 2 vias, 1 rip-ups, 0 failed pads") != std::string::npos);
     CHECK_EQ(rv_text(s.s, RV_TEXT_POSITION, &cap), RV_OK);
     CHECK(std::string(cap).find("event ") == 0);
-    CHECK_EQ(rv_text(s.s, 3, &cap), RV_E_INVALID_ARGUMENT);
+    CHECK_EQ(rv_text(s.s, RV_TEXT_PACING, &cap), RV_OK);
+    CHECK_STREQ(cap, "fit length 3:00");
+    CHECK_EQ(rv_text(s.s, 4, &cap), RV_E_INVALID_ARGUMENT);
 }
 
 TEST(refresh_keeps_the_position) {

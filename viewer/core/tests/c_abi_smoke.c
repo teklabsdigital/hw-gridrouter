@@ -71,7 +71,7 @@ int main(void) {
         if (rv_layer_count(s, &count) != RV_OK || count != 0) ++failures;
         if (rv_layer(s, 0, &layer) != RV_E_INVALID_ARGUMENT) ++failures;
         if (rv_layer_set_visible(s, "F.Cu", 1) != RV_OK) ++failures;
-        if (rv_class_count(s, &count) != RV_OK || count != 11) ++failures;
+        if (rv_class_count(s, &count) != RV_OK || count != 12) ++failures;
         if (rv_class(s, RV_OBJ_VIAS, &text, &visible) != RV_OK || strcmp(text, "Vias") != 0) ++failures;
         if (rv_class_set_visible(s, RV_OBJ_TEXT, 0) != RV_OK) ++failures;
         if (rv_get_display_list(s, &list) != RV_OK || list.batch_count != 0) ++failures;
@@ -113,6 +113,32 @@ int main(void) {
         if (strcmp(rv_event_kind_name(RV_EV_RIPUP), "rip-up") != 0) ++failures;
         if (strcmp(rv_step_kind_name(RV_STEP_KIND_COUNT), "") != 0) ++failures;
         if (rv_order_key(s, RV_OVERLAY_LAYER, 0x10, &count) != RV_OK || count != 1000u * 256u + 0x10u) ++failures;
+    }
+
+    /* M4, the wavefront images and pacing, from C with no trace open. */
+    {
+        rv_wavefront_image img;
+        rv_pacing pacing;
+        uint32_t changed = 9;
+        memset(&img, 0, sizeof img);
+        if (rv_wavefront_image_count(s, &count) != RV_OK || count != 0) ++failures;
+        if (rv_get_wavefront_image(s, 0, &img) != RV_OK || img.pixels != NULL || img.width != 0) ++failures;
+        if (rv_get_wavefront_image(s, 2, &img) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (rv_get_pacing(s, &pacing) != RV_OK || pacing.mode != RV_PACING_FIT) ++failures;
+        if (pacing.fit_seconds != 180.0 || pacing.slowdown != 10.0) ++failures;
+        pacing.mode = RV_PACING_REAL_TIME;
+        pacing.slowdown = 2.0;
+        if (rv_set_pacing(s, &pacing, &changed) != RV_OK) ++failures;
+        if (rv_get_pacing(s, &pacing) != RV_OK || pacing.mode != RV_PACING_REAL_TIME) ++failures;
+        pacing.slowdown = 0.0;
+        if (rv_set_pacing(s, &pacing, &changed) != RV_E_INVALID_ARGUMENT) ++failures;
+        pacing.slowdown = 2.0;
+        pacing.mode = RV_PACING_MODE_COUNT;
+        if (rv_set_pacing(s, &pacing, NULL) != RV_E_INVALID_ARGUMENT) ++failures;
+        if (rv_text(s, RV_TEXT_PACING, &text) != RV_OK || strncmp(text, "real time", 9) != 0) ++failures;
+        if (strcmp(rv_pacing_mode_name(RV_PACING_NETS_ONLY), "nets only") != 0) ++failures;
+        if (strcmp(rv_pacing_mode_name(RV_PACING_MODE_COUNT), "") != 0) ++failures;
+        if (RV_CHANGED_WAVEFRONT != 8u || RV_SLOT_WAVEFRONT != 3u || RV_OBJ_WAVEFRONT != 11) ++failures;
     }
 
     if (strcmp(rv_kind_tag(RV_CHUNK_BRD), "BRD ") != 0) ++failures;

@@ -37,15 +37,29 @@ const char *step_kind_name(std::uint32_t kind) noexcept;
 bool step_matches(const Event &e, StepKind kind);
 
 // The event a step from playback time t lands on: forward, the first
-// matching event starting after t; backward, the last matching event
-// starting before t.  kNone32 if there is none.
+// matching event with time starting after t; backward, the last matching
+// event with time starting before t.  kNone32 if there is none.
 std::uint32_t step_target(const Timeline &tl, double t, StepKind kind, int direction);
 
 // Fraction of event e played at time t, in [0, 1].
 double event_fraction(const Timeline &tl, std::uint32_t e, double t);
 
-// Wavefront cells revealed at time t of a search event (M4 draws them).
+// A search event plays in two parts.  Over the first kRevealEnd of its
+// time the wavefront's cells appear in expansion order, linearly: at
+// fraction f, floor(n * f / kRevealEnd) of its n stored entries.  For the
+// rest it is "settled": every cell is shown, with the path if one was found.
+constexpr double kRevealEnd = 0.8;
+std::uint32_t revealed_count(std::uint32_t n, double fraction);
+
+// The search whose stored arrays are event e's wavefront (repeat_of
+// resolved), kNone32 if e is not a search or has no stored wavefront.
+std::uint32_t wavefront_source(const Trace &tr, const Timeline &tl, std::uint32_t e);
+
+// Wavefront cells revealed at time t of a search event.
 std::uint32_t cells_revealed(const Trace &tr, const Timeline &tl, std::uint32_t e, double t);
+
+// Is event e a search in its settled part at time t?
+bool search_settled(const Timeline &tl, std::uint32_t e, double t);
 
 // One line about the position: phase, route_net, what the event does,
 // counts so far and router time.
@@ -54,6 +68,9 @@ std::string caption(const Trace &tr, const Timeline &tl, std::uint32_t e, std::u
 std::string position_text(const Timeline &tl, std::uint32_t e, double t);
 // "1×", "0.25×"
 std::string speed_text(double speed);
+// "fit length 3:00", "one net: /CLK, 0:41", "real time ×10, 4:47" (the
+// length of the run at 1x after the comma).
+std::string pacing_text(const PacingSettings &p, const Trace *tr, double total);
 
 } // namespace rv
 

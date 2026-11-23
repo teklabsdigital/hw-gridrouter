@@ -14,6 +14,7 @@
 #include "scene.hpp"
 #include "timeline.hpp"
 #include "trace.hpp"
+#include "wavefront.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -64,6 +65,7 @@ public:
         scene.reset();
         player = Player();
         timeline_.reset();
+        waves.reset();
         rebuild_timeline(true);
     }
 
@@ -74,10 +76,20 @@ public:
         timeline_.reset();
         geometry_.clear();
         overlay.reset();
+        waves.reset();
         player = Player();
         ++timeline_generation_;
         sig_valid_ = false;
     }
+
+    // --- pacing ---------------------------------------------------------------
+
+    const PacingSettings &pacing() const { return pacing_; }
+    // New pacing settings (validated by the caller).  The events get new
+    // times; the position stays in the same event at the same fraction (at
+    // its start if it gets no time now, which shows the next event with
+    // time), or at the end if it was there.
+    void set_pacing(const PacingSettings &p);
 
     // Read appended chunks and rebuild the timeline, keeping the position.
     std::uint32_t refresh() {
@@ -114,11 +126,12 @@ public:
     struct Mark {
         double t = 0;
         std::uint32_t board = kNone32, outline = kNone32;
-        std::uint64_t overlay = 0;
+        std::uint64_t overlay = 0, wave = 0;
     };
     Mark mark() {
         sync();
-        return Mark{player.t, scene.effective_board(trace_.get()), scene.effective_outline(trace_.get()), sig_count_};
+        return Mark{player.t, scene.effective_board(trace_.get()), scene.effective_outline(trace_.get()), sig_count_,
+                    wave_count_};
     }
     std::uint32_t changed_since(const Mark &m) {
         const Mark now = mark();
@@ -126,6 +139,7 @@ public:
         if (now.t != m.t) f |= RV_CHANGED_POSITION;
         if (now.board != m.board || now.outline != m.outline) f |= RV_CHANGED_BOARD;
         if (now.overlay != m.overlay) f |= RV_CHANGED_OVERLAY;
+        if (now.wave != m.wave) f |= RV_CHANGED_WAVEFRONT;
         return f;
     }
 
@@ -166,6 +180,9 @@ public:
     // The overlay at the current position, built if needed.
     const Overlay &overlay_now();
 
+    // The wavefront images at the current position, brought up to date.
+    const WavefrontImages &wavefront_now();
+
     // Failed pads, ghosts and copper at the current position (for
     // rv_position and the caption).
     std::uint32_t failures_now() const;
@@ -177,6 +194,7 @@ public:
     Scene scene;
     Player player;
     Overlay overlay;
+    WavefrontImages waves;
 
     // Buffers that back borrowed pointers handed out through rv.h.
     std::string text;                              // rv_chunk_text
@@ -204,11 +222,20 @@ private:
 
     struct Signature {
         std::uint32_t timeline = 0, event = kNone32, visibility = 0, board = kNone32, outline = kNone32;
-        bool hidden = false;
+        bool hidden = false, settled = false;
         std::vector<std::pair<std::uint32_t, int>> ghosts;
         bool operator==(const Signature &o) const {
             return timeline == o.timeline && event == o.event && visibility == o.visibility && board == o.board &&
-                   outline == o.outline && hidden == o.hidden && ghosts == o.ghosts;
+                   outline == o.outline && hidden == o.hidden && settled == o.settled && ghosts == o.ghosts;
+        }
+    };
+    // What the wavefront images show (wavefront.hpp): a function of these.
+    struct WaveSignature {
+        std::uint32_t timeline = 0, session = kNone32, source = kNone32, search = kNone32, count = 0, visibility = 0;
+        bool shown = false;
+        bool operator==(const WaveSignature &o) const {
+            return timeline == o.timeline && session == o.session && source == o.source && search == o.search &&
+                   count == o.count && visibility == o.visibility && shown == o.shown;
         }
     };
 
@@ -222,6 +249,12 @@ private:
     bool sig_valid_ = false;
     std::uint64_t sig_count_ = 0;   // bumps when the overlay signature changes
     std::uint64_t built_sig_ = ~0ull; // sig_count_ the overlay was built for
+    WaveSignature wave_sig_;
+    bool wave_sig_valid_ = false;
+    std::uint64_t wave_count_ = 0;     // bumps when the wavefront signature changes
+    std::uint64_t built_wave_ = ~0ull; // wave_count_ the images were brought to
+    std::uint64_t built_wave_overlay_ = ~0ull; // sig_count_ then (the board's layer table may differ)
+    PacingSettings pacing_;
 };
 
 } // namespace rv

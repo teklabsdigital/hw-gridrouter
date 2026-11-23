@@ -100,23 +100,78 @@ struct CopperLife {
 };
 
 // Pacing: how long each event lasts in playback seconds.  Replaceable.
+// An event may get no time (duration 0): it is applied together with the
+// next event that has time and is never the current event itself.
 class Pacing {
 public:
     virtual ~Pacing() = default;
-    // Relative weight of an event, > 0.
-    virtual double weight(const Event &e) const = 0;
-    // Length of the whole run in playback seconds at 1x.
-    virtual double total_seconds() const = 0;
+    // Playback seconds of every event (>= 0), in event order.  Returns the
+    // length of the run: the sum of the durations (rounding aside; the last
+    // event with time is stretched or shrunk to end there), 0 if none.
+    virtual double durations(const Trace &t, const std::vector<Event> &events, std::vector<double> &out) const = 0;
 };
 
-// "Fit length": the whole run lasts kTotal seconds at 1x; a search's weight
-// grows with the log of its size, so big searches get more time.
+// Pacing modes; values match rv_pacing_mode in rv.h.
+enum class PacingMode : std::uint32_t { Fit = 0, NetsOnly, OneNet, SkipFailed, RealTime };
+constexpr std::uint32_t kPacingModeCount = 5;
+const char *pacing_mode_name(std::uint32_t mode) noexcept;
+
+struct PacingSettings {
+    PacingMode mode = PacingMode::Fit;
+    std::int32_t net = 0;        // OneNet
+    double fit_seconds = 180.0;  // the weight modes: length of the run at 1x
+    double slowdown = 10.0;      // RealTime: playback seconds per router second
+    bool operator==(const PacingSettings &o) const {
+        return mode == o.mode && net == o.net && fit_seconds == o.fit_seconds && slowdown == o.slowdown;
+    }
+    bool operator!=(const PacingSettings &o) const { return !(*this == o); }
+};
+// Limits of the settings (rv_set_pacing rejects values outside).
+constexpr double kFitSecondsMin = 1.0, kFitSecondsMax = 86400.0;
+constexpr double kSlowdownMin = 0.01, kSlowdownMax = 100000.0;
+
+// The weight modes ("fit length" and its variants): every event gets a
+// weight, and the weights are scaled so that the run lasts fit_seconds.
+// Weights: a search 1 + ln(1 + size), where a search that found nothing
+// counts at most kFailedSizeCap states (its wavefront plays shortened); a
+// commit 2, a via 1, a rip-up 3, a route_net begin 0.5, an end 0.5 (2 with
+// failed pads), a drop 1, a phase 4, a snapshot 0.5, a session 1, a board
+// 2, the end 1.  The variants set some weights to 0: NetsOnly every search,
+// SkipFailed every search that found nothing, OneNet every event that is not
+// of `net`.  When every weight is 0 the run lasts 0 s.
 class FitLengthPacing : public Pacing {
 public:
     static constexpr double kTotal = 180.0;
-    double weight(const Event &e) const override;
-    double total_seconds() const override { return kTotal; }
+    static constexpr double kFailedSizeCap = 1000.0;
+    explicit FitLengthPacing(double total = kTotal, PacingMode mode = PacingMode::Fit, std::int32_t net = 0)
+        : total_(total), mode_(mode), net_(net) {}
+    // The weight of an event in this mode (>= 0).
+    double weight(const Event &e) const;
+    double total_seconds() const { return total_; }
+    double durations(const Trace &t, const std::vector<Event> &events, std::vector<double> &out) const override;
+
+private:
+    double total_;
+    PacingMode mode_;
+    std::int32_t net_;
 };
+
+// Real time: an event lasts as long as the router took from the end of the
+// event before it to the end of this one (the times of their last chunks;
+// the first event lasts 0), times the slowdown.  A search that found nothing
+// lasts at most kFailedSecondsCap router seconds (its wavefront plays
+// shortened).
+class RealTimePacing : public Pacing {
+public:
+    static constexpr double kFailedSecondsCap = 0.010;
+    explicit RealTimePacing(double slowdown) : slowdown_(slowdown) {}
+    double durations(const Trace &t, const std::vector<Event> &events, std::vector<double> &out) const override;
+
+private:
+    double slowdown_;
+};
+
+std::unique_ptr<Pacing> make_pacing(const PacingSettings &s);
 
 // Items alive at an event: births non-decreasing in item order, each alive
 // for events [birth, death).
@@ -142,10 +197,15 @@ public:
 
     Timeline(const Trace &t, const Pacing &pacing);
 
+    // Give the events new times (another pacing); everything else stays.
+    void repace(const Pacing &pacing);
+
     const std::vector<Event> &events() const { return events_; }
     std::uint32_t size() const { return static_cast<std::uint32_t>(events_.size()); }
     double total() const { return total_; }
-    // The event at playback time t (clamped), kNone32 with no events.
+    // The event at playback time t (clamped): the last event starting at or
+    // before t, so an event without time is never the result unless it is
+    // the last one; kNone32 with no events.
     std::uint32_t event_at(double t) const;
     // The event containing chunk c (an absorbed chunk belongs to the next
     // event), kNone32 with no events.

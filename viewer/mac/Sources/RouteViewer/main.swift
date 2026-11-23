@@ -17,8 +17,15 @@ if selfTest {
     // The file is the self-test's: AppKit must not also open it as a
     // document (that would add it to Open Recent).
     UserDefaults.standard.register(defaults: ["NSTreatUnknownArgumentsAsOpen": "NO"])
-    // Watchdog: a self-test that has not finished in 10 s fails instead of hanging.
-    DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
+    // Nor reopen the documents of the owner's last session (window
+    // restoration), which would be counted as documents left open.
+    UserDefaults.standard.register(defaults: ["ApplePersistenceIgnoreState": "YES"])
+    // Watchdog: a self-test that has not finished in 10 s fails instead of
+    // hanging.  RV_SELFTEST_TIMEOUT=SECONDS allows longer for a large board
+    // (the dongle's gesture check rasterises in one band: about 8 s).
+    let timeout = ProcessInfo.processInfo.environment["RV_SELFTEST_TIMEOUT"].flatMap(Double.init)
+        .map { max(1, min($0, 600)) } ?? 10
+    DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
         FileHandle.standardError.write(Data("selftest FAILED: timed out\n".utf8))
         exit(2)
     }

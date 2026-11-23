@@ -49,11 +49,29 @@ constexpr std::uint32_t kMarkPads = 0x30;
 constexpr std::uint32_t kMarkVia = 0x38;
 } // namespace sub
 
-constexpr std::uint32_t kClassRouted = 10;   // rv_object_class RV_OBJ_ROUTED
+constexpr std::uint32_t kClassRouted = 10;    // rv_object_class RV_OBJ_ROUTED
+constexpr std::uint32_t kClassWavefront = 11; // rv_object_class RV_OBJ_WAVEFRONT
 constexpr std::uint32_t kKeyBase = 0x80000000u; // overlay keys never collide with board keys
 
-// Slot kinds; values match RV_SLOT_* in rv.h.
-enum class SlotKind : std::uint32_t { Routed = 0, Drills = 1, Markers = 2 };
+// Slot kinds; values match RV_SLOT_* in rv.h.  A Wavefront slot holds no
+// batches: its content is the wavefront image of its router layer
+// (wavefront.hpp), drawn at order_begin.
+enum class SlotKind : std::uint32_t { Routed = 0, Drills = 1, Markers = 2, Wavefront = 3 };
+
+// One router layer of a session as the overlay and the wavefront see it.
+struct RouterLayer {
+    std::string name;
+    std::uint32_t index = kNone32; // board layer index (kNone32 if the board lacks it)
+    std::uint32_t rank = 0;        // draw rank
+    Rgba color = 0;                // theme colour
+    bool visible = true;
+};
+
+// The router layers of a session: their names, board indices, ranks,
+// colours and visibility.  Returns 1 when both have the same name (then
+// only layers[0] is meaningful), else 2.
+int router_layers(const Trace &t, std::uint32_t session, const DisplayList *board, const Theme &theme,
+                  const std::vector<std::pair<std::string, bool>> &layer_visible, RouterLayer layers[2]);
 
 struct Slot {
     SlotKind kind = SlotKind::Routed;
@@ -100,6 +118,7 @@ struct OverlayInput {
     double time = 0;
     std::uint32_t event = kNone32;
     bool suppress_routed = false; // the board drawn already holds this routing
+    bool settled = false;         // a search event in its settled part (playback.hpp)
 };
 
 class Overlay {

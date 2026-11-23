@@ -28,15 +28,30 @@ Rgba with_alpha(Rgba c, double a) {
 constexpr std::uint64_t kGroupHilite = 1ull << 62;
 constexpr std::uint64_t kGroupMarker = 2ull << 62;
 
-struct RouterLayer {
-    std::string name;
-    std::uint32_t index = kNone32; // board layer index
-    std::uint32_t rank = 0;
-    Rgba color = 0;
-    bool visible = true;
-};
-
 } // namespace
+
+int router_layers(const Trace &t, std::uint32_t session, const DisplayList *board, const Theme &theme,
+                  const std::vector<std::pair<std::string, bool>> &layer_visible, RouterLayer rl[2]) {
+    rl[0] = RouterLayer();
+    rl[1] = RouterLayer();
+    if (session >= t.runs().size() || !t.runs()[session].valid) return 0;
+    const Run &run = t.runs()[session];
+    for (int k = 0; k < 2; ++k) {
+        RouterLayer &l = rl[k];
+        l.name = run.layer_name[k];
+        l.rank = draw_rank(classify_layer(l.name));
+        if (board != nullptr)
+            for (const LayerEntry &le : board->layers)
+                if (le.name == l.name) {
+                    l.index = le.index;
+                    l.rank = le.rank;
+                }
+        l.color = theme.layer_color(l.name);
+        for (const auto &v : layer_visible)
+            if (v.first == l.name) l.visible = v.second;
+    }
+    return rl[1].name == rl[0].name ? 1 : 2;
+}
 
 void Overlay::reset() {
     list_ = DisplayList();
@@ -74,31 +89,22 @@ void Overlay::build(const OverlayInput &in) {
     if (e == kNone32 && !t.runs().empty()) session = static_cast<std::uint32_t>(t.runs().size() - 1);
     const bool have_run = session < t.runs().size() && t.runs()[session].valid;
 
-    // Router layers and slots.
+    // Router layers and slots: each router layer's wavefront image (under
+    // the board's copper) and its ghosts, copper and vias (above the board's
+    // tracks).
     RouterLayer rl[2];
     if (have_run) {
-        const Run &run = t.runs()[session];
-        for (int k = 0; k < 2; ++k) {
-            RouterLayer &l = rl[k];
-            l.name = run.layer_name[k];
-            l.rank = draw_rank(classify_layer(l.name));
-            if (in.board != nullptr)
-                for (const LayerEntry &le : in.board->layers)
-                    if (le.name == l.name) {
-                        l.index = le.index;
-                        l.rank = le.rank;
-                    }
-            l.color = theme.layer_color(l.name);
-            for (const auto &v : in.layer_visible)
-                if (v.first == l.name) l.visible = v.second;
-        }
-        for (int k = 0; k < 2; ++k) {
-            if (k == 1 && rl[1].name == rl[0].name) break;
+        const int nl = router_layers(t, session, in.board, theme, in.layer_visible, rl);
+        for (int k = 0; k < nl; ++k) {
             Slot s;
+            s.kind = SlotKind::Wavefront;
+            s.order_begin = order_key(rl[k].rank, sub::kWavefront);
+            s.order_end = s.order_begin + 1;
+            s.layer = rl[k].index;
+            slots_.push_back(s);
             s.kind = SlotKind::Routed;
             s.order_begin = order_key(rl[k].rank, sub::kGhost);
             s.order_end = order_key(rl[k].rank, sub::kRoutedEnd);
-            s.layer = rl[k].index;
             slots_.push_back(s);
         }
     }
@@ -235,7 +241,10 @@ void Overlay::build(const OverlayInput &in) {
                     b.circle(fr.cx(p.i), fr.cy(p.j), r, 0);
                 }
             };
-            if (s.npath >= 1) {
+            // While the wavefront is revealed: sources and targets.  Once
+            // settled: the path found, or the targets in red if none was.
+            const bool found = s.has(srch_flags::kFound);
+            if (in.settled && s.npath >= 1) {
                 std::vector<double> pts;
                 for (std::uint32_t k = 0; k < s.npath; ++k) {
                     const CellPos p = fr.cell(s.path()[k]);
@@ -247,7 +256,7 @@ void Overlay::build(const OverlayInput &in) {
                     .line(pts.data(), pts.size() / 2, w / 2);
             }
             dots(s.src(), s.nsrc_kept, sub::kMarkCells + 1, colors.src);
-            dots(s.tgt(), s.ntgt_kept, sub::kMarkCells + 2, colors.tgt);
+            dots(s.tgt(), s.ntgt_kept, sub::kMarkCells + 2, in.settled && !found ? colors.failure : colors.tgt);
         }
         if (ev.route != kNone32 && ev.route < t.routes().size()) {
             const Route &r = t.routes()[ev.route];

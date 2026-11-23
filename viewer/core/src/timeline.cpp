@@ -22,11 +22,34 @@ const char *event_kind_name(std::uint32_t kind) noexcept {
 
 // --- pacing -------------------------------------------------------------------
 
+const char *pacing_mode_name(std::uint32_t mode) noexcept {
+    static const char *const names[kPacingModeCount] = {"fit length", "nets only", "one net", "skip failed searches",
+                                                        "real time"};
+    return mode < kPacingModeCount ? names[mode] : "";
+}
+
 double FitLengthPacing::weight(const Event &e) const {
+    const bool failed_search = e.kind == EvKind::Search && (e.flags & evf::kFound) == 0;
+    switch (mode_) {
+    case PacingMode::NetsOnly:
+        if (e.kind == EvKind::Search) return 0.0;
+        break;
+    case PacingMode::SkipFailed:
+        if (failed_search) return 0.0;
+        break;
+    case PacingMode::OneNet:
+        if ((e.flags & evf::kHasNet) == 0 || e.net != net_) return 0.0;
+        break;
+    default: break;
+    }
     switch (e.kind) {
     case EvKind::Session: return 1.0;
     case EvKind::Snapshot: return 0.5;
-    case EvKind::Search: return 1.0 + std::log1p(std::max(0.0, e.size));
+    case EvKind::Search: {
+        double size = std::max(0.0, e.size);
+        if (failed_search) size = std::min(size, kFailedSizeCap);
+        return 1.0 + std::log1p(size);
+    }
     case EvKind::Commit: return 2.0;
     case EvKind::Via: return 1.0;
     case EvKind::RipUp: return 3.0;
@@ -38,6 +61,43 @@ double FitLengthPacing::weight(const Event &e) const {
     case EvKind::End: return 1.0;
     }
     return 1.0;
+}
+
+double FitLengthPacing::durations(const Trace &, const std::vector<Event> &events, std::vector<double> &out) const {
+    out.assign(events.size(), 0.0);
+    double sum = 0;
+    for (std::size_t e = 0; e < events.size(); ++e) {
+        const double w = weight(events[e]);
+        out[e] = w > 0 && std::isfinite(w) ? w : 0.0;
+        sum += out[e];
+    }
+    if (!(sum > 0)) {
+        std::fill(out.begin(), out.end(), 0.0);
+        return 0.0;
+    }
+    for (double &d : out) d = d * total_ / sum;
+    return total_;
+}
+
+double RealTimePacing::durations(const Trace &t, const std::vector<Event> &events, std::vector<double> &out) const {
+    out.assign(events.size(), 0.0);
+    const std::vector<Chunk> &ch = t.chunks();
+    double prev = 0, sum = 0;
+    for (std::size_t e = 0; e < events.size(); ++e) {
+        const double end = events[e].last < ch.size() ? ch[events[e].last].t : prev;
+        double d = e == 0 ? 0.0 : std::max(0.0, end - prev);
+        if (events[e].kind == EvKind::Search && (events[e].flags & evf::kFound) == 0)
+            d = std::min(d, kFailedSecondsCap);
+        out[e] = std::isfinite(d) ? d * slowdown_ : 0.0;
+        sum += out[e];
+        if (std::isfinite(end)) prev = std::max(prev, end);
+    }
+    return sum;
+}
+
+std::unique_ptr<Pacing> make_pacing(const PacingSettings &s) {
+    if (s.mode == PacingMode::RealTime) return std::unique_ptr<Pacing>(new RealTimePacing(s.slowdown));
+    return std::unique_ptr<Pacing>(new FitLengthPacing(s.fit_seconds, s.mode, s.net));
 }
 
 // --- interval index ---------------------------------------------------------------
@@ -262,27 +322,38 @@ void Timeline::build_events() {
     }
 }
 
+void Timeline::repace(const Pacing &pacing) {
+    pace(pacing);
+    for (std::size_t k = 0; k < ghost_order_.size(); ++k) ghost_start_[k] = events_[life_[ghost_order_[k]].death].start;
+}
+
 void Timeline::pace(const Pacing &pacing) {
-    total_ = pacing.total_seconds();
-    if (events_.empty()) return;
-    double sum = 0;
-    std::vector<double> w(events_.size());
-    for (std::size_t e = 0; e < events_.size(); ++e) {
-        w[e] = std::max(1e-6, pacing.weight(events_[e]));
-        sum += w[e];
+    rip_ticks_.clear();
+    failure_ticks_.clear();
+    total_ = 0;
+    if (events_.empty()) {
+        for (Phase &p : phases_) p.start = p.end = 0;
+        return;
     }
+    std::vector<double> d;
+    const double want = pacing.durations(t_, events_, d);
+    d.resize(events_.size(), 0.0);
     double start = 0;
+    std::size_t last_timed = events_.size();
     for (std::size_t e = 0; e < events_.size(); ++e) {
         events_[e].start = start;
-        events_[e].duration = w[e] * total_ / sum;
+        events_[e].duration = d[e] > 0 ? d[e] : 0.0;
+        if (events_[e].duration > 0) last_timed = e;
         start += events_[e].duration;
     }
-    Event &last = events_.back();
-    last.duration = total_ - last.start; // the last event ends exactly at total
-    if (!(last.duration > 0)) {
-        // Rounding can only shave a negligible amount; keep it positive.
-        last.start = std::nextafter(total_, 0.0);
+    total_ = last_timed < events_.size() && want > 0 && std::isfinite(want) ? want : start;
+    if (last_timed < events_.size()) {
+        // The last event with time ends exactly at total; the events after it
+        // (without time) start there.
+        Event &last = events_[last_timed];
+        if (!(last.start < total_)) last.start = std::nextafter(total_, 0.0);
         last.duration = total_ - last.start;
+        for (std::size_t e = last_timed + 1; e < events_.size(); ++e) events_[e].start = total_;
     }
     for (const Event &ev : events_) {
         if (ev.kind == EvKind::RipUp) rip_ticks_.push_back(ev.start);
@@ -296,11 +367,12 @@ void Timeline::pace(const Pacing &pacing) {
 
 std::uint32_t Timeline::event_at(double t) const {
     if (events_.empty()) return kNone32;
-    if (!(t > 0)) return 0;
     if (t >= total_) return size() - 1;
+    if (!(t > 0)) t = 0;
     auto it = std::upper_bound(events_.begin(), events_.end(), t,
                                [](double v, const Event &ev) { return v < ev.start; });
-    return static_cast<std::uint32_t>(it - events_.begin()) - 1;
+    const auto k = it - events_.begin();
+    return k == 0 ? 0 : static_cast<std::uint32_t>(k) - 1;
 }
 
 std::uint32_t Timeline::event_of_chunk(std::uint32_t c) const {

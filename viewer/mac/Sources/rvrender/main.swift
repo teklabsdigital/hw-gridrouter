@@ -4,15 +4,18 @@
 //
 //   rvrender FILE OUT.png [--size WxH] [--board N] [--layers a,b,c | --all-layers]
 //                         [--hide-classes i,j] [--fit | --window x0,y0,x1,y1]
-//                         [--at FRACTION | --event N]
+//                         [--at FRACTION | --event N [--into F]] [--pacing PACING]
 //   rvrender FILE OUTDIR --frames N [same options]     N frames evenly through the run
 //   rvrender --compare GOLDEN.png NEW.png [--tolerance T] [--max-fraction F]
 //   rvrender --bench FILE [--size WxH] [--frames N] [--board N]
-//   rvrender --bench-playback FILE [--size WxH] [--speed S] [--frames N] [--bands B]
+//   rvrender --bench-playback FILE [--size WxH] [--speed S] [--frames N] [--bands B] [--pacing PACING]
 //   rvrender --selftest FILE [--size WxH]
 //
 // Without --at or --event the position is the end of the run (as after
-// opening a trace in the app).  Exit status 0 on success (and for
+// opening a trace in the app).  --into F: F (0...1) of the way through event
+// N, e.g. part of a search's wavefront revealed (below 0.8) or settled.
+// PACING (how long each event lasts): fit[:SECONDS] (the default, 180 s),
+// nets, net:NET (one router net), skip-failed, real[:SLOWDOWN] (default 10).  Exit status 0 on success (and for
 // --compare, images within tolerance), 1 on failure, 2 for bad usage.
 
 import CoreGraphics
@@ -29,12 +32,13 @@ func usage() -> Never {
     fail("""
     usage: rvrender FILE OUT.png [--size WxH] [--board N] [--layers a,b,c | --all-layers]
                                  [--hide-classes i,j] [--fit | --window x0,y0,x1,y1]
-                                 [--at FRACTION | --event N]
+                                 [--at FRACTION | --event N [--into F]] [--pacing PACING]
            rvrender FILE OUTDIR --frames N [options as above]
            rvrender --compare GOLDEN.png NEW.png [--tolerance T] [--max-fraction F]
            rvrender --bench FILE [--size WxH] [--frames N] [--board N]
-           rvrender --bench-playback FILE [--size WxH] [--speed S] [--frames N] [--bands B]
+           rvrender --bench-playback FILE [--size WxH] [--speed S] [--frames N] [--bands B] [--pacing PACING]
            rvrender --selftest FILE [--size WxH]
+    PACING: fit[:SECONDS], nets, net:NET, skip-failed, real[:SLOWDOWN]
     """, code: 2)
 }
 
@@ -56,6 +60,33 @@ struct Options {
     var event: UInt32?
     var speed = 8.0
     var bands = 0
+    var into: Double?
+    var pacing: Pacing?
+}
+
+/// "fit", "fit:60", "nets", "net:4", "skip-failed", "real", "real:10" (as rvdump).
+func parsePacing(_ spec: String) -> Pacing? {
+    let parts = spec.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+    let name = parts[0]
+    let value = parts.count > 1 ? Double(parts[1]) : nil
+    if parts.count > 1 && value == nil { return nil }
+    var p = Pacing()
+    switch name {
+    case "fit":
+        p.mode = .fit
+        if let value { p.fitSeconds = value }
+    case "nets" where parts.count == 1: p.mode = .netsOnly
+    case "net":
+        guard let value, let n = Int32(exactly: value) else { return nil }
+        p.mode = .oneNet
+        p.net = n
+    case "skip-failed" where parts.count == 1: p.mode = .skipFailed
+    case "real":
+        p.mode = .realTime
+        if let value { p.slowdown = value }
+    default: return nil
+    }
+    return p
 }
 
 func parseOptions(_ args: ArraySlice<String>) -> Options {
@@ -110,12 +141,19 @@ func parseOptions(_ args: ArraySlice<String>) -> Options {
         case "--bands":
             guard let n = Int(value(a)), n >= 0 else { usage() }
             o.bands = n
+        case "--into":
+            guard let f = Double(value(a)), f >= 0, f <= 1 else { usage() }
+            o.into = f
+        case "--pacing":
+            guard let p = parsePacing(value(a)) else { usage() }
+            o.pacing = p
         default:
             if a.hasPrefix("--") { usage() }
             o.positional.append(a)
         }
     }
     if o.at != nil && o.event != nil { usage() }
+    if o.into != nil && o.event == nil { usage() }
     return o
 }
 
@@ -127,11 +165,18 @@ func openSession(_ path: String, _ o: Options, needBoard: Bool = true) -> Sessio
         let s = try Session()
         try s.open(path: path)
         try s.selectBoard(o.board)
+        if let p = o.pacing { try s.setPacing(p) }
         if let f = o.at { try s.seek(fraction: f) }
         if let e = o.event {
             let count = try s.position().eventCount
             if e >= count { fail("\(path): no event \(e) (the run has \(count))") }
             try s.seek(event: e)
+            if let f = o.into {
+                let ev = try s.timeline().events[Int(e)]
+                // Within the event: its start plus f of its duration (the
+                // end of a zero-length event is the next event).
+                if ev.duration > 0 { try s.seek(time: ev.start + min(f * ev.duration, ev.duration * 0.999999)) }
+            }
         }
         if needBoard, try s.selectedBoard() == nil, try s.displayList()?.batches.isEmpty ?? true {
             fail("\(path): nothing to draw (no board and no router outline)")
@@ -164,11 +209,13 @@ func openSession(_ path: String, _ o: Options, needBoard: Bool = true) -> Sessio
     }
 }
 
-/// Give the renderer the session's current lists.
+/// Give the renderer the session's current lists and wavefront images (a
+/// search whose arrays cannot be read shows no wavefront, as in the app).
 @MainActor
 func sync(_ s: Session, _ r: LayeredRenderer) throws(CoreError) {
     if let list = try s.displayList(ifChangedSince: r.boardList?.generation) { r.update(board: list) }
     if let o = try s.overlay(ifChangedSince: r.overlayList?.generation) { r.update(overlay: o) }
+    r.update(wavefront: (try? s.wavefrontImages(reusing: r.wavefronts)) ?? [])
 }
 
 /// An RGBA8 sRGB bitmap context, flipped so that y goes down like a view.
@@ -269,6 +316,10 @@ func render(_ o: Options) -> Int32 {
             print("  copper \(p.copperAlive), ghosts \(p.ghosts), failed pads \(p.failures)"
                   + (p.routedHidden ? " (router copper hidden: the board holds it)" : "") + "; "
                   + (try s.text(.caption)))
+            let waves = r.wavefronts.filter { $0.image != nil }
+            print("  pacing \(try s.text(.pacing)); wavefront: \(p.cellsRevealed) entries revealed, "
+                  + "\(waves.reduce(0) { $0 + Int($1.cells) }) cells drawn in \(waves.count) images"
+                  + (p.settled ? ", settled" : ""))
         }
         return 0
     } catch {
@@ -483,8 +534,8 @@ func benchPlayback(_ o: Options) -> Int32 {
         let dt = 1.0 / 60
         let limit = o.framesGiven ? o.frames : Int.max
         var all: [Double] = [], dynamic: [Double] = [], core: [Double] = [], raster: [Double] = []
-        var pixels: [Double] = []
-        var planesRendered = 0, boardFrames = 0, frames = 0
+        var pixels: [Double] = [], waveOnly: [Double] = []
+        var planesRendered = 0, boardFrames = 0, frames = 0, waveFrames = 0
         var playing = true
         while frames < limit && playing {
             // As the app's run loop does each frame: release what Core
@@ -500,30 +551,38 @@ func benchPlayback(_ o: Options) -> Int32 {
                 let ms = Double(t2 - t0) / 1e6
                 all.append(ms)
                 core.append(Double(t1 - t0) / 1e6)
+                // A wavefront change swaps an image (no rasterising).
+                let waveChanged = r.lastWavefrontChanges > 0
+                if waveChanged { waveFrames += 1 }
                 if changed.contains(.board) {
                     boardFrames += 1
-                } else if n > 0 {
+                } else if n > 0 || waveChanged {
                     dynamic.append(ms)
                     raster.append(Double(t2 - t1) / 1e6)
                     pixels.append(Double(r.lastRenderedPixels))
+                    if n == 0 { waveOnly.append(ms) }
                 }
                 planesRendered += n
                 playing = try s.position().playing
             }
         }
         let p = try s.position()
-        print(String(format: "rvrender: playback bench %@ at %d x %d px, speed %gx, %d events, run %.1f s",
-                     o.positional[0], o.width, o.height, try s.position().speed, p0.eventCount, p0.total))
-        print(String(format: "  %d frames (%.1f s at 60 fps), %d redrew planes (%d planes), %d with a new board, end reached: %@",
-                     frames, Double(frames) / 60, dynamic.count, planesRendered, boardFrames, p.atEnd ? "yes" : "no"))
+        print(String(format: "rvrender: playback bench %@ at %d x %d px, speed %gx, %d events, run %.1f s, pacing %@",
+                     o.positional[0], o.width, o.height, try s.position().speed, p0.eventCount, p0.total,
+                     try s.text(.pacing)))
+        print(String(format: "  %d frames (%.1f s at 60 fps), %d dynamic (planes redrawn or a wavefront changed; "
+                        + "%d planes), %d with a wavefront change (%d only that), %d with a new board, end reached: %@",
+                     frames, Double(frames) / 60, dynamic.count, planesRendered, waveFrames, waveOnly.count,
+                     boardFrames, p.atEnd ? "yes" : "no"))
         func row(_ label: String, _ v: [Double]) {
             print("  " + label.padding(toLength: 40, withPad: " ", startingAt: 0)
                   + String(format: " median %6.2f ms   p90 %6.2f ms   p99 %6.2f ms   worst %6.2f ms",
                            median(v), percentile(v, 0.9), percentile(v, 0.99), v.max() ?? 0))
         }
         row("every frame", all)
-        row("dynamic-only frames (planes redrawn)", dynamic)
+        row("dynamic frames (no new board)", dynamic)
         row("  of which rasterising + images", raster)
+        row("  wavefront-only frames", waveOnly)
         row("  core: clock + overlay copy, all frames", core)
         print(String(format: "  pixels rasterised per dynamic frame: median %.0f (view %d)", median(pixels),
                      o.width * o.height))
@@ -531,7 +590,11 @@ func benchPlayback(_ o: Options) -> Int32 {
         let nonEmpty = r.planes.filter { $0.image != nil }.count
         row("full redraw (pan/zoom), start of run", fullStart)
         row("full redraw (pan/zoom), end of run", fullEnd)
-        let bytes = r.planes.reduce(0) { $0 + Int($1.pixelRect.width * $1.pixelRect.height) * 4 }
+        // A wavefront plane holds its grid-sized image, not a view-sized bitmap.
+        let bytes = r.planes.reduce(0) {
+            $0 + ($1.nearest ? ($1.image.map { $0.width * $0.height } ?? 0)
+                             : Int($1.pixelRect.width * $1.pixelRect.height)) * 4
+        }
         print("  planes at the end: \(r.planes.count), \(nonEmpty) with content, "
               + String(format: "%.1f MB of bitmaps", Double(bytes) / 1e6))
         return 0
@@ -753,7 +816,61 @@ func selfTest(_ o: Options) -> Int32 {
             try compareSinglePass("ROUT event \(e)")
         }
 
-        // 4. The end: the default position after opening.
+        // 4. Wavefronts (M4): in searches, revealing and settled, the
+        // layered picture against a single-pass one.
+        let searches = tl.events.indices.filter { tl.events[$0].kind == .search && tl.events[$0].duration > 0 }
+        var waveChecks = 0, mostCells = 0
+        for i in [searches.first, searches.dropFirst(searches.count / 2).first, searches.last].compactMap({ $0 }) {
+            let e = tl.events[i]
+            for f in [0.3, 0.79, 0.95] {
+                try s.seek(time: e.start + f * e.duration)
+                try sync(s, r)
+                let p = try s.position()
+                check(p.settled == (f >= 0.8), "search event \(i) at \(f): settled \(p.settled)")
+                mostCells = max(mostCells, r.wavefronts.reduce(0) { $0 + Int($1.cells) })
+                try compareSinglePass("search event \(i) at \(f)")
+                waveChecks += 1
+            }
+        }
+        print("selftest: \(waveChecks) positions in searches compared, most wavefront cells drawn \(mostCells)")
+
+        // 5. Every pacing mode plays to the end (One net: the net of the
+        // middle search), then back to fit length.
+        if !tl.events.isEmpty {
+            let netSearch = searches.dropFirst(searches.count / 2).first(where: { tl.events[$0].net != nil })
+            var line: [String] = []
+            for mode in PacingMode.allCases {
+                var pacing = Pacing(mode: mode)
+                if mode == .oneNet {
+                    guard let i = netSearch, let net = tl.events[i].net else {
+                        line.append("one net: no search with a net")
+                        continue
+                    }
+                    pacing.net = net
+                }
+                try s.setPacing(pacing)
+                let t = try s.timeline()
+                try s.jump(toEnd: false)
+                try s.setSpeed(64)
+                try s.setPlaying(true)
+                let speed = try s.position().speed
+                let dt = max(t.total / speed / 100, 1e-3)
+                var n = 0, waves = 0
+                while try s.position().playing, n < 100_000 {
+                    if try s.advance(by: dt).contains(.wavefront) { waves += 1 }
+                    n += 1
+                }
+                let pe = try s.position()
+                check(pe.atEnd && !pe.playing, "pacing \(mode.name): playing stopped at t = \(pe.time) of \(pe.total)")
+                check(abs(pe.total - t.total) < 1e-9, "pacing \(mode.name): total \(pe.total), timeline \(t.total)")
+                line.append(String(format: "%@ %.1f s, %d steps, %d wavefront changes", try s.text(.pacing), t.total,
+                                   n, waves))
+            }
+            try s.setPacing(Pacing())
+            print("selftest: pacing modes played to the end: " + line.joined(separator: "; "))
+        }
+
+        // 6. The end: the default position after opening.
         try s.jump(toEnd: true)
         let pe = try s.position()
         try compareSinglePass("end")

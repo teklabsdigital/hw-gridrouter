@@ -23,13 +23,14 @@ enum class Prim : std::uint32_t { Fill = 1, Stroke = 2, Segs = 3, Disc = 4, Ring
 // Object classes; values match rv_object_class in rv.h.
 enum class ObjClass : std::uint32_t {
     Zones = 0, Tracks, Pads, Vias, Holes, Text, FpGraphics, Graphics, RuleAreas, Outline,
-    Routed, // router copper and its ghosts, in the overlay (M3)
+    Routed,    // router copper and its ghosts, in the overlay (M3)
+    Wavefront, // the search wavefront images (M4)
 };
-constexpr std::uint32_t kClassCount = 11;
+constexpr std::uint32_t kClassCount = 12;
 const char *class_name(std::uint32_t cls) noexcept;
 
 // Sub-slots inside one layer's rank (order = rank * 256 + sub).  Values
-// match RV_SUB_* in rv.h.  Wavefront (M4) is a reserved slot; Routed is
+// match RV_SUB_* in rv.h.  Wavefront holds the M4 images (wavefront.hpp); Routed is
 // filled by the overlay (overlay.hpp), never by the board list.
 namespace sub {
 constexpr std::uint32_t kWavefront = 0x08;

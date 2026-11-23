@@ -309,7 +309,8 @@ public final class Session {
                                             kind: TimelineEvent.Kind(rawValue: e.kind) ?? .end, flags: e.flags,
                                             chunk: e.chunk, lastChunk: e.last_chunk,
                                             phase: e.phase == RV_NONE ? nil : e.phase,
-                                            board: e.board == RV_NONE ? nil : e.board))
+                                            board: e.board == RV_NONE ? nil : e.board,
+                                            net: e.flags & RV_EVF_HAS_NET != 0 ? e.net : nil))
             }
         }
         func copy(_ p: UnsafePointer<Double>?, _ n: UInt32) -> [Double] {
@@ -338,7 +339,49 @@ public final class Session {
                                 routerTime: p.router_time, event: p.event == RV_NONE ? nil : p.event,
                                 eventCount: p.event_count, playing: p.playing != 0, direction: p.direction,
                                 atEnd: p.at_end != 0, cellsRevealed: p.cells_revealed, copperAlive: p.copper_alive,
-                                ghosts: p.ghosts, failures: p.failures, routedHidden: p.routed_hidden != 0)
+                                ghosts: p.ghosts, failures: p.failures, routedHidden: p.routed_hidden != 0,
+                                net: p.has_net != 0 ? p.net : nil, settled: p.settled != 0)
+    }
+
+    // MARK: - Pacing (M4)
+
+    public func pacing() throws(CoreError) -> Pacing {
+        var p = rv_pacing()
+        try check(rv_get_pacing(handle, &p))
+        return Pacing(mode: PacingMode(rawValue: p.mode) ?? .fit, net: p.net, fitSeconds: p.fit_seconds,
+                      slowdown: p.slowdown)
+    }
+
+    /// Keeps the position in the same event; changes the timeline's times.
+    @discardableResult
+    public func setPacing(_ pacing: Pacing) throws(CoreError) -> PlaybackChange {
+        var p = rv_pacing(mode: pacing.mode.rawValue, net: pacing.net, fit_seconds: pacing.fitSeconds,
+                          slowdown: pacing.slowdown)
+        var changed: UInt32 = 0
+        try check(rv_set_pacing(handle, &p, &changed))
+        return PlaybackChange(rawValue: changed)
+    }
+
+    // MARK: - Wavefront images (M4)
+
+    /// The wavefront images at the position (one per router layer), each
+    /// cropped to its bounds as a CGImage.  An image whose generation,
+    /// order and layer equal one in `previous` is reused, not copied again.
+    public func wavefrontImages(reusing previous: [WavefrontImage] = []) throws(CoreError) -> [WavefrontImage] {
+        var count: UInt32 = 0
+        try check(rv_wavefront_image_count(handle, &count))
+        var result: [WavefrontImage] = []
+        for index in 0..<count {
+            var w = rv_wavefront_image()
+            try check(rv_get_wavefront_image(handle, index, &w))
+            if let old = previous.first(where: { $0.routerLayer == w.router_layer }), old.generation == w.generation,
+               old.order == w.order, old.layer == (w.layer == RV_NONE ? nil : w.layer) {
+                result.append(old)
+            } else {
+                result.append(WavefrontImage(copying: w))
+            }
+        }
+        return result
     }
 
     // MARK: - Playback (M3)
@@ -476,6 +519,8 @@ public struct TimelineEvent: Sendable {
     public let lastChunk: UInt32
     public let phase: UInt32?
     public let board: UInt32?
+    /// Router net, when the event has one.
+    public let net: Int32?
 
     public var isFound: Bool { flags & TimelineEvent.found != 0 }
     public var isFailed: Bool { flags & (TimelineEvent.failed | TimelineEvent.error) != 0 }
@@ -515,6 +560,35 @@ public struct PlaybackPosition: Sendable {
     public let ghosts: UInt32
     public let failures: UInt32
     public let routedHidden: Bool
+    /// The current event's router net, else that of the route_net in progress.
+    public let net: Int32?
+    /// In the settled part of a search event (the path or the red targets show).
+    public let settled: Bool
+}
+
+/// How long each event lasts (rv_set_pacing).
+public enum PacingMode: UInt32, CaseIterable, Sendable {
+    case fit = 0, netsOnly, oneNet, skipFailed, realTime
+
+    /// The core's name ("fit length", ...).
+    public var name: String { String(cString: rv_pacing_mode_name(rawValue)) }
+}
+
+public struct Pacing: Equatable, Sendable {
+    public var mode: PacingMode
+    /// For `oneNet`: the router net.
+    public var net: Int32
+    /// For the fit modes: the run's length at 1x, seconds.
+    public var fitSeconds: Double
+    /// For `realTime`: playback seconds per router second.
+    public var slowdown: Double
+
+    public init(mode: PacingMode = .fit, net: Int32 = 0, fitSeconds: Double = 180, slowdown: Double = 10) {
+        self.mode = mode
+        self.net = net
+        self.fitSeconds = fitSeconds
+        self.slowdown = slowdown
+    }
 }
 
 /// What a playback call changed (RV_CHANGED_*).
@@ -527,6 +601,8 @@ public struct PlaybackChange: OptionSet, Sendable {
     public static let overlay = PlaybackChange(rawValue: 2)
     /// The static display list (board or outline).
     public static let board = PlaybackChange(rawValue: 4)
+    /// What the wavefront images show.
+    public static let wavefront = PlaybackChange(rawValue: 8)
 }
 
 public enum StepKind: UInt32, CaseIterable, Sendable {
@@ -537,13 +613,13 @@ public enum StepKind: UInt32, CaseIterable, Sendable {
 }
 
 public enum PlaybackText: UInt32, Sendable {
-    case caption = 0, position = 1, speed = 2
+    case caption = 0, position = 1, speed = 2, pacing = 3
 }
 
 /// One overlay slot (`rv_slot`): a range of the order axis holding overlay batches.
 public struct OverlaySlot: Sendable {
     public enum Kind: UInt32, Sendable {
-        case routed = 0, drills = 1, markers = 2
+        case routed = 0, drills = 1, markers = 2, wavefront = 3
     }
     public let kind: Kind
     public let orderBegin: UInt32

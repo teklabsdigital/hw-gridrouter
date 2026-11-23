@@ -201,7 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !window.isVisible { failures.append("board window is not visible") }
         if window.title != name { failures.append("window title \"\(window.title)\", expected \"\(name)\"") }
         if controller.panel.layerRowCount == 0 { failures.append("Appearance panel lists no layers") }
-        if controller.panel.classRowCount != 11 {
+        if controller.panel.classRowCount != 12 {
             failures.append("Appearance panel lists \(controller.panel.classRowCount) object classes")
         }
 
@@ -213,15 +213,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let layered = view.layered
         let batches = layered.batchCount
         if batches == 0 { failures.append("display list is empty") }
+        // The comparisons below rasterise in one band: Core Graphics drawing
+        // on several threads at once (the default, for speed) is not exactly
+        // repeatable for thin strokes (checkGestures measures it), and these
+        // checks are about where the planes go, which bands do not change.
+        layered.bands = 1
+        layered.invalidate()
 
-        /// The layer tree on screen against a single-pass render of every
-        /// batch: the planes must add up to the same picture, the right way
-        /// up.  Cropped slot planes may differ in a few edge pixels of thin
-        /// strokes (LayeredRenderer.cropsSlots); anything more is a failure.
+        /// The layer tree as Core Animation draws it (LayerSnapshot) against
+        /// a single-pass render of every batch: the planes must add up to
+        /// the same picture, in the same places, the right way up; no pixel
+        /// may be off by more than 48.
+        if let reason = LayerSnapshot.unavailableReason {
+            failures.append("cannot render the layer tree offscreen: \(reason)")
+        }
         func compareLayers(_ label: String) -> (painted: Double, differing: Int, total: Int) {
             view.refresh()
             guard let vt = try? controller.session.view(), let single = layered.renderSinglePass(view: vt),
-                  let captured = view.captureLayers()
+                  let captured = view.snapshotLayers()
             else {
                 failures.append("\(label): could not render or capture the board view")
                 return (0, -1, 0)
@@ -239,17 +248,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             let a = SelfTestPixels.rgba(single), b = SelfTestPixels.rgba(captured)
             let bg = SelfTestPixels.rgba(of: layered.background)
-            var painted = 0, differing = 0
-            for i in stride(from: 0, to: a.count, by: 4) {
-                if !SelfTestPixels.close(a, i, bg, 6) { painted += 1 }
-                if !SelfTestPixels.close(a, i, b, i, 48) { differing += 1 }
+            var painted = 0
+            for i in stride(from: 0, to: a.count, by: 4) where !SelfTestPixels.close(a, i, bg, 6) { painted += 1 }
+            let d = SelfTestPixels.differing(a, b, width: single.width) {
+                layered.isWavefrontCellEdge(x: $0, y: $1, view: vt)
             }
             let total = single.width * single.height
             if painted == 0 { failures.append("\(label): the render shows only the background") }
-            if differing > total / 2000 {
-                failures.append("\(label): the layers on screen differ from a single-pass render in \(differing) of \(total) pixels")
+            if d.strict > 0 {
+                failures.append("\(label): the layers on screen differ from a single-pass render in \(d.strict) of \(total) pixels")
             }
-            return (100 * Double(painted) / Double(total), differing, total)
+            if d.cellEdge > 0 { print("selftest: \(label): \(d.cellEdge) px at wavefront cell edges a pixel apart") }
+            return (100 * Double(painted) / Double(total), d.strict, total)
         }
         let first = compareLayers("opened")
         print(String(format: "selftest: %@: %d batches (%d board, %d overlay) in %d planes, %d px, %.1f%% painted, "
@@ -264,9 +274,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // AppKit (as a command-line argument) nor added to Open Recent.
         let controller2 = NSDocumentController.shared
         if !controller2.documents.isEmpty {
-            failures.append("\(controller2.documents.count) documents still open (argument opened by AppKit?)")
+            failures.append("\(controller2.documents.count) documents still open (argument opened by AppKit?): "
+                            + controller2.documents.map { "\($0.fileURL?.path ?? "?") same \($0 === document)" }
+                                .joined(separator: ", "))
         }
-        if controller2.recentDocumentURLs.contains(where: { $0.lastPathComponent == name }) {
+        // By path: the owner's own Open Recent may hold another file of the same name.
+        let ownPath = URL(fileURLWithPath: selfTestFile ?? "").standardizedFileURL.resolvingSymlinksInPath().path
+        if controller2.recentDocumentURLs.contains(where: {
+            $0.standardizedFileURL.resolvingSymlinksInPath().path == ownPath
+        }) {
             failures.append("\(name) is in Open Recent")
         }
         return failures
@@ -327,6 +343,252 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         + "%d ghosts, layers differ in %d px; caption \"%@\"",
                      frame, overlays.count, planesRedrawn, pm?.copperAlive ?? 0, pm?.ghosts ?? 0, mid.differing,
                      c.caption.stringValue))
+        // M4: a search in the second half of the run, part revealed (router
+        // copper, ghosts and a wavefront over the board), then settled.
+        let midSearch = seekMidSearch(c)
+        let waves = c.boardView.layered.wavefronts
+        let shownWaves = waves.filter { $0.image != nil }
+        let midWave = compareLayers("mid-search")
+        if let e = midSearch {
+            let event = c.timelineView.timeline?.events[Int(e)]
+            print(String(format: "selftest: mid-search (event %u, %@): %d wavefront images, %d drawn, %u cells; "
+                            + "layers differ in %d px",
+                         e, event?.isFound == true ? "found" : "failed", waves.count, shownWaves.count,
+                         shownWaves.reduce(UInt32(0)) { $0 + $1.cells }, midWave.differing))
+            if let event, event.size > 0, shownWaves.isEmpty, (try? s.position().cellsRevealed) ?? 0 > 0 {
+                failures.append("mid-search: cells are revealed but no wavefront image is drawn")
+            }
+            if let event {
+                _ = try? s.seek(time: event.start + event.duration * 0.95)
+                c.apply([.position, .overlay, .wavefront])
+                let settled = compareLayers("search settled")
+                if (try? s.position().settled) != true { failures.append("95% into a search is not settled") }
+                print("selftest: search settled: layers differ in \(settled.differing) px")
+            }
+        } else {
+            print("selftest: no search with a duration in the second half: wavefront not checked")
+        }
+        // Pans and zooms through the view's own event handlers, mid-run
+        // (router copper over the board), in a search when there is one.
+        if midSearch == nil { c.seek(fraction: 0.5) } else { _ = seekMidSearch(c) }
+        let g0 = DispatchTime.now().uptimeNanoseconds
+        failures += checkGestures(c.boardView, session: s)
+        print(String(format: "selftest: gestures took %.0f ms",
+                     Double(DispatchTime.now().uptimeNanoseconds - g0) / 1e6))
+        failures += checkPacing(c)
+        return failures
+    }
+
+    /// Seek 40% into the first search with a duration that starts in the
+    /// second half of the run (the reveal), or nil if there is none.
+    private func seekMidSearch(_ c: BoardWindowController) -> UInt32? {
+        guard let tl = c.timelineView.timeline else { return nil }
+        let candidates = tl.events.indices.filter {
+            tl.events[$0].kind == .search && tl.events[$0].duration > 0
+        }
+        guard let i = candidates.first(where: { tl.events[$0].start >= tl.total * 0.5 }) ?? candidates.last
+        else { return nil }
+        let e = tl.events[i]
+        c.apply((try? c.session.seek(time: e.start + e.duration * 0.4)) ?? [])
+        return UInt32(i)
+    }
+
+    /// Play the run to the end through the window's clock in every pacing
+    /// mode (One net: the net of the search seekMidSearch finds), counting
+    /// the frames in which a wavefront image changed; back to fit length.
+    private func checkPacing(_ c: BoardWindowController) -> [String] {
+        var failures: [String] = []
+        let s = c.session
+        for mode in PacingMode.allCases {
+            if mode == .oneNet {
+                // The net of a search in the second half (the playhead is
+                // at the end, where there is none).
+                let events = c.timelineView.timeline?.events ?? []
+                let searches = events.indices.filter { events[$0].kind == .search && events[$0].net != nil }
+                guard let i = searches.first(where: { $0 >= events.count / 2 }) ?? searches.last else {
+                    if c.setPacing(.oneNet) { failures.append("pacing one net: set with no net at the playhead") }
+                    print("selftest: pacing one net: no search with a net: not played")
+                    continue
+                }
+                c.apply((try? s.seek(event: UInt32(i))) ?? [])
+            }
+            guard c.setPacing(mode), let p0 = try? s.pacing(), p0.mode == mode else {
+                failures.append("pacing \(mode.name): could not be set")
+                continue
+            }
+            if c.timelineView.timeline?.total != (try? s.position().total) {
+                failures.append("pacing \(mode.name): the timeline was not reloaded")
+            }
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            c.goToStart(nil)
+            guard let start = try? s.position() else { return failures + ["no position"] }
+            c.togglePlay(nil)
+            // Large frames: the dongle must fit in the 10 s watchdog.
+            let frames = 16
+            let dt = start.total / max(start.speed, 1e-9) / Double(frames - 4)
+            var frame = 0, waveFrames = 0
+            while c.isPlaying && frame < frames {
+                c.advanceClock(by: dt)
+                if c.boardView.layered.lastWavefrontChanges > 0 { waveFrames += 1 }
+                frame += 1
+            }
+            let end = try? s.position()
+            if end?.atEnd != true || c.isPlaying {
+                failures.append("pacing \(mode.name): playing did not stop at the end (t = \(end?.time ?? -1))")
+                _ = try? s.setPlaying(false)
+            }
+            let text = (try? s.text(.pacing)) ?? ""
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+            print(String(format: "selftest: pacing %@ (%@): total %.1f s, played %d frames (%.0f ms), "
+                            + "%d with a wavefront change",
+                         mode.name, text, start.total, frame, ms, waveFrames))
+        }
+        if !c.setPacing(.fit) { failures.append("pacing: could not go back to fit length") }
+        c.updateTransport()
+        return failures
+    }
+
+    /// Many small pans and zooms through the board view's own handlers
+    /// (mouse drags, trackpad scrolls, the zoom that pinch and the wheel
+    /// call), at backing scales 2 and 1.  After every step, the refresh the
+    /// next turn of the run loop would make runs, and the layer tree as Core
+    /// Animation draws it (LayerSnapshot) must equal a single-pass render
+    /// at that camera: no pixel off by more than 48.
+    private func checkGestures(_ view: BoardView, session: Session) -> [String] {
+        var failures: [String] = []
+        guard let window = view.window else { return ["the board view has no window"] }
+        let w = view.bounds.width, h = view.bounds.height
+        enum Step {
+            case drag(CGFloat, CGFloat)
+            case scroll(Int32, Int32)
+            case zoom(Double, CGFloat, CGFloat) // factor, anchor as a fraction of the view
+            case fit
+        }
+        var steps: [Step] = [.fit]
+        for _ in 0..<6 { steps.append(.drag(0, 3.25)) }          // drag down
+        for _ in 0..<4 { steps.append(.drag(0, -5.5)) }          // and up
+        for _ in 0..<3 { steps.append(.drag(2.75, 0)) }          // right
+        for _ in 0..<3 { steps.append(.drag(-4.5, 0.5)) }        // left
+        steps += [.drag(1.5, -0.75), .drag(0.25, 0.25)]
+        for _ in 0..<3 { steps.append(.zoom(1.7, 0.3, 0.7)) }    // in, about an off-centre point
+        for _ in 0..<3 { steps.append(.drag(0, 7.25)) }
+        for _ in 0..<2 { steps.append(.zoom(2.5, 0.8, 0.2)) }    // far in
+        steps += [.drag(-3.5, -2.25), .scroll(-3, 2), .scroll(2, 0), .scroll(0, -5)]
+        for _ in 0..<4 { steps.append(.zoom(0.45, 0.15, 0.85)) } // far out
+        steps += [.drag(0, 11), .zoom(1.1, 0.5, 0.5), .drag(0, -1.5), .fit, .drag(0, 20), .drag(0, -40)]
+
+        var lastDrag = NSPoint(x: w / 2, y: h / 2)
+        func send(_ type: NSEvent.EventType, _ p: NSPoint) {
+            guard let e = NSEvent.mouseEvent(with: type, location: view.convert(p, to: nil), modifierFlags: [],
+                                             timestamp: ProcessInfo.processInfo.systemUptime,
+                                             windowNumber: window.windowNumber, context: nil, eventNumber: 0,
+                                             clickCount: 1, pressure: 1)
+            else { failures.append("could not make a mouse event"); return }
+            switch type {
+            case .leftMouseDown: view.mouseDown(with: e)
+            case .leftMouseDragged: view.mouseDragged(with: e)
+            default: view.mouseUp(with: e)
+            }
+        }
+        for backing: CGFloat in [2, 1] {
+            view.backingOverride = backing
+            view.flushRefresh()
+            var compared = 0, worst = 0, worstStep = -1, failing = 0, failingVertical = 0, cellEdges = 0
+            let verticalDrags = steps.filter {
+                if case let .drag(dx, dy) = $0 { return dx == 0 && dy != 0 }
+                return false
+            }.count
+            var before: ViewTransform? = nil
+            send(.leftMouseDown, lastDrag)
+            for (k, step) in steps.enumerated() {
+                switch step {
+                case let .drag(dx, dy):
+                    lastDrag = NSPoint(x: lastDrag.x + dx, y: lastDrag.y + dy)
+                    send(.leftMouseDragged, lastDrag)
+                case let .scroll(dx, dy):
+                    if let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: dy,
+                                        wheel2: dx, wheel3: 0),
+                       let e = NSEvent(cgEvent: cg) {
+                        view.scrollWheel(with: e)
+                    }
+                case let .zoom(f, ax, ay):
+                    view.zoom(by: f, about: NSPoint(x: w * ax, y: h * ay))
+                case .fit:
+                    view.zoomToFit()
+                }
+                view.flushRefresh()
+                guard let vt = try? session.view(), let single = view.layered.renderSinglePass(view: vt),
+                      let shown = view.snapshotLayers(), shown.width == single.width, shown.height == single.height
+                else {
+                    failures.append("gestures at backing \(backing), step \(k): could not render or capture")
+                    break
+                }
+                let a = SelfTestPixels.rgba(single), b = SelfTestPixels.rgba(shown)
+                let d = SelfTestPixels.differing(a, b, width: single.width) {
+                    view.layered.isWavefrontCellEdge(x: $0, y: $1, view: vt)
+                }
+                let differing = d.strict
+                cellEdges += d.cellEdge
+                compared += 1
+                // A drag moves the board with the pointer, by the same points.
+                if case let .drag(dx, dy) = step, let before {
+                    if abs(vt.tx - before.tx - Double(dx)) > 1e-9 || abs(vt.ty - before.ty - Double(dy)) > 1e-9 {
+                        failures.append("gestures: a drag of (\(dx), \(dy)) moved the camera by "
+                                        + "(\(vt.tx - before.tx), \(vt.ty - before.ty))")
+                    }
+                }
+                before = vt
+                if differing > 0 {
+                    failing += 1
+                    if case let .drag(dx, dy) = step, dx == 0, dy != 0 { failingVertical += 1 }
+                }
+                if differing > worst {
+                    worst = differing
+                    worstStep = k
+                    if let dir = ProcessInfo.processInfo.environment["RV_SELFTEST_DUMP"] {
+                        for (image, suffix) in [(single, "single"), (shown, "layers")] {
+                            let url = URL(fileURLWithPath: dir)
+                                .appendingPathComponent("gesture_x\(Int(backing))_step\(k)_\(suffix).png")
+                            try? NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])?
+                                .write(to: url)
+                        }
+                    }
+                }
+            }
+            send(.leftMouseUp, lastDrag)
+            print(String(format: "selftest: gestures at backing %.0f: %d steps compared (%d vertical drags), "
+                            + "%d differ (%d vertical drags), worst %d px off (step %d); "
+                            + "%d px at wavefront cell edges a pixel apart in all",
+                         backing, compared, verticalDrags, failing, failingVertical, worst, worstStep, cellEdges))
+            if worst > 0 {
+                failures.append("gestures at backing \(Int(backing)): the layers on screen differ from a single-pass "
+                                + "render after \(failing) of \(compared) steps (\(failingVertical) of "
+                                + "\(verticalDrags) vertical drags), at worst in \(worst) px (step \(worstStep))")
+            }
+        }
+        // How repeatable the parallel rasteriser is (information only):
+        // the same picture drawn twice in the default bands, zoomed in.
+        view.backingOverride = nil
+        view.zoom(by: 4, about: NSPoint(x: w * 0.4, y: h * 0.6))
+        view.flushRefresh()
+        let savedBands = view.layered.bands
+        view.layered.bands = 0
+        var worstRepeat = 0
+        if let vt = try? session.view() {
+            for _ in 0..<4 {
+                guard let x = view.layered.renderSinglePass(view: vt), let y = view.layered.renderSinglePass(view: vt)
+                else { break }
+                let a = SelfTestPixels.rgba(x), b = SelfTestPixels.rgba(y)
+                var n = 0
+                for i in stride(from: 0, to: a.count, by: 4) where !SelfTestPixels.close(a, i, b, i, 48) { n += 1 }
+                worstRepeat = max(worstRepeat, n)
+            }
+        }
+        view.layered.bands = savedBands
+        print("selftest: the parallel rasteriser drawing the same picture twice: up to \(worstRepeat) px off by more than 48")
+        view.flushRefresh()
+        view.zoomToFit()
+        view.flushRefresh()
         return failures
     }
 
@@ -421,6 +683,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         add("Faster", #selector(BoardWindowController.faster(_:)), "]", [.command])
         add("Slower", #selector(BoardWindowController.slower(_:)), "[", [.command])
+        // M4: how long each event lasts.  "One Net" follows the net of the
+        // event at the playhead.
+        let pacing = NSMenu(title: "Pacing")
+        let titles: [PacingMode: String] = [.fit: "Fit Length", .netsOnly: "Nets Only", .oneNet: "One Net",
+                                            .skipFailed: "Skip Failed", .realTime: "Real Time"]
+        for mode in PacingMode.allCases {
+            let item = pacing.addItem(withTitle: titles[mode] ?? mode.name,
+                                      action: #selector(BoardWindowController.setPacingMode(_:)), keyEquivalent: "")
+            item.tag = Int(mode.rawValue)
+        }
+        let pacingItem = menu.addItem(withTitle: "Pacing", action: nil, keyEquivalent: "")
+        pacingItem.submenu = pacing
         return menu
     }
 
@@ -512,5 +786,47 @@ enum SelfTestPixels {
 
     static func close(_ a: [UInt8], _ i: Int, _ b: [UInt8], _ j: Int, _ tolerance: Int) -> Bool {
         (0..<3).allSatisfy { abs(Int(a[i + $0]) - Int(b[j + $0])) <= tolerance }
+    }
+
+    /// Pixels of `shown` more than 48 off `single` (both `width` wide, rows
+    /// from the top).  A pixel whose centre lies on a wavefront cell edge
+    /// (`cellEdge`, LayeredRenderer.isWavefrontCellEdge) and that equals a
+    /// pixel of `single` one pixel away is counted apart, as a tie that Core
+    /// Animation and Core Graphics break differently; every other differing
+    /// pixel counts.
+    static func differing(_ single: [UInt8], _ shown: [UInt8], width: Int, cellEdge: (Int, Int) -> Bool)
+        -> (strict: Int, cellEdge: Int) {
+        let height = single.count / (4 * max(1, width))
+        var strict = 0, edge = 0
+        // The pixels off by more than 48 in a channel, quickly.
+        var off: [Int] = []
+        single.withUnsafeBufferPointer { a in
+            shown.withUnsafeBufferPointer { b in
+                var i = 0
+                let n = min(a.count, b.count)
+                while i + 3 < n {
+                    if abs(Int(a[i]) - Int(b[i])) > 48 || abs(Int(a[i + 1]) - Int(b[i + 1])) > 48
+                        || abs(Int(a[i + 2]) - Int(b[i + 2])) > 48 {
+                        off.append(i)
+                    }
+                    i += 4
+                }
+            }
+        }
+        for i in off {
+            let x = (i / 4) % width, y = (i / 4) / width
+            var tie = false
+            if cellEdge(x, y) {
+                search: for dy in -1...1 {
+                    for dx in -1...1 where (dx, dy) != (0, 0) {
+                        let nx = x + dx, ny = y + dy
+                        guard nx >= 0, ny >= 0, nx < width, ny < height else { continue }
+                        if close(single, (ny * width + nx) * 4, shown, i, 48) { tie = true; break search }
+                    }
+                }
+            }
+            if tie { edge += 1 } else { strict += 1 }
+        }
+        return (strict, edge)
     }
 }
