@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // routed.hpp: router geometry in board millimetres.
 //
 //   - Frame: router cells and router-grid mm to board mm (spec 9).

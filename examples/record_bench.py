@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Trevor Attema, Teklabs Digital
+
 """Record a routing run to a trace file, without KiCad.
 
     python3 examples/record_bench.py OUT.grtrace                 # the tests/bench.py board

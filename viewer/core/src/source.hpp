@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // source.hpp: where the reader gets its bytes from.
 //
 // A Source is a growing, append-only sequence of bytes read by position: a

@@ -1,7 +1,13 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // file.cpp: FileSource, the only platform-specific code in the core.
 //
-// POSIX (macOS, Linux): open + fstat + pread, 64-bit offsets; replaced()
+// POSIX (macOS, Linux): open (non-blocking, so a named pipe or device is
+// refused at once) + fstat + pread, 64-bit offsets; replaced()
 // compares stat(path) with fstat of the open descriptor (device and inode).
+// Windows needs no such care: CreateFileW does not wait on a pipe, and
+// GetFileType refuses anything but a disk file.
 // Windows: CreateFileW (UTF-8 path converted to UTF-16) + GetFileSizeEx +
 // ReadFile with an OVERLAPPED offset; replaced() compares the volume serial
 // number and file index of the path with those of the open handle.
@@ -168,9 +174,12 @@ FileSource::FileSource(const std::string &utf8_path, bool wait) : path_(utf8_pat
 }
 
 bool FileSource::try_open(bool missing_ok) {
+    // O_NONBLOCK: opening a named pipe (or a device) for reading would
+    // otherwise wait for a writer, before the regular-file check below can
+    // refuse it.  It changes nothing for a regular file; it is cleared anyway.
     int fd;
     do {
-        fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
+        fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
     } while (fd < 0 && errno == EINTR);
     if (fd < 0) {
         if (missing_ok && errno == ENOENT) return false;
@@ -185,6 +194,12 @@ bool FileSource::try_open(bool missing_ok) {
     if (!S_ISREG(st.st_mode)) {
         ::close(fd);
         throw IoError("not a regular file: " + path_);
+    }
+    const int fl = ::fcntl(fd, F_GETFL);
+    if (fl == -1 || ::fcntl(fd, F_SETFL, fl & ~O_NONBLOCK) == -1) {
+        const int err = errno;
+        ::close(fd);
+        throw IoError(posix_error("cannot open", path_, err));
     }
     handle_ = fd;
     open_ = true;

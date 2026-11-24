@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // theme.hpp: KiCad layer names, the "KiCad Default" colour theme, and the
 // board draw order.
 //

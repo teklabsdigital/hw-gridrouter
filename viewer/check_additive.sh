@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Trevor Attema, Teklabs Digital
+#
 # check_additive.sh: read-only check that the visual-router work is additive.
 #
 # Lists every path changed on this branch relative to main (committed, staged,
@@ -27,6 +30,12 @@ docs/TRACE_FORMAT.md
 .gitignore
 README.md
 CLAUDE.md
+docs/assets/kicadautorouter.mp4
+docs/assets/kicadautorouter-small.mp4
+docs/assets/visual-gridrouter.gif
+docs/assets/visual-gridrouter-wavefront.png
+docs/assets/visual-gridrouter-ripup.png
+docs/assets/visual-gridrouter-final.png
 '
 
 changed=$(

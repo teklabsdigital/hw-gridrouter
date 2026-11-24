@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // test_trace.cpp: the trace reader against the synthetic writer.
 
 #include "check.hpp"

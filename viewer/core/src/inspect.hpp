@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // inspect.hpp: the nets table and the per-net attempt history (M5).
 //
 // Both are functions of the trace and the timeline; the table's "now"

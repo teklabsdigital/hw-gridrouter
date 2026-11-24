@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // synth_board.cpp: the M2 stress board of the synthetic writer (synth.hpp).
 //
 // Like synth.cpp it shares no code with the reader.  Coordinates are board

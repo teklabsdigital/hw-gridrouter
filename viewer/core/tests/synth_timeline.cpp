@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // synth_timeline.cpp: controlled routing runs for the M3 tests (synth.hpp).
 //
 // Written from docs/TRACE_FORMAT.md alone, like the rest of synth; shares no

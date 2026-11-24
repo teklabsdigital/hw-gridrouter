@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Trevor Attema, Teklabs Digital
+
 """Record a routing run of gridrouter into a trace file (docs/TRACE_FORMAT.md).
 
     from gridrouter.recorder import TracedRouter, Recorder

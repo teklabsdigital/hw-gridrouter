@@ -8,3 +8,6 @@ gridrouter/*.exp
 gridrouter/*.lib
 __pycache__/
 .DS_Store
+# traces recorded by the README's examples
+/traces/
+/*.grtrace

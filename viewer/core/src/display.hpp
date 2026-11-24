@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // display.hpp: the board display list.
 //
 // A BRD chunk becomes a list of batches of five primitives, in board mm,
@@ -92,6 +95,13 @@ struct DisplayList {
     bool has_extent = false;
     std::vector<LayerEntry> layers;      // in Appearance panel order
 };
+
+// Rule-area hatching costs (hatch lines x polygon edges) edge tests and
+// gives at most half as many segments.  A polygon over the first bound, or
+// one that would take the board's total over the second, is drawn as its
+// outline only.  Real boards stay far below both.
+constexpr std::uint64_t kHatchWorkPerPolygon = 1ull << 20;
+constexpr std::uint64_t kHatchWorkPerBoard = 1ull << 23;
 
 // Build the full display list of one board.
 DisplayList build_display_list(const BoardInfo &info, const BoardGeometry &geo, const Theme &theme);

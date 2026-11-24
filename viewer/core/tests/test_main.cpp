@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // test_main.cpp: runs every TEST registered through check.hpp.
 //
 //   rv_tests            run all tests

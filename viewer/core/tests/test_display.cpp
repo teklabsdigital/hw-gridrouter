@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // test_display.cpp: M2, the board in the core: theme, layer names and draw
 // order, the display list, visibility, board selection and the camera.
 // No rendering: everything is checked on the data the core hands out.

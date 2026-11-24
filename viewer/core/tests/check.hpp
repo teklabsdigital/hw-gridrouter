@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // check.hpp: a tiny test framework, no dependencies.
 //
 //   TEST(name) { CHECK(cond); CHECK_EQ(a, b); CHECK_STREQ(a, b); }

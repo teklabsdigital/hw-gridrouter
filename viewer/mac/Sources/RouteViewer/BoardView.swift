@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // BoardView.swift: the board canvas.  Shows the core's display list and
 // overlay as a stack of Core Animation layers, one per LayeredRenderer
 // plane, and turns mouse, trackpad and keys into the core's camera calls

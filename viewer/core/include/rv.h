@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Trevor Attema, Teklabs Digital
+ *
  * rv.h: the C interface of the Visual Gridrouter core.
  *
  * Every client (Swift/AppKit now, C++/Win32 and C++/Qt6 later) talks to the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // hittest.cpp: what is under a point of the view (hittest.hpp).
 
 #include "hittest.hpp"
@@ -75,6 +78,15 @@ void Picker::reset() {
     wave_source_ = kNone32;
     wave_.reset();
     wave_first_.clear();
+    wave_pairs_.clear();
+}
+
+std::uint32_t Picker::first_position(std::uint64_t cell) const {
+    if (!wave_first_.empty()) return cell < wave_first_.size() ? wave_first_[cell] : kNone32;
+    if (cell > 0xFFFFFFFFull) return kNone32;
+    const std::pair<std::uint32_t, std::uint32_t> key(static_cast<std::uint32_t>(cell), 0u);
+    const auto it = std::lower_bound(wave_pairs_.begin(), wave_pairs_.end(), key);
+    return it != wave_pairs_.end() && it->first == key.first ? it->second : kNone32;
 }
 
 void Picker::index_board(const PickInput &in) {
@@ -353,20 +365,29 @@ std::vector<Hit> Picker::pick(const PickInput &in) {
                 wave_source_ = in.wave_source;
                 wave_.reset();
                 wave_first_.clear();
+                wave_pairs_.clear();
                 try {
                     wave_ = in.trace->wavefront(in.wave_source);
                 } catch (...) {
                     wave_.reset(); // unreadable arrays: nothing to pick (the images report the error)
                 }
-                if (wave_) {
-                    wave_first_.assign(static_cast<std::size_t>(t.runs()[session].ncells()), kNone32);
-                    for (std::uint32_t k = 0; k < wave_->cells.size(); ++k) {
-                        const std::uint32_t cc = wave_->cells[k];
-                        if (cc < wave_first_.size() && wave_first_[cc] == kNone32) wave_first_[cc] = k;
+                if (wave_ && !wave_->cells.empty()) {
+                    const std::uint64_t ncells = t.runs()[session].ncells();
+                    const auto n = static_cast<std::uint32_t>(wave_->cells.size());
+                    if (dense_cell_array_ok(4 * ncells, n)) {
+                        wave_first_.assign(static_cast<std::size_t>(ncells), kNone32);
+                        for (std::uint32_t k = 0; k < n; ++k) {
+                            const std::uint32_t cc = wave_->cells[k];
+                            if (cc < wave_first_.size() && wave_first_[cc] == kNone32) wave_first_[cc] = k;
+                        }
+                    } else {
+                        wave_pairs_.reserve(n);
+                        for (std::uint32_t k = 0; k < n; ++k) wave_pairs_.emplace_back(wave_->cells[k], k);
+                        std::sort(wave_pairs_.begin(), wave_pairs_.end());
                     }
                 }
             }
-            if (wave_ && !wave_first_.empty()) {
+            if (wave_ && (!wave_first_.empty() || !wave_pairs_.empty())) {
                 const Run &run = t.runs()[session];
                 const Frame fr(run);
                 const double ci = (x - fr.cx(0)) / run.cell, cj = (y - fr.cy(0)) / run.cell;
@@ -381,8 +402,7 @@ std::vector<Hit> Picker::pick(const PickInput &in) {
                         const std::uint64_t cell = static_cast<std::uint64_t>(rlay) * run.nc() +
                                                    static_cast<std::uint64_t>(j) * static_cast<std::uint64_t>(run.nx) +
                                                    static_cast<std::uint64_t>(i);
-                        if (cell >= wave_first_.size()) continue;
-                        const std::uint32_t k = wave_first_[cell];
+                        const std::uint32_t k = first_position(cell);
                         if (k == kNone32 || k >= in.wave_count) continue;
                         Hit h;
                         h.kind = hitkind::Wavefront;

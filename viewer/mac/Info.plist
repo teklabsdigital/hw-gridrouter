@@ -29,7 +29,7 @@
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSHumanReadableCopyright</key>
-	<string>MIT licence. See LICENSE.</string>
+	<string>Copyright (c) 2026 Trevor Attema, Teklabs Digital. MIT licence.</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>

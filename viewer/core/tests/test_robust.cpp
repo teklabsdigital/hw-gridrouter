@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // test_robust.cpp: truncation at every byte and corruption fuzzing.
 //
 // The reader must never crash, read out of bounds or trip ASan/UBSan on any

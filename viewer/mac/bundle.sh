@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Trevor Attema, Teklabs Digital
+#
 # bundle.sh: wrap the release build of RouteViewer into
 # build/Visual Gridrouter.app and sign it ad hoc.
 #
@@ -20,6 +23,8 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$exe" "$app/Contents/MacOS/RouteViewer"
 cp "$viewer/mac/Info.plist" "$app/Contents/Info.plist"
+# The licence travels with the app; it must be in place before signing.
+cp "$viewer/../LICENSE" "$app/Contents/Resources/LICENSE"
 printf 'APPL????' > "$app/Contents/PkgInfo"
 
 plutil -lint "$app/Contents/Info.plist"

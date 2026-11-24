@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // hittest.hpp: what is under a point of the view (M5).
 //
 // A pick looks at what is drawn: router copper alive at the position (not
@@ -22,10 +25,12 @@
 #include "records.hpp"
 #include "routed.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace rv {
@@ -92,6 +97,9 @@ public:
     // Every hit at the point, topmost first.  Never throws for unreadable
     // wavefront arrays (they are skipped).
     std::vector<Hit> pick(const PickInput &in);
+    // Bytes of the wavefront cell index (tests): a per-cell array only when
+    // dense_cell_array_ok, else sorted (cell, position) pairs.
+    std::size_t wave_index_bytes() const { return wave_first_.size() * 4 + wave_pairs_.size() * 8; }
 
 private:
     struct Shape {
@@ -108,6 +116,10 @@ private:
     std::uint32_t wave_source_ = kNone32;
     std::shared_ptr<const Wavefront> wave_;
     std::vector<std::uint32_t> wave_first_; // per cell: first position in the order, kNone32
+    // Instead of wave_first_ on a grid too large for the search: (cell,
+    // position) of every entry, sorted, so a cell's first position comes first.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> wave_pairs_;
+    std::uint32_t first_position(std::uint64_t cell) const;
 };
 
 } // namespace rv

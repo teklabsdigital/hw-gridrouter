@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // playback.hpp: the playback clock, stepping, and the strings a client shows
 // for a position.
 //

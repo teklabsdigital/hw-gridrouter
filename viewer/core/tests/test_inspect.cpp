@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // test_inspect.cpp: M5 core: the nets table, the selection and its
 // highlight, hit testing, the attempt history, and their C interface.
 

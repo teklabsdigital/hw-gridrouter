@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // camera.cpp: the board-mm to view transform (see camera.hpp).
 
 #include "camera.hpp"

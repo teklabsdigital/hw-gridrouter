@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // lru.hpp: a small least-recently-used cache of immutable values.
 //
 // Bounded by both an entry count and a byte budget.  The most recently used

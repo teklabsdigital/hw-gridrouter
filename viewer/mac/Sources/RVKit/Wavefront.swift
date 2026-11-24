@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // Wavefront.swift: one wavefront image of the core (rv_wavefront_image) as
 // a CGImage cropped to its bounds, with where it goes on the board.
 //

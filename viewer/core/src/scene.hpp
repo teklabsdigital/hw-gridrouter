@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // scene.hpp: what a session shows of its trace: the board under the
 // position, layer and object visibility, the theme, the camera, and the
 // cached static display list.

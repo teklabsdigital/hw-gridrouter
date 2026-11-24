@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // records.hpp: the typed contents of a .grtrace file.
 //
 // One struct per chunk kind of docs/TRACE_FORMAT.md section 7, plus the
@@ -54,6 +57,10 @@ constexpr std::uint32_t kStrict = 1u << 0;
 constexpr std::uint32_t kSkipJoinedStubs = 1u << 1;
 constexpr std::uint32_t kHasEdgeMargin = 1u << 2;
 } // namespace run_flags
+
+// The largest nx and ny a RUN may have: the router's own limit (RT_MAXSIDE
+// in gridrouter.h; TRACE_FORMAT.md 3.4).  A RUN beyond it is corrupt.
+constexpr std::int32_t kMaxGridSide = 8192;
 
 struct Run {
     bool valid = false;               // false: the RUN chunk was corrupt
@@ -221,6 +228,16 @@ struct Wavefront {
     std::uint32_t ntrace_total = 0;
     std::size_t bytes() const { return cells.size() * 4 + costs.size() * 4; }
 };
+
+// Whether a scratch array indexed by cell (one entry per cell of the grid,
+// `bytes` in all) is justified for a wavefront of n entries: when it is
+// small on any machine, or no larger than the entries' own memory.  Else the
+// caller sorts the entries instead, so a large grid with a small search
+// costs memory in proportion to the search, not to the grid.
+constexpr std::uint64_t kDenseCellBytes = 16ull << 20;
+inline bool dense_cell_array_ok(std::uint64_t bytes, std::uint64_t n) {
+    return bytes <= kDenseCellBytes || bytes <= 8 * n;
+}
 
 // --- CMIT (7.12) ---------------------------------------------------------------
 

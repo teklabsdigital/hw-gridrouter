@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // LayerSnapshot.swift: the board view's layer tree rendered by Core
 // Animation itself, offscreen, for the self-test.
 //

@@ -1,4 +1,6 @@
 // swift-tools-version: 6.0
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
 //
 // Visual Gridrouter, macOS client.  No package dependencies: system
 // frameworks and the C++ standard library only.

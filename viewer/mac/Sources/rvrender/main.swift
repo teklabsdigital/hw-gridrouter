@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // rvrender: draw a trace's board and router overlay to a PNG without a
 // window, compare two PNGs, time redraws, or check playback.  Uses RVKit's
 // LayeredRenderer, the same code the app draws with.
@@ -16,7 +19,9 @@
 //                                  SRC written into DIR while followed (M6)
 //   rvrender --selftest FILE [--size WxH]
 //   rvrender --repeat FILE [--size WxH] [--at FRACTION]   how repeatable the banded rasteriser is
+//   rvrender --help                                       the usage (exit 0)
 //
+// Any other argument that starts with '-' is bad usage, never a path.
 // Without --at or --event the position is the end of the run (as after
 // opening a trace in the app).  --into F: F (0...1) of the way through event
 // N, e.g. part of a search's wavefront revealed (below 0.8) or settled.
@@ -24,7 +29,8 @@
 // nets, net:NET (one router net), skip-failed, real[:SLOWDOWN] (default 10).
 // --select NET: select the net of that name (KiCad-style highlight), as a
 // click on it in the app does.  Exit status 0 on success (and for
-// --compare, images within tolerance), 1 on failure, 2 for bad usage.
+// --compare, images within tolerance, and --help), 1 on failure, 2 for bad
+// usage.
 
 import CoreGraphics
 import Foundation
@@ -36,8 +42,9 @@ func fail(_ message: String, code: Int32 = 1) -> Never {
     exit(code)
 }
 
-func usage() -> Never {
-    fail("""
+/// Bad usage: the text on stderr, exit 2; asked (--help): on stdout, exit 0.
+func usage(asked: Bool = false) -> Never {
+    let text = """
     usage: rvrender FILE OUT.png [--size WxH] [--board N] [--layers a,b,c | --all-layers]
                                  [--hide-classes i,j] [--fit | --window x0,y0,x1,y1]
                                  [--at FRACTION | --event N [--into F]] [--pacing PACING]
@@ -52,8 +59,15 @@ func usage() -> Never {
            (--bench-playback also takes --crop-grid G)
            rvrender --selftest FILE [--size WxH]
            rvrender --repeat FILE [--size WxH] [--at FRACTION]
+           rvrender --help
     PACING: fit[:SECONDS], nets, net:NET, skip-failed, real[:SLOWDOWN]
-    """, code: 2)
+    Any other argument that starts with '-' is a usage error.
+    """
+    if asked {
+        print(text)
+        exit(0)
+    }
+    fail(text, code: 2)
 }
 
 struct Options {
@@ -176,8 +190,11 @@ func parseOptions(_ args: ArraySlice<String>) -> Options {
             let v = value(a)
             guard !v.isEmpty else { usage() }
             o.select = v
+        case "--help", "-h": usage(asked: true)
         default:
-            if a.hasPrefix("--") { usage() }
+            // A file or folder never starts with '-': an unknown option,
+            // not a path to write.
+            if a.hasPrefix("-") { usage() }
             o.positional.append(a)
         }
     }

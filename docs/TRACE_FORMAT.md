@@ -221,7 +221,7 @@ reader is not required to check any of them.
 
 | Chunk | Bound |
 |---|---|
-| `RUN ` | `nx > 0`, `ny > 0`, and `2 * nx * ny <= 2^32`, so that every cell `< 2 * nc` fits in a `u32` |
+| `RUN ` | `0 < nx <= 8192` and `0 < ny <= 8192` (the router's limit, below), so every cell `< 2 * nc` fits in a `u32` |
 | `RUN ` | `0 <= nd <= 16` |
 | `RUN ` | `cell` finite and `> 0`; `origin_x`, `origin_y` finite |
 | `SRCH` | every `path` and `trace_cell` entry `< 2 * nc`; `ntrace_total <= 2 * nc`; `ntrace <= ntrace_total` |
@@ -254,11 +254,15 @@ Values that are **not** bounded, because the router accepts them:
   says. A reader MAY report it as a warning, and a viewer MAY leave the via
   undrawn.
 
-The format sets no maximum grid size other than the `u32` cell bound above.
-The router itself (informative) supports at most 8192 cells per side, 16
-directions and disc radius 255.
+The grid bound is the router's own: it rejects a grid with more than 8192
+cells per side (`RT_MAXSIDE` in `gridrouter/gridrouter.h`), so no writer
+produces one. A reader MAY reject a `RUN ` whose `nx` or `ny` is larger, as a
+corrupt chunk; both readers do. A reader that sizes arrays by the grid can
+then rely on this bound instead of trusting the file. The router also
+supports (informative) at most 16 directions and disc radius 255.
 
-Which bounds the existing readers check differs; neither checks every one.
+Which bounds the existing readers check differs; neither checks every one
+(both check the `RUN ` grid bound).
 For example, `DISC` `i`, `j`, `RECT` `op`, `DROP` `ok` and `GRDS` `which` are
 not checked by either reader; an out-of-range value there is shown as
 unknown.
@@ -1590,7 +1594,7 @@ field, size or number changed; files valid before are valid now.
   attaching.
 
 **2026-11-23, second pass.** Open points 1 to 6 of [17](#17-open-points)
-settled by the project lead; open point 8 closed after checking
+settled; open point 8 closed after checking
 `gridrouter/kicad_trace.py`; `BRD ` details from running KiCad 10. No byte layout, field, size or number changed; files valid
 before are valid now. Some files that a reader could report as corrupt or as
 having errors before are valid now (a `SRCH` with `error` set and invalid
@@ -1631,6 +1635,14 @@ having errors before are valid now (a `SRCH` with `error` set and invalid
 - `examples/record_bench.py` writes KiCad 10's layer names
   (`F.Silkscreen`), and the viewer's sample `small.grtrace` was regenerated
   with it.
+
+**2026-11-24.** The grid bound of [3.4](#34-value-bounds) is now the
+router's limit: `0 < nx <= 8192` and `0 < ny <= 8192`, where before only
+`2 * nx * ny <= 2^32` was stated and no maximum grid size was set. No byte
+layout, field or size changed, and every file the recorder can write is
+valid as before (the router rejects larger grids). A reader MAY reject a
+larger `RUN ` as corrupt, and both readers now do, so a file cannot make a
+reader size per-cell arrays beyond what the router could have used.
 
 ---
 

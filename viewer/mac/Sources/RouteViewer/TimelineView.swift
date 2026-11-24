@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // TimelineView.swift: the run as a strip under the board.  Phase bands
 // with their labels along the top, one bar per search (height: the
 // search's size from the core; red when it found nothing), rip-up and

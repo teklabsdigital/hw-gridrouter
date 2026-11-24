@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Trevor Attema, Teklabs Digital
+
 """gridrouter.kicad_trace.dump_board on an in-memory pcbnew board.
 
 Needs KiCad's Python (pcbnew); the board tests are skipped elsewhere:

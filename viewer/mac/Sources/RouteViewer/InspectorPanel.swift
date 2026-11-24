@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // InspectorPanel.swift: the nets table and the selected net's attempt
 // history (M5).  Every row, cell, order and text comes from the core
 // (rv_nets_*, rv_net_history); the panel only shows them and turns clicks

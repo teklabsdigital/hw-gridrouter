@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // session.cpp: timeline rebuilds, position sync and the overlay (session.hpp).
 
 #include "session.hpp"

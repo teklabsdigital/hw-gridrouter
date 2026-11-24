@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // display.cpp: builds the display list of a board (see display.hpp, rv.h).
 //
 // Records are sorted into buckets keyed by (order, primitive, width, class,
@@ -107,6 +110,7 @@ private:
     std::vector<LayerEntry> by_index_; // indexed by BRD layer index
     std::vector<float> tmp_;
     float outline_[4] = {kInf, kInf, -kInf, -kInf};
+    std::uint64_t hatch_work_ = 0; // edge tests of the hatching so far (kHatchWorkPerBoard)
 };
 
 void Builder::read_contour(const Polyset &p, std::uint32_t c, bool drop_closing) {
@@ -180,7 +184,9 @@ void Builder::stroke_contour(Bucket &b, const Polyset &p, std::uint32_t contour,
 }
 
 // Diagonal hatching of one polygon (outline and holes, even-odd), as KiCad
-// marks rule areas.  Lines x - y = c, spaced kHatchPitchMm apart.
+// marks rule areas.  Lines x - y = c, spaced kHatchPitchMm apart.  None when
+// it would cost more than kHatchWorkPerPolygon / kHatchWorkPerBoard (the
+// outline, drawn by the caller, remains).
 void Builder::hatch_polygon(Bucket &b, const Polyset &p, std::uint32_t poly, float half_width) {
     const std::uint32_t c0 = p.poly_start[poly], c1 = p.poly_start[poly + 1];
     std::vector<float> edges; // x0, y0, x1, y1 per edge
@@ -199,6 +205,13 @@ void Builder::hatch_polygon(Bucket &b, const Polyset &p, std::uint32_t poly, flo
     }
     if (edges.empty()) return;
     const double step = kHatchPitchMm * std::sqrt(2.0);
+    // Bound the work (and so the segments): over it, the outline alone.
+    const double lines = std::floor(umax / step) - std::ceil(umin / step) + 1;
+    const double work = std::max(0.0, lines) * static_cast<double>(edges.size() / 4);
+    if (!(work <= static_cast<double>(kHatchWorkPerPolygon)) ||
+        work + static_cast<double>(hatch_work_) > static_cast<double>(kHatchWorkPerBoard))
+        return;
+    hatch_work_ += static_cast<std::uint64_t>(work);
     std::vector<std::pair<double, std::pair<float, float>>> hits;
     for (double u = std::ceil(umin / step) * step; u <= umax; u += step) {
         hits.clear();

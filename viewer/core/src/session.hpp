@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // session.hpp: the C++ object behind an rv_session handle.
 //
 // Portable C++17, standard library only.  The trace reader; since M2 the

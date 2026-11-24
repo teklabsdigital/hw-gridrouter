@@ -1,16 +1,209 @@
 # gridrouter
 
+A two-layer grid (maze) router for printed circuit boards, written for Python
+scripts that generate KiCad boards. The A* search, the occupancy grids and
+rip-up are in C; the API is plain Python. Visual Gridrouter, the macOS app in
+[`viewer/`](viewer/), replays a recorded routing run search by search, or
+follows one live while the router writes it.
+
+[![Visual Gridrouter replaying the routing of the OBD-II dongle's board](docs/assets/visual-gridrouter.gif)](docs/assets/kicadautorouter.mp4)
+
+*Visual Gridrouter replaying the routing of the Bluetooth OBD-II dongle's
+board, sped up from 1× to 64×. Click the picture for the original screen
+recording (MP4, 28 s, 11.5 MB). A [shorter clip](docs/assets/kicadautorouter-small.mp4)
+of the refine phase at 16× is also in the repository (MP4, 11 s, 3.4 MB).*
+
+## Contents
+
+- [What you are looking at](#what-you-are-looking-at)
+- [Visual Gridrouter](#visual-gridrouter)
+  ([what it does](#what-it-does), [build and run](#build-and-run),
+  [record a trace](#record-a-trace))
+- [The router](#the-router) ([quick start](#quick-start))
+- [Documentation](#documentation)
+- Reference: [Layout](#layout), [Build and test](#build-and-test),
+  [Model](#model-unchanged-from-the-reference), [API](#api),
+  [Tracing](#tracing),
+  [How it works](#how-it-works-and-how-it-differs-from-the-reference)
+  and its [Deviations](#deviations),
+  [Test and benchmark results](#test-and-benchmark-results),
+  [How the OBD-II dongle uses it](#how-the-obd-ii-dongle-uses-it),
+  [Platforms](#platforms), [Where this came from](#where-this-came-from),
+  [Licence](#licence)
+
+## What you are looking at
+
+The animation is one recorded run of the board generator of the
+[Bluetooth OBD-II dongle](https://github.com/teklabsdigital/hw-obd2-dongle),
+which routes its board with this library. The generator wrote a trace file
+(`.grtrace`) while it ran; the app plays that file back.
+
+- **The board** is the dongle's KiCad board after placement, written into the
+  trace by `gridrouter.kicad_trace.dump_board` and drawn in KiCad's default
+  colours and layer order. The panel on the right lists its layers and object
+  classes.
+- **Searches.** Each A* search shows as a faint tint in its layer's colour,
+  spreading over the cells in the order the search expanded them (the
+  wavefront). When it settles, the path it found is drawn over it.
+- **Tracks committing.** Each path becomes copper: red tracks on F.Cu, blue
+  tracks on B.Cu, and vias where a path changes layer.
+- **Rip-up and retry.** When a net cannot get through, the router searches
+  again through other nets' tracks, rips up the nets in the way and routes
+  them again later. Ripped-up copper fades out; a pad that could not be
+  reached gets a red marker.
+- **The caption** above the timeline names the phase, the net being routed
+  and what the current event does, with running counts. The phases in the
+  timeline ("plane stubs", "main queue", "polish", "refine", "group moves")
+  are the dongle generator's own.
+- **The timeline** has one bar per search (taller when it expanded more
+  states, red when it found nothing), rip-up ticks in orange, and the
+  playhead.
+- **The end.** The generator writes the board again after its last zone fill
+  and DRC. The app then shows that "final" board, with its copper zones and
+  reference designators. The caption reports 1023 route_net calls and 0
+  failed pads.
+
+## Visual Gridrouter
+
+![A search in progress: the wavefront of net /PAIR_BTN at the lower left of the board](docs/assets/visual-gridrouter-wavefront.png)
+
+*A large search in progress, at 8×: the shaded area at the lower left is the
+wavefront of search 352, for net /PAIR_BTN (379,968 states expanded), with the
+path it found. Left: the nets table. Right: board, layers and object classes.
+Below: caption, timeline and transport bar.*
+
+![The refine phase: two failed pads and recently ripped-up copper](docs/assets/visual-gridrouter-ripup.png)
+
+*Later, in the refine phase at 32×: route_net for /TX_INH has just ended with
+two failed pads (R37.2 and U2.12), each marked with a red ring. White rings
+mark the pads of that route_net, and the pale tracks are copper removed by a
+recent rip-up, fading out.*
+
+![The end of the run: the final board with its zone fills](docs/assets/visual-gridrouter-final.png)
+
+*The end of the run (event 8006 of 8006): the final board as KiCad wrote it,
+with zone fills on F.Cu and In1.Cu.*
+
+Visual Gridrouter only watches: it reads trace files and never steers the
+router. It does not open a `.kicad_pcb` file or route a board by itself; the
+board it draws is the one the recorder wrote into the trace.
+
+### What it does
+
+The full list, with every key and menu, is in
+[viewer/README.md](viewer/README.md) ("The app").
+
+- **Opening.** File > Open, Open Recent, a double-click in Finder, a drop on
+  the Dock icon or a window, or a path on the command line. Each trace is a
+  read-only document.
+- **Board.** The KiCad board stored in the trace, in KiCad 10's default
+  colours and draw order. The Appearance panel shows or hides each layer and
+  each object class (zones, tracks, pads, vias, holes, text, routed copper,
+  wavefront and others), and picks which board to draw: by default the latest
+  one at the playhead.
+- **Playback and timeline.** Play, pause, play backward, step by event,
+  search, commit, net, rip-up, failure or phase, and speed from 0.25× to 64×.
+  Click or drag on the timeline to scrub.
+- **Pacing.** Fit length (the whole run lasts 3 minutes at 1×), Nets only
+  (copper commit by commit, no wavefronts), One net, Skip failed (searches
+  that found nothing take no time) and Real time (the router's own timing,
+  slowed down).
+- **Wavefronts, ghosts and failures.** Each search's expanded cells in order,
+  then its path, or its targets in red if it found none. Copper removed by a
+  rip-up fades out over a moment. Failed pads keep a red marker until the
+  net is tried again.
+- **Nets table and highlight.** One row per net with its route_net calls,
+  searches, commits, vias, rip-ups, failed pads, states expanded, router time
+  and state at the playhead (routing, failed, ripped, complete, routed, not
+  started). Filter and sort it. Selecting a net, in the table or by clicking
+  it on the board, highlights it the way KiCad's net highlight does.
+- **Per-net history.** For the selected net: each route_net call with its
+  searches, commits and result, and each rip-up of its copper with what
+  caused it. Double-click a line to go to that event. The net's events are
+  also marked on the timeline.
+- **Following a run live.** Open a trace while the router is still writing
+  it, or before the file exists ("Waiting for the file"). The window follows
+  the run as it grows and shows a live indicator; scrub back to look at
+  something, then press Live to catch up. When the recorder finishes, the
+  indicator says "Complete".
+- **Status line.** The cursor position in board millimetres, the zoom and
+  what is under the pointer (a pad and its net, router copper and the event
+  that committed it, a wavefront cell and its cost).
+- **Command-line tools.** `rvrender` draws any position of a trace to a PNG
+  without a window; `rvdump` prints a trace's contents and can follow a file
+  that is being written.
+
+Platform: macOS 14 or later on Apple Silicon. That is the only client built
+today. Windows and Linux clients are planned on the same portable C++ core;
+they have not been built.
+
+### Build and run
+
+It needs only Apple's Command Line Tools (Swift 6 and clang); Xcode is not
+required. From the repository root:
+
+```sh
+make -C viewer app      # builds viewer/build/Visual Gridrouter.app (swift build -c release)
+make -C viewer run      # opens the app built by `make app`
+make -C viewer test     # core tests, C99 header check and golden images
+```
+
+To open a trace from a terminal, or to wait for one that a run is about to
+write:
+
+```sh
+"viewer/build/Visual Gridrouter.app/Contents/MacOS/RouteViewer" run.grtrace
+```
+
+A small sample trace is in the repository:
+`viewer/core/tests/data/small.grtrace` (an 80 x 50 board with a rip-up, a
+failed plane drop and a repeated search).
+
+### Record a trace
+
+Without KiCad, from the repository root:
+
+```sh
+python3 examples/record_bench.py run.grtrace --size small   # an 80 x 50 board, about 200 KB
+python3 examples/record_bench.py run.grtrace                # the tests/bench.py board, 21.8 MB
+```
+
+Then open `run.grtrace` in the app. To watch the run live instead, start the
+app on the path first (the command above); it waits for the file and follows
+it as it is written.
+
+In your own script, use `TracedRouter` in place of `gridrouter.Router` and
+attach a `Recorder`:
+
+```python
+from gridrouter.recorder import Recorder, TracedRouter
+
+r = TracedRouter(nx, ny, 0.1)             # the same arguments and results as gridrouter.Router
+with Recorder("run.grtrace") as rec:
+    rec.attach(r, nets={1: "A"})          # router net numbers to names
+    rec.phase("routing")
+    ...                                   # add_pad, snapshot, route_net as usual
+```
+
+Add a KiCad board with `gridrouter.kicad_trace.dump_board`. See
+[Tracing](#tracing) below for the details and
+[docs/TRACE_FORMAT.md](docs/TRACE_FORMAT.md) for the file format.
+
+## The router
+
 A grid router for printed circuit boards, rewritten from Python to C. Routing a
 real 4-layer KiCad board went from 16 to 38 minutes to about 11 to 17 seconds.
-On the same inputs it gives the same routes as the Python version. In the benchmark it is about 60x faster: the whole test
-board takes 1.27 s instead of 84.9 s, with an identical result (see the
+On the same inputs it gives the same routes as the Python version. In the
+benchmark it is about 67x faster: the whole test board takes 1.27 s instead of
+84.9 s, with an identical result (see the
 [benchmark table](#speed-testsbenchpy) below).
 
 It is a two-layer grid (maze) router for Python scripts that generate KiCad
 boards. It re-implements the pure-Python router that was first written inside
 the board generator of the [Bluetooth OBD-II dongle](https://github.com/teklabsdigital/hw-obd2-dongle) project.
 The behaviour is the same: on the same inputs it returns the same paths, costs,
-rip-ups and failures, as checked by the tests. It runs about 60x faster. The
+rip-ups and failures, as checked by the tests. It runs about 67x faster on the
+benchmark board. The
 dongle's board generator now uses this library to route its real board.
 
 The A* search, the occupancy grids, claiming and rip-up are in C
@@ -21,10 +214,56 @@ driver logic stay in Python.
   and Linux; on Windows MSVC `cl`, MinGW-w64 `gcc` or LLVM `clang`).
 - Does not import `pcbnew`. The router returns plain lists of segments and vias.
   An optional helper (`gridrouter.kicad.emit`) turns them into KiCad objects.
-- The shared library is compiled automatically on first import, and again
-  whenever `gridrouter.c` / `gridrouter.h` is newer than it. On macOS it is a
+- The shared library is compiled automatically on first use (the first
+  `Router()`, or `gridrouter.build()`), and again whenever `gridrouter.c` /
+  `gridrouter.h` is newer than it. On macOS it is a
   universal (arm64 + x86_64) dylib, so it loads in the system Python and in
   KiCad's bundled Python 3.9, native or under Rosetta.
+
+### Quick start
+
+Clone the repository (into a folder named `router` if you use it with the
+dongle, see [Build and test](#build-and-test)) and run Python from its root.
+The first `Router()` compiles the library.
+
+```python
+import gridrouter
+
+r = gridrouter.Router(60, 40, 0.1)          # 60 x 40 cells of 0.1 mm
+nx = r.NX
+
+# two pads of net 1 on F.Cu (layer 0): net, layers, centre, then the pad's rectangle, in mm
+r.add_pad(1, (0,), 1.0, 1.0, 0.9, 0.9, 1.1, 1.1, 0)
+r.add_pad(1, (0,), 4.0, 3.0, 3.9, 2.9, 4.1, 3.1, 0)
+r.snapshot()                                # everything so far becomes permanent
+
+# each pad: (x, y, layers, [(layer, cell index)], label)
+pads = [(1.0, 1.0, (0,), [(0, 10 * nx + 10)], "A.0"),
+        (4.0, 3.0, (0,), [(0, 30 * nx + 40)], "A.1")]
+ripped = r.route_net(1, "A", pads, False, 0)    # names of nets ripped up to make room
+segments, vias = r.routes()                 # [(layer, x0, y0, x1, y1, width, net)], [(x, y, net)]
+```
+
+`gridrouter.kicad.emit` writes `segments` and `vias` into a `pcbnew` board.
+The [API](#api) section lists every parameter and method.
+
+## Documentation
+
+- [viewer/README.md](viewer/README.md): Visual Gridrouter in full: layout,
+  build and test targets, every app feature, playback, live following,
+  inspecting, drawing and performance figures.
+- [docs/TRACE_FORMAT.md](docs/TRACE_FORMAT.md): the trace file format,
+  version 1.0, the only contract between the recorder and the viewer.
+- This README's reference sections: [Model](#model-unchanged-from-the-reference),
+  [API](#api), [Tracing](#tracing),
+  [Deviations](#deviations) from the reference router,
+  [Test and benchmark results](#test-and-benchmark-results) and
+  [Platforms](#platforms).
+- [CLAUDE.md](CLAUDE.md) and [viewer/CLAUDE.md](viewer/CLAUDE.md): the rules
+  for AI assistants working on this repository, including the test gates
+  for each kind of change.
+- [examples/record_bench.py](examples/record_bench.py): a complete recording
+  without KiCad.
 
 ## Layout
 
@@ -38,6 +277,7 @@ router/
   gridrouter/tracefile.py   trace file writer and reader, BoardWriter, check / replay, command line
   gridrouter/kicad_trace.py optional: dump a pcbnew BOARD into a trace (pcbnew passed in)
   docs/TRACE_FORMAT.md      the trace file format, version 1.0
+  docs/assets/              the screen recording, animation and pictures in this README
   examples/record_bench.py  record a trace of the benchmark board (or a small one) without KiCad
   tests/ref_router.py       the oracle: the original pure-Python Router, copied unchanged (constants configurable)
   tests/common.py           random-scene helpers shared by the tests
@@ -62,7 +302,7 @@ Nothing to install. Clone the repository into a folder named `router`, the name 
 git clone https://github.com/teklabsdigital/hw-gridrouter router
 cd router
 
-python3 -c "import gridrouter"          # compiles the library if needed (macOS: gridrouter/libgridrouter.dylib)
+python3 -c "import gridrouter; gridrouter.build()"   # compiles the library if needed (macOS: gridrouter/libgridrouter.dylib)
 make                                    # same, via make
 python3 tests/run_all.py                # all tests (~1-2 min); GRIDROUTER_TEST_SCALE=0.2 for a quick run
 make test-kicad                         # the same tests in KiCad's Python (includes the pcbnew emit and board dump tests)
@@ -206,7 +446,10 @@ Module-level names:
 
 - `BLOCK`, `RouterError` (raised on bad cells, cost overflow, or relax before
   snapshot).
-- `build(force=False)`.
+- `build(force=False, quiet=True)`: compiles the library if it is missing or
+  older than the C source (always with `force`), and returns its path; with
+  `quiet=False` it prints the compiler's warnings. `Router()` calls it on
+  first use.
 - `make_dirs(strict)`, `make_step(dirs, wrong_way, diagonal)`,
   `make_turn(dirs, bend_45, bend_90)`, `disc(r)`: the reference's table code.
 - `gridrouter.kicad.emit(board, router, netinfo, names, pcbnew, origin=(0, 0), via_dia=0.6, via_drill=0.3)`:
@@ -619,6 +862,9 @@ details. This README does not track its line numbers.
   yourself and set `GRIDROUTER_LIB` to its path. The Windows build itself
   has never been run.
   The Makefile is for macOS and Linux only.
+- **Visual Gridrouter:** macOS on Apple Silicon only (see
+  [Visual Gridrouter](#visual-gridrouter)); Windows and Linux clients are
+  planned, not built.
 
 ## Where this came from
 
@@ -636,4 +882,19 @@ project.
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Copyright (c) 2026 Trevor Attema, Teklabs Digital.
+The licence covers the router, the trace recorder and the Visual Gridrouter
+viewer (`viewer/`). The source files added with the recorder and the viewer
+carry an `SPDX-License-Identifier: MIT` header.
+
+The project contains no third-party code. It needs only the Python standard
+library and a C99 compiler and, for the viewer, the C++ standard library and
+Apple's system frameworks. `tests/ref_router.py` is the original Python router
+from the [Bluetooth OBD-II dongle](https://github.com/teklabsdigital/hw-obd2-dongle)
+project (same author, MIT). The viewer's default colours, layer names and draw
+order follow KiCad's so that boards look familiar; the colour values were read
+from KiCad 10.0.8, and no KiCad source code is included.
+
+KiCad is a trademark of its respective owner. This project is not part of
+KiCad and is not affiliated with or endorsed by the KiCad project. It reads
+and writes KiCad boards only through KiCad's own Python API (`pcbnew`).

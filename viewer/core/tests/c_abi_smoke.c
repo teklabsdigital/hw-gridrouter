@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Trevor Attema, Teklabs Digital
+ *
  * c_abi_smoke.c: proves rv.h is plain C99 and that the C++ core links and
  * runs when called from C.  Built with cc -std=c99 -Wall -Wextra -Wpedantic
  * -Werror and linked against the core objects (see the Makefile).

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // listbuild.hpp: a small display-list builder for router content (the
 // outline list drawn without a board, and the overlay of routed copper,
 // ghosts, markers and highlights).

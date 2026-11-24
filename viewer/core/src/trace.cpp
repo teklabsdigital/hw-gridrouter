@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // trace.cpp: the .grtrace reader.  See trace.hpp for the design and
 // docs/TRACE_FORMAT.md for the format; section numbers below refer to it.
 
@@ -662,8 +665,11 @@ void Trace::on_run(Chunk &c, std::uint32_t idx) {
     run.via_dia = r.f64("via_dia");
     run.via_drill = r.f64("via_drill");
     if (run.nx <= 0 || run.ny <= 0) r.fail("nx, ny", "grid size must be positive");
-    // Cells are u32 values < 2 * nx * ny (1.3).
-    if (run.ncells() > 0x100000000ull) r.fail("nx, ny", "grid too large for u32 cells");
+    // The router's limit (3.4); it also keeps cells, u32 values < 2 * nx * ny
+    // (1.3), far inside 32 bits, and bounds every per-cell array.
+    if (run.nx > kMaxGridSide || run.ny > kMaxGridSide)
+        r.fail("nx, ny", "more than 8192 cells per side (the router's limit)");
+    static_assert(2ull * kMaxGridSide * kMaxGridSide <= 0x100000000ull, "cells must fit a u32");
     if (run.nd < 0 || run.nd > 16) r.fail("nd", "must be 0 to 16");
     if (!(std::isfinite(run.cell) && run.cell > 0)) r.fail("cell", "must be a positive number");
     if (!std::isfinite(run.origin_x) || !std::isfinite(run.origin_y))

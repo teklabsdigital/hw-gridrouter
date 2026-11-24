@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // scene.cpp: the board under the position, visibility and the cached static
 // display list.
 

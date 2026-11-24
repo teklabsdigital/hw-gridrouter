@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // DisplayListRenderer.swift: draws the core's display list into any
 // CGContext.  Shared by the app's BoardView and by rvrender.
 //

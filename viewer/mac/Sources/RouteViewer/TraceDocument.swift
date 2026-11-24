@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // TraceDocument.swift: one open .grtrace file, read only.  The document owns
 // a core session; its window shows the inspector (nets table and history,
 // M5), the board, the caption, the timeline, the transport bar, the

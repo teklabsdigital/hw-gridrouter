@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // trace_util.hpp: helpers shared by the reader tests.
 #ifndef RV_TESTS_TRACE_UTIL_HPP
 #define RV_TESTS_TRACE_UTIL_HPP

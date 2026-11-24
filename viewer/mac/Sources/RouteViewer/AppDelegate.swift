@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // AppDelegate.swift: main menu, the welcome window, and the --selftest mode.
 // Trace windows belong to TraceDocument (NSDocument, named in Info.plist).
 

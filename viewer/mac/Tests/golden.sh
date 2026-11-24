@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Trevor Attema, Teklabs Digital
+#
 # golden.sh: golden-image tests for the board and overlay renderer.
 #
 #   sh mac/Tests/golden.sh check    render every case and compare it with mac/Tests/golden/NAME.png

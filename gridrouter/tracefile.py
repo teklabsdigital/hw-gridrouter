@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Trevor Attema, Teklabs Digital
+
 """gridrouter trace files (.grtrace), format version 1.0.
 
 The format is specified in docs/TRACE_FORMAT.md; this module follows it and
@@ -39,6 +42,7 @@ MAGIC = b"GRTRACE\0"
 MAJOR, MINOR = 1, 0
 NONE32 = 0xFFFFFFFF
 BLOCK = 1 << 30
+MAX_SIDE = 8192                 # largest RUN nx, ny: the router's RT_MAXSIDE (spec 3.4)
 
 HEADER = struct.Struct("<8sHHId")           # 24 bytes
 CHUNK = struct.Struct("<4sId")              # 16 bytes
@@ -612,6 +616,9 @@ def _parse_run(c, ctx):
         r_via=[v[14], v[15]], r_via_space=v[16], flags=v[17], cell=v[18], origin_x=v[19],
         origin_y=v[20], track=v[21], track_wide=v[22], pad_clear=[v[23], v[24]], pad_novia=v[25],
         edge_margin=[v[26], v[27]], via_dia=v[28], via_drill=v[29])
+    if not (0 < f.nx <= MAX_SIDE and 0 < f.ny <= MAX_SIDE):
+        raise CorruptChunk("RUN: grid %d x %d; nx and ny must be 1 to %d (the router's limit)"
+                           % (f.nx, f.ny, MAX_SIDE))
     nd = f.nd
     if nd < 0 or nd > 4096:
         raise CorruptChunk("RUN: nd = %d" % nd)
@@ -1389,7 +1396,11 @@ def _main(argv):
     ap.add_argument("command", choices=("summary", "dump", "check"))
     ap.add_argument("file")
     a = ap.parse_args(argv)
-    tr = read_trace(a.file)
+    try:
+        tr = read_trace(a.file)
+    except (OSError, ValueError) as e:      # unreadable, or not a trace file
+        print("%s: %s: %s" % (ap.prog, a.file, e), file=sys.stderr)
+        return 1
     if a.command == "dump":
         if tr.header is not None:
             print("header: version %d.%d, opened %s" % (

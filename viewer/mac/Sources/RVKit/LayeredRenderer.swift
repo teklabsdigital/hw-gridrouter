@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // LayeredRenderer.swift: the board and the overlay as a stack of cached
 // bitmaps ("planes"), so that playback redraws only what changed.
 //

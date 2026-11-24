@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // timeline.cpp: events, pacing and the state at any event (timeline.hpp).
 
 #include "timeline.hpp"
@@ -88,7 +91,7 @@ double RealTimePacing::durations(const Trace &t, const std::vector<Event> &event
         double d = e == 0 ? 0.0 : std::max(0.0, end - prev);
         if (events[e].kind == EvKind::Search && (events[e].flags & evf::kFound) == 0)
             d = std::min(d, kFailedSecondsCap);
-        out[e] = std::isfinite(d) ? d * slowdown_ : 0.0;
+        out[e] = std::isfinite(d) ? std::min(d * slowdown_, kMaxEventSeconds) : 0.0;
         sum += out[e];
         if (std::isfinite(end)) prev = std::max(prev, end);
     }
@@ -106,7 +109,7 @@ double RealTimePacing::step(const Trace &t, const std::vector<Event> &events, st
     double d = e == 0 ? 0.0 : std::max(0.0, end - prev);
     if (events[e].kind == EvKind::Search && (events[e].flags & evf::kFound) == 0) d = std::min(d, kFailedSecondsCap);
     if (std::isfinite(end)) prev = std::max(prev, end);
-    return std::isfinite(d) ? d * slowdown_ : 0.0;
+    return std::isfinite(d) ? std::min(d * slowdown_, kMaxEventSeconds) : 0.0;
 }
 
 std::unique_ptr<Pacing> make_pacing(const PacingSettings &s) {
@@ -443,7 +446,7 @@ bool Timeline::pace(const Pacing &pacing, std::uint32_t e0) {
             std::size_t last_timed = events_.size();
             for (std::size_t e = 0; e < events_.size(); ++e) {
                 events_[e].start = start;
-                events_[e].duration = d[e] > 0 ? d[e] : 0.0;
+                events_[e].duration = d[e] > 0 ? std::min(d[e], kMaxEventSeconds) : 0.0; // also NaN: 0
                 if (events_[e].duration > 0) last_timed = e;
                 start += events_[e].duration;
             }
@@ -466,7 +469,7 @@ bool Timeline::pace(const Pacing &pacing, std::uint32_t e0) {
             pace_state_[e] = st;
             const double d = pacing.step(t_, events_, e, st);
             events_[e].start = start;
-            events_[e].duration = d > 0 && std::isfinite(d) ? d : 0.0;
+            events_[e].duration = d > 0 && std::isfinite(d) ? std::min(d, kMaxEventSeconds) : 0.0;
             start += events_[e].duration;
         }
         pace_state_[size] = st;

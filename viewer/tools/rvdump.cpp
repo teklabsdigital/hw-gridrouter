@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // rvdump: print what the core reads from a .grtrace file.
 //
 //   rvdump FILE              summary
@@ -25,10 +28,12 @@
 //                            at END; reload when it is replaced; give up
 //                            after S seconds without growth (default never).
 //                            Ends with the refresh times.
+//   rvdump --help            the usage
 //
 // Exit status: 0 for a readable trace with no errors (complete, or a valid
-// file that is still being written: "incomplete"); 1 if the file cannot be
-// opened or read, is not a trace, or has corrupt parts; 2 for bad usage.
+// file that is still being written: "incomplete") and for --help; 1 if the
+// file cannot be opened or read, is not a trace, or has corrupt parts; 2 for
+// bad usage (also a FILE that starts with '-': an unknown option).
 //
 // It uses only the C interface rv.h, like every client, so it also shows
 // that the interface is enough to inspect a file.
@@ -48,8 +53,9 @@
 
 namespace {
 
-int usage() {
-    std::fprintf(stderr,
+// Bad usage: on stderr, exit 2; --help: on stdout, exit 0.
+int usage(bool asked = false) {
+    std::fprintf(asked ? stdout : stderr,
                  "usage: rvdump FILE\n"
                  "       rvdump --chunks FILE\n"
                  "       rvdump --search N FILE\n"
@@ -59,10 +65,11 @@ int usage() {
                  "       rvdump --net NAME [--at AT] FILE\n"
                  "       rvdump --hit X,Y [--at AT] [--bench N] FILE\n"
                  "       rvdump --follow [--interval MS] [--stall-exit S] [--quiet] FILE\n"
+                 "       rvdump --help\n"
                  "PACING: fit[:SECONDS], nets, net:NET, skip-failed, real[:SLOWDOWN]\n"
                  "AT: a fraction of the timeline 0..1, or end (the default)\n"
                  "COLUMN: a column title in lower case, spaces as '-' (name, state, failed-pads, ...)\n");
-    return 2;
+    return asked ? 0 : 2;
 }
 
 // "fit", "fit:60", "nets", "net:4", "skip-failed", "real", "real:10".
@@ -839,6 +846,10 @@ int follow(const char *path, const FollowOpts &o) {
 }
 
 int main(int argc, char **argv) {
+    for (int a = 1; a < argc; ++a)
+        if (std::strcmp(argv[a], "--help") == 0 || std::strcmp(argv[a], "-h") == 0) return usage(true);
+    // FILE never starts with '-': such an argument is an unknown option.
+    if (argc >= 2 && argv[argc - 1][0] == '-') return usage();
     if (argc >= 3 && std::strcmp(argv[1], "--follow") == 0) {
         FollowOpts o;
         int a = 2;

@@ -5,6 +5,11 @@ file (`.grtrace`): the board as KiCad draws it, the A* wavefront of each
 search, paths committing, rip-ups, retries and failures. It only watches; it
 never steers the router.
 
+Names: the app is called Visual Gridrouter, its executable (inside
+`Visual Gridrouter.app`) is `RouteViewer`, and the command-line tools are
+`rvrender` (draws positions to PNG, benchmarks), `rvdump` (prints what the
+core reads from a trace) and `rvsynth` (writes synthetic test traces).
+
 Status: **milestone M6**, live. The core reads `.grtrace` files (M1),
 turns a trace's `BRD` board into a display list in KiCad's default colours
 and draw order and owns the camera (M2), cuts the run into events on a
@@ -49,7 +54,7 @@ viewer/
     bundle.sh           wraps the binary into a signed .app
   Package.swift         SwiftPM targets RVCore, RVKit, RouteViewer, rvrender
   Makefile              test, asan, dump, render, golden, app, selftest, run, clean
-  check_additive.sh     checks the branch changed nothing outside the plan
+  check_additive.sh     development check: compares the branch with main (needs a git checkout)
 ```
 
 The core owns everything that is not pixels or widgets, so the later Win32
@@ -72,8 +77,15 @@ make selftest   # the app four times (no file, the sample, the stress board, the
                 # then rvrender --selftest on the synthetic run and the sample
 make run        # opens the app
 make clean      # removes build/ and .build/
-sh check_additive.sh   # read-only: fails if anything outside viewer/ changed beyond the allow-list
+sh check_additive.sh   # development check, read-only, needs a git checkout: compares the branch with
+                       # main and fails if anything outside viewer/ changed beyond its allow-list
 ```
+
+Times and sizes below that name "the dongle" were measured on a trace of the
+OBD-II dongle's board generator (145.8 MB), which is not in the repository.
+To reproduce such numbers, `examples/record_bench.py` (repository root)
+records the benchmark board without KiCad into a 21.8 MB trace anyone can
+make.
 
 `make selftest` opens one window per run for a few seconds and exits on its
 own (0 on success, 1 on a failed check, 2 if it does not finish in 10 s;
@@ -584,7 +596,7 @@ Measure with `.build/release/rvrender --bench-playback FILE --size 3200x2000 --s
 ### Theme
 
 Colours are KiCad 10's built-in "KiCad Default" theme, read from KiCad
-10.0.8's own `COLOR_SETTINGS` through its Python (`pcbnew`) on this machine:
+10.0.8's own `COLOR_SETTINGS` through its Python (`pcbnew`) on an Apple Silicon Mac:
 every copper layer (F.Cu, In1–In30, B.Cu), every technical layer, Edge.Cuts,
 Margin, the User layers, the background (0, 16, 35), via holes, via hole
 walls, plated holes and non-plated holes. The zone fill opacity (0.6) is
@@ -592,7 +604,10 @@ KiCad's default from `.kicad_prl`. Not verified against KiCad, chosen to
 match how KiCad looks: tracks, pads, vias and zones take their copper layer's
 colour (KiCad 10's theme leaves those entries unset); pad hole walls are not
 drawn; outlines of zones, rule areas and Edge.Cuts with no width use a
-0.05 mm hairline; rule areas are hatched all over at 0.5 mm. There is no
+0.05 mm hairline; rule areas are hatched all over at 0.5 mm (a rule area
+whose hatching would cost more than about a million edge tests, or that would
+take the board past eight million, is drawn as its outline only; real boards
+stay far below). There is no
 theme file loader yet; the theme is built into the core (`core/src/theme.cpp`).
 
 ### Headless rendering and golden images
@@ -772,3 +787,17 @@ No packages, no SwiftPM dependencies, no Homebrew, no CMake. The core uses
 the C++ standard library only; the Mac client uses system frameworks only.
 Any new tool or dependency needs the owner's approval first (see
 `CLAUDE.md`).
+
+## Licence
+
+MIT, the same licence as the router: see `LICENSE` at the repository root.
+Copyright (c) 2026 Trevor Attema, Teklabs Digital. Each source file carries
+an `SPDX-License-Identifier: MIT` header, and `make app` copies `LICENSE`
+into the app bundle (`Contents/Resources/LICENSE`).
+
+The viewer contains no third-party code and uses no third-party packages:
+only the C++ standard library and Apple's system frameworks. The default
+colours, layer names and draw order follow KiCad so that a board looks as it
+does there (see "Theme"); they are values read from KiCad 10.0.8, not code
+copied from it. Visual Gridrouter is not part of KiCad and is not affiliated
+with or endorsed by the KiCad project.

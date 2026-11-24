@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Trevor Attema, Teklabs Digital
+
 """Run the existing test files with TracedRouter(check=True) in place of gridrouter.Router.
 
     python3 tests/run_traced.py            (GRIDROUTER_TEST_SCALE=0.2 for a quick run)

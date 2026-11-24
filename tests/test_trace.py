@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Trevor Attema, Teklabs Digital
+
 """The search trace hook, the recorder and the trace file format.
 
 1. The C trace equals the oracle's first-pop order and costs, exactly, on
@@ -1248,6 +1251,44 @@ class Decisions(unittest.TestCase):
         code, lines = got["error"]
         self.assertEqual(code, 1)
         self.assertTrue(lines[-1].endswith("1 problems"), lines)
+
+    def test_command_line_on_a_file_that_is_not_a_trace(self):
+        """check, summary and dump on a non-trace, a missing file or a directory: one line on
+        stderr, exit 1, no traceback."""
+        import contextlib
+        import io
+        bad = tmp("cli_not_a_trace.txt")
+        with open(bad, "wb") as f:
+            f.write(b"this is not a gridrouter trace file, just some text\n")
+        for path, text in ((bad, "not a gridrouter trace file"),
+                           (tmp("cli_missing.grtrace"), "No such file"),
+                           (tmp(""), "directory")):
+            for command in ("check", "summary", "dump"):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = tf._main([command, path])
+                self.assertEqual(code, 1, (command, path))
+                self.assertEqual(out.getvalue(), "")
+                lines = err.getvalue().splitlines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertIn(text, lines[0])
+                self.assertNotIn("Traceback", lines[0])
+
+    def test_run_grid_limit(self):
+        """Spec 3.4: nx and ny are 1 to 8192 (the router's limit); a RUN beyond is corrupt
+        and its session has no grid."""
+        f = sample_fields()["RUN "]
+        for nx, ny, ok in ((8192, 8192, True), (8193, 5, False), (6, 8193, False),
+                           (0, 5, False), (6, -1, False)):
+            tr, errs, warns = self.levels([("RUN ", dict(f, nx=nx, ny=ny)), self.cmit(0, 1)])
+            self.assertEqual(tr.chunks[0].data is not None, ok, (nx, ny))
+            if ok:
+                self.assertEqual(errs, [])
+            else:
+                self.assertEqual(len(tr.errors), 1)
+                self.assertIn("1 to 8192", tr.errors[0])
+                self.assertEqual(len(errs), 2, errs)                # the RUN, then its CMIT
+                self.assertIn("RUN is corrupt", errs[1])
 
 
 class Library(unittest.TestCase):

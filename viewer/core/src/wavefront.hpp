@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // wavefront.hpp: the A* wavefront of the current search as images.
 //
 // One premultiplied RGBA image per router layer at grid resolution (nx x ny
@@ -16,7 +19,13 @@
 // repainting; both give the same pixels (tests check this).
 //
 // Memory: the images, and the arrays of the one search shown (a shared_ptr
-// from the trace's wavefront cache); nothing else is kept.
+// from the trace's wavefront cache); nothing else is kept.  An image's
+// pixels are allocated only when a cell is first drawn on it, as zeroed
+// memory from calloc, which the system maps on demand: only the pages that
+// hold drawn cells become resident, so a small search on a large grid (up
+// to 8192 x 8192, 256 MiB of pixels per image) costs little.  The duplicate
+// check uses a per-cell array only when that is small or no larger than the
+// search's own arrays (dense_cell_array_ok), else a sorted copy.
 #ifndef RV_WAVEFRONT_HPP
 #define RV_WAVEFRONT_HPP
 
@@ -24,6 +33,7 @@
 #include "theme.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -64,9 +74,33 @@ struct WaveRequest {
     std::uint32_t board_layer[2] = {kNone32, kNone32};
 };
 
+// Zeroed bytes from calloc (see Memory above); empty until allocate().  The
+// memory is kept when the buffer is emptied (clear) and serves the next
+// allocate that fits: freeing and allocating again would let calloc hand
+// back the same block, which it must then zero, making all of it resident.
+class PixelBuffer {
+public:
+    bool empty() const { return size_ == 0; }
+    std::size_t size() const { return size_; }
+    std::uint8_t *data() { return p_.get(); }
+    const std::uint8_t *data() const { return p_.get(); }
+    // n zero bytes (n > 0); throws std::bad_alloc.
+    void allocate(std::size_t n);
+    // Empty again, keeping the memory.  The caller has zeroed every byte it
+    // wrote, so the memory is all zero.
+    void clear() { size_ = 0; }
+
+private:
+    struct Free {
+        void operator()(std::uint8_t *p) const;
+    };
+    std::unique_ptr<std::uint8_t, Free> p_;
+    std::size_t size_ = 0, capacity_ = 0;
+};
+
 struct WaveImage {
     std::uint32_t width = 0, height = 0;    // nx, ny (0 without a router session)
-    std::vector<std::uint8_t> pixels;       // width * height * 4 once something was drawn, else empty
+    PixelBuffer pixels;                     // width * height * 4 once something was drawn, else empty
     std::array<std::int32_t, 4> bounds{{0, 0, 0, 0}}; // x0, y0, x1, y1: outside it every pixel is 0
     std::array<std::int32_t, 4> dirty{{0, 0, 0, 0}};  // pixels changed from generation dirty_from
     std::uint32_t generation = 1, dirty_from = 0;
@@ -91,6 +125,8 @@ public:
     bool always_rebuild = false;
     // Counts of the two ways of updating (tests, benchmarks).
     std::uint64_t rebuilds = 0, incremental = 0;
+    // Bytes of the per-cell scratch array of the duplicate check (tests).
+    std::size_t scratch_bytes() const { return seen_.size(); }
 
 private:
     struct Style {

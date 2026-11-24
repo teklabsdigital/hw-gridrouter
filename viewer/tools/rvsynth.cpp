@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // rvsynth: write the synthetic test trace (core/tests/synth.cpp) to a file.
 // For testing rvdump and clients without the Python recorder.
 //
@@ -13,6 +16,10 @@
 //                               headers and payloads anywhere; default
 //                               65536), each written and flushed, at RATE
 //                               bytes per second (default 5000000)
+//   rvsynth --help              this usage (exit 0)
+//
+// Any other argument that starts with '-' is a usage error (exit 2): it is
+// never taken as the file to write.
 
 #include "synth.hpp"
 
@@ -87,17 +94,33 @@ int drip(int argc, char **argv) {
 
 } // namespace
 
+static const char kUsage[] = "usage: rvsynth [--no-end | --truncate N | --stress | --timeline] OUT\n"
+                             "       rvsynth --drip SRC DST [--rate BYTES_PER_S] [--piece N] [--seed S]\n"
+                             "       rvsynth --help\n";
+
+// --help: the usage on stdout, exit 0; bad usage: on stderr, exit 2.
+static int usage(bool asked) {
+    std::fputs(kUsage, asked ? stdout : stderr);
+    return asked ? 0 : 2;
+}
+
 int main(int argc, char **argv) {
+    for (int a = 1; a < argc; ++a)
+        if (std::strcmp(argv[a], "--help") == 0 || std::strcmp(argv[a], "-h") == 0) return usage(true);
+    // A path never starts with '-': an argument that does and is not an
+    // option in its place is a mistake, not a file to write.
+    auto path_ok = [](const char *p) { return p[0] != '\0' && p[0] != '-'; };
     if (argc >= 2 && std::strcmp(argv[1], "--drip") == 0) {
+        if (argc < 4 || !path_ok(argv[2]) || !path_ok(argv[3])) return usage(false);
         const int rc = drip(argc, argv);
         if (rc >= 0) return rc;
-        std::fprintf(stderr, "usage: rvsynth --drip SRC DST [--rate BYTES_PER_S] [--piece N] [--seed S]\n");
-        return 2;
+        return usage(false);
     }
     bool with_end = true;
     long truncate = -1;
     const char *out = nullptr;
     if (argc == 3 && std::strcmp(argv[1], "--stress") == 0) {
+        if (!path_ok(argv[2])) return usage(false);
         const std::vector<unsigned char> bytes = synth::build_stress_trace();
         if (!synth::write_file(argv[2], bytes)) {
             std::fprintf(stderr, "rvsynth: cannot write %s\n", argv[2]);
@@ -107,6 +130,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc == 3 && std::strcmp(argv[1], "--timeline") == 0) {
+        if (!path_ok(argv[2])) return usage(false);
         const std::vector<unsigned char> bytes = synth::build_timeline_sample();
         if (!synth::write_file(argv[2], bytes)) {
             std::fprintf(stderr, "rvsynth: cannot write %s\n", argv[2]);
@@ -126,11 +150,7 @@ int main(int argc, char **argv) {
         if (end == argv[2] || *end != '\0' || truncate < 0) truncate = -2;
         out = argv[3];
     }
-    if (out == nullptr || truncate == -2) {
-        std::fprintf(stderr, "usage: rvsynth [--no-end | --truncate N | --stress | --timeline] OUT\n"
-                             "       rvsynth --drip SRC DST [--rate BYTES_PER_S] [--piece N] [--seed S]\n");
-        return 2;
-    }
+    if (out == nullptr || truncate == -2 || !path_ok(out)) return usage(false);
     synth::Sample s = synth::build_sample(with_end);
     if (truncate >= 0 && static_cast<unsigned long>(truncate) < s.bytes.size())
         s.bytes.resize(static_cast<std::size_t>(truncate));

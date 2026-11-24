@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // api.cpp: the C boundary of the core.
 //
 // Each entry point translates between the C types of rv.h and the C++

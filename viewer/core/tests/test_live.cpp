@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // test_live.cpp: M6, following a trace while it is written.
 //
 //   - equivalence: a session that read a file piece by piece (refresh after

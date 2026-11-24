@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // timeline.hpp: the routing run as a sequence of events on a playback clock.
 //
 // Built from the reader's tables and extended (M6) when the trace grows:
@@ -146,6 +149,10 @@ struct PacingSettings {
 // Limits of the settings (rv_set_pacing rejects values outside).
 constexpr double kFitSecondsMin = 1.0, kFitSecondsMax = 86400.0;
 constexpr double kSlowdownMin = 0.01, kSlowdownMax = 100000.0;
+// No event lasts longer (about 32 years): chunk times are any f64 the file
+// holds, so this keeps every duration, start and total finite and small
+// enough to show as a clock (2^32 events of it still fit an int64 of seconds).
+constexpr double kMaxEventSeconds = 1e9;
 
 // The weight modes ("fit length" and its variants): every event gets a
 // weight, and the weights are scaled so that the run lasts fit_seconds.

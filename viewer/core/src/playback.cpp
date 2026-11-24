@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // playback.cpp: stepping and the position strings (playback.hpp).
 
 #include "playback.hpp"
@@ -202,11 +205,24 @@ std::string caption(const Trace &tr, const Timeline &tl, std::uint32_t e, std::u
     return s;
 }
 
+namespace {
+
+// Seconds for a clock: negative and NaN as 0, at most kClockMax, so the
+// minutes always fit a long long.  The timeline keeps its times far below
+// (kMaxEventSeconds); this guards the conversion whatever it is given.
+double clock_seconds(double s) {
+    constexpr double kClockMax = 1e15;
+    if (!(s > 0)) return 0.0;
+    return s < kClockMax ? s : kClockMax;
+}
+
+} // namespace
+
 std::string position_text(const Timeline &tl, std::uint32_t e, double t) {
     auto clock = [](double s) {
-        const double v = std::max(0.0, s);
-        const int m = static_cast<int>(v / 60);
-        return fmt("%d:%04.1f", m, v - 60.0 * m);
+        const double v = clock_seconds(s);
+        const long long m = static_cast<long long>(v / 60);
+        return fmt("%lld:%04.1f", m, v - 60.0 * static_cast<double>(m));
     };
     if (e >= tl.size()) return "no events";
     return fmt("event %u of %u · %s / %s", e + 1, tl.size(), clock(t).c_str(), clock(tl.total()).c_str());
@@ -218,9 +234,9 @@ std::string speed_text(double speed) {
 
 std::string pacing_text(const PacingSettings &p, const Trace *tr, double total) {
     auto clock = [](double s) {
-        const double v = std::max(0.0, s);
-        const int m = static_cast<int>(v / 60);
-        return fmt("%d:%02.0f", m, std::floor(v - 60.0 * m));
+        const double v = clock_seconds(s);
+        const long long m = static_cast<long long>(v / 60);
+        return fmt("%lld:%02.0f", m, std::floor(v - 60.0 * static_cast<double>(m)));
     };
     switch (p.mode) {
     case PacingMode::Fit: return "fit length " + clock(total);

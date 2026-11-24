@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Trevor Attema, Teklabs Digital
+
 """Dump a pcbnew BOARD into a trace file as one ``BRD `` chunk (docs/TRACE_FORMAT.md 7.18).
 
     from gridrouter.recorder import Recorder

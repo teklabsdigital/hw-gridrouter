@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // trace.hpp: the .grtrace reader (docs/TRACE_FORMAT.md, version 1.x).
 //
 // Opening scans the chunk headers once and builds the chunk index.  Each

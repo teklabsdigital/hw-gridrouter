@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // Session.swift: Swift wrapper over an rv_session (core/include/rv.h).
 //
 // The core is single-threaded, so the wrapper is main-actor isolated: every

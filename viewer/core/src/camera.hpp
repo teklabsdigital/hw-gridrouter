@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // camera.hpp: the board-mm to view transform.
 //
 // View coordinates are the client's points, origin top left, y down (as

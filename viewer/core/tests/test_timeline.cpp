@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // test_timeline.cpp: M3 core: the timeline, the state at every position,
 // the playback clock, the overlay and the board under the position.
 

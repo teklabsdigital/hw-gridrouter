@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // AppearancePanel.swift: KiCad-style Appearance panel.  The board picker,
 // the layers (colour swatch and visibility checkbox, in the core's
 // panel order) and the object classes.  Everything shown comes from the

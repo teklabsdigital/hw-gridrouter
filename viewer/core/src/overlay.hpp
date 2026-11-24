@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // overlay.hpp: the dynamic display list at a playback position.
 //
 // What changes with the position is kept out of the board's static list, so

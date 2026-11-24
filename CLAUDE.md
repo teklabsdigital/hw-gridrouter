@@ -14,14 +14,14 @@
   - `docs/TRACE_FORMAT.md`: the file format, the only contract between the recorder and the viewer.
   - `examples/record_bench.py`: records the benchmark board, or a small board, without KiCad.
   - `viewer/`: Visual Gridrouter, the native app that replays traces. It has its own rules: read `viewer/CLAUDE.md` before changing anything under `viewer/`.
-- It uses only the Python standard library and a C compiler. The library is built automatically on first import, and again whenever the C source is newer.
+- It uses only the Python standard library and a C compiler. The library is built automatically on first use (`build()`, called by the first `Router()`), and again whenever the C source is newer. Importing the package does not build it.
 
 It was written by an AI assistant to speed up the board generator of the Bluetooth OBD-II dongle (https://github.com/teklabsdigital/hw-obd2-dongle). That generator is its main user. See `README.md` for the full API and the model.
 
 ## Build and test
 
 ```sh
-python3 -c "import gridrouter"     # builds gridrouter/libgridrouter.dylib (.so on Linux, gridrouter.dll on Windows) if needed
+python3 -c "import gridrouter; gridrouter.build()"   # builds gridrouter/libgridrouter.dylib (.so on Linux, gridrouter.dll on Windows) if needed
 python3 tests/run_all.py           # all tests, about 1 to 2 minutes
 GRIDROUTER_TEST_SCALE=0.2 python3 tests/run_all.py    # quick run (macOS / Linux shell)
 python3 tests/bench.py             # timing, C against the Python reference

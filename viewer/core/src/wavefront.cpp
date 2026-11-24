@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // wavefront.cpp: the wavefront images (wavefront.hpp).
 
 #include "wavefront.hpp"
@@ -7,8 +10,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <new>
 
 namespace rv {
 
@@ -56,6 +61,25 @@ void unite(std::array<std::int32_t, 4> &box, const std::array<std::int32_t, 4> &
 
 } // namespace
 
+void PixelBuffer::Free::operator()(std::uint8_t *p) const {
+    std::free(p);
+}
+
+void PixelBuffer::allocate(std::size_t n) {
+    if (n <= capacity_) { // zero already (clear)
+        size_ = n;
+        return;
+    }
+    // calloc, not a vector: a vector writes its zeros and so makes every page
+    // resident; calloc's large blocks are mapped zeroed on demand.
+    p_.reset();
+    size_ = capacity_ = 0;
+    void *p = std::calloc(n, 1);
+    if (p == nullptr) throw std::bad_alloc();
+    p_.reset(static_cast<std::uint8_t *>(p));
+    size_ = capacity_ = n;
+}
+
 void WavefrontImages::reset() {
     for (WaveImage &im : img_) {
         const std::uint32_t g = im.generation;
@@ -101,7 +125,7 @@ void WavefrontImages::paint(std::uint32_t k, bool frontier) {
     const int im = layers_ == 1 ? 0 : static_cast<int>(layer & 1);
     if (!style_.visible[im]) return;
     WaveImage &img = img_[im];
-    if (img.pixels.empty()) img.pixels.assign(static_cast<std::size_t>(img.width) * img.height * 4, 0);
+    if (img.pixels.empty()) img.pixels.allocate(static_cast<std::size_t>(img.width) * img.height * 4);
     const std::uint64_t idx = cell % nc_;
     std::uint32_t color;
     if (frontier) {
@@ -136,14 +160,22 @@ void WavefrontImages::clear_cell(std::uint32_t k) {
           static_cast<std::int32_t>(idx / static_cast<std::uint64_t>(nx_)));
 }
 
+// Zero the pixels inside the bounds (outside them every pixel is zero);
+// true if there were any.
+static bool zero_drawn(WaveImage &img) {
+    const auto &b = img.bounds;
+    if (!(b[0] < b[2] && b[1] < b[3] && !img.pixels.empty())) return false;
+    for (std::int32_t y = b[1]; y < b[3]; ++y)
+        std::memset(img.pixels.data() + 4 * (static_cast<std::size_t>(y) * img.width + b[0]), 0,
+                    4 * static_cast<std::size_t>(b[2] - b[0]));
+    return true;
+}
+
 void WavefrontImages::clear_all() {
     for (int k = 0; k < 2; ++k) {
         WaveImage &img = img_[k];
         const auto &b = img.bounds;
-        if (b[0] < b[2] && b[1] < b[3] && !img.pixels.empty()) {
-            for (std::int32_t y = b[1]; y < b[3]; ++y)
-                std::memset(img.pixels.data() + 4 * (static_cast<std::size_t>(y) * img.width + b[0]), 0,
-                            4 * static_cast<std::size_t>(b[2] - b[0]));
+        if (zero_drawn(img)) {
             unite(img.dirty, b);
             changed_[k] = true;
         }
@@ -168,6 +200,14 @@ void WavefrontImages::load(Trace &t, std::uint32_t source) {
     // Each cell at most once (the format says so; a file that breaks it
     // is still drawn, by repainting only).
     unique_ = true;
+    if (!dense_cell_array_ok(2 * nc_, n)) {
+        // A large grid and a small search: sort a copy rather than hold a
+        // byte per cell of the grid.
+        std::vector<std::uint32_t> sorted(wave_->cells);
+        std::sort(sorted.begin(), sorted.end());
+        unique_ = std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end();
+        return;
+    }
     if (seen_.size() < 2 * nc_) seen_.assign(static_cast<std::size_t>(2 * nc_), 0);
     std::uint32_t k = 0;
     for (; k < n; ++k) {
@@ -221,10 +261,11 @@ void WavefrontImages::update(Trace &t, const WaveRequest &req) {
                                                                  std::max<std::int32_t>(ny, static_cast<std::int32_t>(im.height))}});
                 changed_[k] = true;
             }
+            // Keep the memory, all zero, for the next drawing (PixelBuffer).
+            zero_drawn(im);
+            im.pixels.clear();
             im.width = static_cast<std::uint32_t>(nx);
             im.height = static_cast<std::uint32_t>(ny);
-            im.pixels.clear();
-            im.pixels.shrink_to_fit();
             im.bounds = {{0, 0, 0, 0}};
             im.cells = 0;
         }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // test_wavefront.cpp: M4 core: the wavefront images and the pacing modes.
 
 #include "check.hpp"
@@ -73,7 +76,7 @@ rv::WaveRequest request(rv::Trace &tr, const rv::Timeline &tl, std::uint32_t e, 
 
 // Pixels of an image, transparent if never drawn.
 std::vector<std::uint8_t> pixels_of(const rv::WaveImage &im) {
-    if (!im.pixels.empty()) return im.pixels;
+    if (!im.pixels.empty()) return std::vector<std::uint8_t>(im.pixels.data(), im.pixels.data() + im.pixels.size());
     return std::vector<std::uint8_t>(static_cast<std::size_t>(im.width) * im.height * 4, 0);
 }
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // synth.cpp: the synthetic .grtrace writer (see synth.hpp).  Every layout
 // here is taken from the field tables of docs/TRACE_FORMAT.md section 7.
 

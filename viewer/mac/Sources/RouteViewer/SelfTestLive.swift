@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Trevor Attema, Teklabs Digital
+//
 // SelfTestLive.swift: the self-test's live phase (M6).  The self-test's
 // trace is written again, piece by piece, into a file that does not exist
 // when its window opens; a clock the test drives stands in for wall time,
